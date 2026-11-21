@@ -4,23 +4,26 @@ This guide provides exact instructions to run DevOrbit locally.
 
 ---
 
-## Quick Diagnosis: Docker Desktop Error
+## Setting Go Path in PowerShell
 
-If you see:
-`open //./pipe/dockerDesktopLinuxEngine: The system cannot find the file specified`
+Go SDK is located at `C:\Users\shubham\go_sdk\go\bin`.
 
-This means **Docker Desktop is not running** on your Windows host. You have two options:
-1. **Option 1 (Recommended & Easiest)**: Run all services **natively on Windows using Go** (no Docker required!).
-2. **Option 2**: Start Docker Desktop from the Windows Start Menu and wait for the engine to initialize before running `docker compose`.
+To permanently add Go to your user PATH in PowerShell (so it works in all new terminal windows):
+```powershell
+[System.Environment]::SetEnvironmentVariable("Path", $env:Path + ";C:\Users\shubham\go_sdk\go\bin", [System.EnvironmentVariableTarget]::User)
+```
+
+Or run `$env:Path += ";C:\Users\shubham\go_sdk\go\bin"` at the top of your terminal session.
 
 ---
 
-## Option 1: Pure Native Go Launch (No Docker Required!)
+## Native Go Launch (Recommended — No Docker Required!)
 
-You can run all three Go services natively in separate PowerShell windows.
+Launch each service in a PowerShell terminal:
 
 ### Terminal 1: Launch Host Bridge Daemon (Port 8082)
 ```powershell
+$env:Path += ";C:\Users\shubham\go_sdk\go\bin"
 cd C:\Users\shubham\Documents\PersonalProjects\DevOrbit\agents\host-bridge
 go run ./cmd/host-bridge
 ```
@@ -28,6 +31,7 @@ go run ./cmd/host-bridge
 
 ### Terminal 2: Launch Control Plane Service (Port 8080)
 ```powershell
+$env:Path += ";C:\Users\shubham\go_sdk\go\bin"
 cd C:\Users\shubham\Documents\PersonalProjects\DevOrbit\services\control-plane
 go run ./cmd/control-plane
 ```
@@ -35,22 +39,11 @@ go run ./cmd/control-plane
 
 ### Terminal 3: Launch Connection Broker Service (Port 8081)
 ```powershell
+$env:Path += ";C:\Users\shubham\go_sdk\go\bin"
 cd C:\Users\shubham\Documents\PersonalProjects\DevOrbit\services\connection-broker
 go run ./cmd/connection-broker
 ```
 *Listening on `:8081`*
-
----
-
-## Option 2: Launching with Docker Desktop
-
-If you prefer using Docker:
-1. Open **Docker Desktop** from your Windows Start Menu.
-2. Wait until the status in the bottom-left corner of Docker Desktop turns **green ("Engine running")**.
-3. Run:
-   ```powershell
-   docker compose -f infrastructure/docker/docker-compose.yml up -d
-   ```
 
 ---
 
