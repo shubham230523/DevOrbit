@@ -62,6 +62,7 @@ type Broker struct {
 	authorizedHost         map[string]string             // Key: MachineID -> Expected Token
 	authorizedClientTokens map[string]string             // Key: MachineID + ":" + DeviceID + ":" + SessionID -> Token
 	authorizedExpiries     map[string]time.Time          // Key: MachineID + ":" + DeviceID + ":" + SessionID -> Expiry
+	sessionExpiries        map[string]time.Time          // Key: SessionID -> Authoritative Expiry
 	allowedOrigins         map[string]bool                // Key: Origin domain
 	environment            string
 	adminSecret            string
@@ -96,6 +97,7 @@ func NewBrokerWithSecret(adminSecret string) *Broker {
 		authorizedHost:         make(map[string]string),
 		authorizedClientTokens: make(map[string]string),
 		authorizedExpiries:     make(map[string]time.Time),
+		sessionExpiries:        make(map[string]time.Time),
 		allowedOrigins:         origins,
 		environment:            env,
 		adminSecret:            adminSecret,
@@ -183,7 +185,9 @@ func (b *Broker) AuthorizeDeviceWithExpiry(machineID, deviceID, sessionID, clien
 			key := machineID + ":" + deviceID + ":" + sessionID
 			b.authorizedClientTokens[key] = clientToken
 			if ttl > 0 {
-				b.authorizedExpiries[key] = time.Now().Add(ttl)
+				exp := time.Now().UTC().Add(ttl)
+				b.authorizedExpiries[key] = exp
+				b.sessionExpiries[sessionID] = exp
 			}
 		}
 	}
@@ -199,6 +203,10 @@ func (b *Broker) RevokeDevice(machineID, deviceID string) {
 		if strings.HasPrefix(key, prefix) {
 			delete(b.authorizedClientTokens, key)
 			delete(b.authorizedExpiries, key)
+			parts := strings.Split(key, ":")
+			if len(parts) >= 3 {
+				delete(b.sessionExpiries, parts[2])
+			}
 		}
 	}
 
@@ -218,15 +226,32 @@ func (b *Broker) RegisterHostConnection(machineID, sessionID, token string, conn
 		return nil, ErrUnauthorizedSession
 	}
 
+	expiry, hasExp := b.sessionExpiries[sessionID]
+	if !hasExp {
+		expiry = time.Now().UTC().Add(24 * time.Hour)
+	}
+
+	if time.Now().UTC().After(expiry) {
+		return nil, errors.New("session expired")
+	}
+
 	sess, ok := b.sessions[sessionID]
 	if !ok {
 		sess = &Session{
 			ID:        sessionID,
 			MachineID: machineID,
 			Token:     token,
-			ExpiresAt: time.Now().Add(1 * time.Hour),
+			ExpiresAt: expiry,
 		}
 		b.sessions[sessionID] = sess
+	} else {
+		if sess.ExpiresAt.IsZero() || sess.ExpiresAt.After(expiry) {
+			sess.ExpiresAt = expiry
+		}
+	}
+
+	if time.Now().UTC().After(sess.ExpiresAt) {
+		return nil, errors.New("session expired")
 	}
 
 	if sess.HostConn != nil && sess.HostConn != conn {
@@ -257,11 +282,22 @@ func (b *Broker) RegisterClientConnection(machineID, deviceID, sessionID, token 
 
 	sess, ok := b.sessions[sessionID]
 	if !ok {
-		return nil, ErrSessionNotFound
+		expiry, hasExp := b.sessionExpiries[sessionID]
+		if !hasExp {
+			expiry = time.Now().UTC().Add(24 * time.Hour)
+		}
+		sess = &Session{
+			ID:        sessionID,
+			MachineID: machineID,
+			DeviceID:  deviceID,
+			Token:     token,
+			ExpiresAt: expiry,
+		}
+		b.sessions[sessionID] = sess
 	}
 
-	if time.Now().After(sess.ExpiresAt) {
-		delete(b.sessions, sessionID)
+	if time.Now().UTC().After(sess.ExpiresAt) {
+		b.closeSessionLocked(sessionID)
 		return nil, errors.New("session expired")
 	}
 
@@ -462,6 +498,11 @@ func (b *Broker) RelayFrameFromClientToHost(sessionID string, frame *FrameEnvelo
 		return ErrSessionNotFound
 	}
 
+	if time.Now().UTC().After(sess.ExpiresAt) {
+		b.CloseSession(sessionID)
+		return errors.New("session expired")
+	}
+
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
 
@@ -475,6 +516,11 @@ func (b *Broker) RelayFrameFromHostToClient(sessionID string, frame *FrameEnvelo
 
 	if !ok || sess.ClientConn == nil {
 		return ErrSessionNotFound
+	}
+
+	if time.Now().UTC().After(sess.ExpiresAt) {
+		b.CloseSession(sessionID)
+		return errors.New("session expired")
 	}
 
 	sess.mu.Lock()
@@ -521,9 +567,13 @@ func (b *Broker) ActiveSessionCount() int {
 func (b *Broker) verifyAdminAuth(r *http.Request) bool {
 	b.mu.RLock()
 	adminSecret := b.adminSecret
+	env := b.environment
 	b.mu.RUnlock()
 
 	if adminSecret == "" {
+		return false
+	}
+	if env == "production" && len(adminSecret) < 16 {
 		return false
 	}
 
@@ -576,10 +626,37 @@ func (b *Broker) HandleAuthorizeSession(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Bounded TTL validation: min 10s, max 30 days (2592000s)
+	if req.TTLSeconds < 0 || (req.TTLSeconds > 0 && req.TTLSeconds < 10) || req.TTLSeconds > 30*24*3600 {
+		http.Error(w, "invalid ttl_seconds: must be between 10 seconds and 30 days (2592000s)", http.StatusBadRequest)
+		return
+	}
+
 	ttl := 24 * time.Hour
 	if req.TTLSeconds > 0 {
 		ttl = time.Duration(req.TTLSeconds) * time.Second
 	}
+
+	b.mu.Lock()
+	// Prevent unauthorized replacement of existing host identity credentials
+	if req.HostToken != "" {
+		existingHostToken, hostExists := b.authorizedHost[req.MachineID]
+		if hostExists && existingHostToken != "" && existingHostToken != req.HostToken {
+			b.mu.Unlock()
+			http.Error(w, "conflict: machine_id is already registered with a different host token", http.StatusConflict)
+			return
+		}
+	}
+
+	// Idempotency: prevent unauthorized replacement of existing session with different client token
+	key := req.MachineID + ":" + req.DeviceID + ":" + req.SessionID
+	existingClientToken, tokenExists := b.authorizedClientTokens[key]
+	if tokenExists && existingClientToken != req.ClientToken {
+		b.mu.Unlock()
+		http.Error(w, "conflict: session_id is already registered with different client credentials", http.StatusConflict)
+		return
+	}
+	b.mu.Unlock()
 
 	b.AuthorizeDeviceWithExpiry(req.MachineID, req.DeviceID, req.SessionID, req.ClientToken, ttl)
 
@@ -593,7 +670,7 @@ func (b *Broker) HandleAuthorizeSession(w http.ResponseWriter, r *http.Request) 
 		"session_id": req.SessionID,
 		"machine_id": req.MachineID,
 		"device_id":  req.DeviceID,
-		"expires_at": time.Now().Add(ttl).Format(time.RFC3339),
+		"expires_at": time.Now().UTC().Add(ttl).Format(time.RFC3339),
 	})
 }
 

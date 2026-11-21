@@ -25,11 +25,15 @@ type Server struct {
 	pairingEngine      *security.PairingEngine
 	rateLimiter        *security.RateLimiter
 	idempotency        *security.IdempotencyManager
-	sessionProvisioner func(sessionID, deviceID, sessionSecret string) error
+	sessionProvisioner func(sessionID, deviceID, sessionSecret string, expiry time.Time) error
 	brokerAuthorizer   BrokerAuthorizer
 	advertisedURL      string
+	brokerHTTPURL      string
+	brokerWSURL        string
 	brokerURL          string
 	hostToken          string
+	trustedProxies     []string
+	isProduction       bool
 	muxOnce            sync.Once
 	cachedMux          *http.ServeMux
 }
@@ -49,10 +53,34 @@ func (s *Server) SetAdvertisedURL(url string) {
 
 func (s *Server) SetBrokerURL(url string) {
 	s.brokerURL = url
+	if s.brokerWSURL == "" {
+		s.brokerWSURL = url
+	}
+}
+
+func (s *Server) SetBrokerHTTPURL(url string) {
+	s.brokerHTTPURL = url
+}
+
+func (s *Server) SetBrokerWSURL(url string) {
+	s.brokerWSURL = url
+	s.brokerURL = url
+}
+
+func (s *Server) SetTrustedProxies(proxies []string) {
+	s.trustedProxies = proxies
+}
+
+func (s *Server) SetIsProduction(isProd bool) {
+	s.isProduction = isProd
 }
 
 func (s *Server) SetHostToken(token string) {
 	s.hostToken = token
+}
+
+func (s *Server) SetSessionProvisioner(provisioner func(sessionID, deviceID, sessionSecret string, expiry time.Time) error) {
+	s.sessionProvisioner = provisioner
 }
 
 func NewServer(

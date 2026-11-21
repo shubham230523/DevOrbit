@@ -126,6 +126,46 @@ void main() {
         }),
         throwsA(isA<FormatException>()),
       );
+
+      // 4. URL with embedded credentials
+      expect(
+        () => QrPairingPayload.fromJson({
+          'v': '1.0',
+          'challenge_id': 'qr-01',
+          'host_id': 'h-01',
+          'pairing_payload': 'p-01',
+          'confirm_url': 'http://user:pass@127.0.0.1:8080/api/v1/pairing/confirm',
+          'expires_at': DateTime.now().add(const Duration(minutes: 5)).toIso8601String(),
+        }),
+        throwsA(isA<FormatException>()),
+      );
+
+      // 5. URL with query parameters
+      expect(
+        () => QrPairingPayload.fromJson({
+          'v': '1.0',
+          'challenge_id': 'qr-01',
+          'host_id': 'h-01',
+          'pairing_payload': 'p-01',
+          'confirm_url': 'http://127.0.0.1:8080/api/v1/pairing/confirm?token=secret',
+          'expires_at': DateTime.now().add(const Duration(minutes: 5)).toIso8601String(),
+        }),
+        throwsA(isA<FormatException>()),
+      );
+
+      // 6. Insecure HTTP scheme for broker_url in QR payload
+      expect(
+        () => QrPairingPayload.fromJson({
+          'v': '1.0',
+          'challenge_id': 'qr-01',
+          'host_id': 'h-01',
+          'pairing_payload': 'p-01',
+          'confirm_url': 'http://127.0.0.1:8080/api/v1/pairing/confirm',
+          'broker_url': 'http://127.0.0.1:8081', // Must be ws or wss
+          'expires_at': DateTime.now().add(const Duration(minutes: 5)).toIso8601String(),
+        }),
+        throwsA(isA<FormatException>()),
+      );
     });
 
     test('Successful backend confirmation persists credentials and survives restart', () async {

@@ -82,6 +82,11 @@ class BrokerWebSocketClient {
         masterSecret: masterSecret,
       );
 
+      final baseUri = Uri.parse(brokerUrl);
+      if (baseUri.scheme.toLowerCase() != 'ws' && baseUri.scheme.toLowerCase() != 'wss') {
+        throw ArgumentError('brokerUrl must use ws:// or wss://, got: ${baseUri.scheme}');
+      }
+
       final wsUri = Uri.parse(
         '$brokerUrl/ws/client?machine_id=$machineId&device_id=$deviceId&session_id=$sessionId',
       );

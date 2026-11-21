@@ -205,3 +205,77 @@ func TestBrokerClient_ProvisionSessionLifecycleAndRevocation(t *testing.T) {
 
 	client.Stop()
 }
+
+func TestBrokerClient_IndependentSimultaneousDeviceSessions(t *testing.T) {
+	connectedCh := make(chan string, 10)
+
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sessID := r.URL.Query().Get("session_id")
+		connectedCh <- sessID
+
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err == nil {
+			defer conn.Close()
+			for {
+				var msg map[string]any
+				if err := conn.ReadJSON(&msg); err != nil {
+					break
+				}
+			}
+		}
+	}))
+	defer s.Close()
+
+	wsURL := strings.Replace(s.URL, "http://", "ws://", 1)
+
+	client := NewBrokerClient(wsURL, "mach-multi-01", "", "host-token-32b", nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client.Start(ctx)
+
+	// 1. Provision Device 1 / Session 1
+	err := client.ProvisionSession("sess-dev1", "phone-01", "secret-phone-32-bytes-ok!", 1*time.Hour)
+	if err != nil {
+		t.Fatalf("Failed to provision dev1: %v", err)
+	}
+
+	// 2. Provision Device 2 / Session 2
+	err = client.ProvisionSession("sess-dev2", "tablet-02", "secret-tablet-32-bytes-ok!", 1*time.Hour)
+	if err != nil {
+		t.Fatalf("Failed to provision dev2: %v", err)
+	}
+
+	// Verify both sessions connected independently
+	connectedSessions := make(map[string]bool)
+	for i := 0; i < 2; i++ {
+		select {
+		case sID := <-connectedCh:
+			connectedSessions[sID] = true
+		case <-time.After(1 * time.Second):
+			t.Fatalf("Timed out waiting for both sessions to connect")
+		}
+	}
+
+	if !connectedSessions["sess-dev1"] || !connectedSessions["sess-dev2"] {
+		t.Fatalf("Expected both sess-dev1 and sess-dev2 to connect, got: %v", connectedSessions)
+	}
+
+	if client.ActiveSessionCount() != 2 {
+		t.Fatalf("Expected 2 active sessions, got %d", client.ActiveSessionCount())
+	}
+
+	// 3. Revoke Device 1: Device 2 must remain connected and active
+	client.RevokeDevice("phone-01")
+
+	if client.ActiveSessionCount() != 1 {
+		t.Fatalf("Expected 1 active session after revoking phone-01, got %d", client.ActiveSessionCount())
+	}
+
+	activeID, _ := client.ActiveSession()
+	if activeID != "sess-dev2" {
+		t.Fatalf("Expected active session to be sess-dev2, got %s", activeID)
+	}
+
+	client.Stop()
+}

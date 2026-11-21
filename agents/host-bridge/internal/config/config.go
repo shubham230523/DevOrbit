@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -11,8 +12,10 @@ import (
 )
 
 var (
-	ErrMissingSecret      = errors.New("config error: required secret key is missing or too short")
-	ErrInsecureSchemeProd = errors.New("config error: production mode requires wss:// or https:// endpoints")
+	ErrMissingSecret           = errors.New("config error: required secret key is missing or too short")
+	ErrInsecureSchemeProd      = errors.New("config error: production mode requires wss:// or https:// endpoints")
+	ErrInvalidConfig           = errors.New("config error: invalid configuration parameter")
+	ErrMismatchedBrokerService = errors.New("config error: broker HTTP and WebSocket endpoints must identify the same service")
 )
 
 type Config struct {
@@ -24,9 +27,12 @@ type Config struct {
 	HostID          string
 	HostName        string
 	HostSecret      string
-	BrokerURL       string
-	BrokerSecret    string
+	BrokerURL       string // Legacy / general broker WS URL
+	BrokerHTTPURL   string // HTTP URL for internal broker authorization / revocation
+	BrokerWSURL     string // WebSocket URL for host/client connections
+	BrokerSecret    string // Service-to-service admin secret
 	AdvertisedURL   string
+	TrustedProxies  []string
 	Environment     string
 }
 
@@ -87,13 +93,121 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("%w: DEVORBIT_HOST_SECRET must be at least 16 characters", ErrMissingSecret)
 	}
 
-	brokerURL := os.Getenv("DEVORBIT_BROKER_URL")
-	if brokerURL == "" {
-		brokerURL = "ws://localhost:8081"
+	// 1. Separate Broker HTTP and WebSocket Endpoints
+	brokerHTTPURL := os.Getenv("DEVORBIT_BROKER_HTTP_URL")
+	brokerWSURL := os.Getenv("DEVORBIT_BROKER_WS_URL")
+	legacyBrokerURL := os.Getenv("DEVORBIT_BROKER_URL")
+
+	if brokerWSURL == "" && legacyBrokerURL != "" {
+		brokerWSURL = legacyBrokerURL
 	}
 
-	if env == "production" && !strings.HasPrefix(brokerURL, "wss://") && !strings.HasPrefix(brokerURL, "https://") {
-		return nil, fmt.Errorf("%w: DEVORBIT_BROKER_URL '%s' must use wss:// or https:// in production mode", ErrInsecureSchemeProd, brokerURL)
+	if env == "production" {
+		if brokerHTTPURL == "" {
+			return nil, fmt.Errorf("%w: DEVORBIT_BROKER_HTTP_URL is required in production mode", ErrInvalidConfig)
+		}
+		if brokerWSURL == "" {
+			return nil, fmt.Errorf("%w: DEVORBIT_BROKER_WS_URL is required in production mode", ErrInvalidConfig)
+		}
+	} else {
+		if brokerHTTPURL == "" {
+			brokerHTTPURL = "http://127.0.0.1:8081"
+		}
+		if brokerWSURL == "" {
+			brokerWSURL = "ws://127.0.0.1:8081"
+		}
+	}
+
+	// Validate Broker HTTP URL
+	httpParsed, err := url.Parse(brokerHTTPURL)
+	if err != nil || httpParsed.Host == "" {
+		return nil, fmt.Errorf("%w: invalid DEVORBIT_BROKER_HTTP_URL: %v", ErrInvalidConfig, err)
+	}
+	if httpParsed.User != nil {
+		return nil, fmt.Errorf("%w: DEVORBIT_BROKER_HTTP_URL must not contain credentials", ErrInvalidConfig)
+	}
+	if env == "production" && strings.ToLower(httpParsed.Scheme) != "https" {
+		return nil, fmt.Errorf("%w: DEVORBIT_BROKER_HTTP_URL '%s' must use https:// in production", ErrInsecureSchemeProd, brokerHTTPURL)
+	}
+	if env != "production" && strings.ToLower(httpParsed.Scheme) != "http" && strings.ToLower(httpParsed.Scheme) != "https" {
+		return nil, fmt.Errorf("%w: DEVORBIT_BROKER_HTTP_URL must use http:// or https://", ErrInvalidConfig)
+	}
+
+	// Validate Broker WebSocket URL
+	wsParsed, err := url.Parse(brokerWSURL)
+	if err != nil || wsParsed.Host == "" {
+		return nil, fmt.Errorf("%w: invalid DEVORBIT_BROKER_WS_URL: %v", ErrInvalidConfig, err)
+	}
+	if wsParsed.User != nil {
+		return nil, fmt.Errorf("%w: DEVORBIT_BROKER_WS_URL must not contain credentials", ErrInvalidConfig)
+	}
+	if env == "production" && strings.ToLower(wsParsed.Scheme) != "wss" {
+		return nil, fmt.Errorf("%w: DEVORBIT_BROKER_WS_URL '%s' must use wss:// in production", ErrInsecureSchemeProd, brokerWSURL)
+	}
+	if env != "production" && strings.ToLower(wsParsed.Scheme) != "ws" && strings.ToLower(wsParsed.Scheme) != "wss" {
+		return nil, fmt.Errorf("%w: DEVORBIT_BROKER_WS_URL must use ws:// or wss://", ErrInvalidConfig)
+	}
+
+	// Verify both URLs identify the same configured broker service
+	if httpParsed.Hostname() != wsParsed.Hostname() {
+		return nil, fmt.Errorf("%w: hostnames do not match (%s vs %s)", ErrMismatchedBrokerService, httpParsed.Hostname(), wsParsed.Hostname())
+	}
+
+	// 2. Broker Administration Secret
+	brokerSecret := os.Getenv("DEVORBIT_BROKER_SECRET")
+	if env == "production" {
+		if brokerSecret == "" {
+			return nil, fmt.Errorf("%w: DEVORBIT_BROKER_SECRET is required in production mode", ErrMissingSecret)
+		}
+		if len(brokerSecret) < 16 {
+			return nil, fmt.Errorf("%w: DEVORBIT_BROKER_SECRET must be at least 16 characters in production", ErrMissingSecret)
+		}
+		if brokerSecret == hostSecret {
+			return nil, fmt.Errorf("%w: DEVORBIT_BROKER_SECRET cannot be identical to host-wide secret", ErrInvalidConfig)
+		}
+	} else if brokerSecret == "" {
+		brokerSecret = hostSecret
+	}
+
+	// 3. Advertised URL Validation
+	advertisedURL := os.Getenv("DEVORBIT_ADVERTISED_URL")
+	if env == "production" {
+		if advertisedURL == "" {
+			return nil, fmt.Errorf("%w: DEVORBIT_ADVERTISED_URL is required in production mode", ErrInvalidConfig)
+		}
+		advParsed, err := url.Parse(advertisedURL)
+		if err != nil || advParsed.Host == "" {
+			return nil, fmt.Errorf("%w: invalid DEVORBIT_ADVERTISED_URL: %v", ErrInvalidConfig, err)
+		}
+		if advParsed.User != nil {
+			return nil, fmt.Errorf("%w: DEVORBIT_ADVERTISED_URL must not contain credentials", ErrInvalidConfig)
+		}
+		if strings.ToLower(advParsed.Scheme) != "https" {
+			return nil, fmt.Errorf("%w: DEVORBIT_ADVERTISED_URL '%s' must use https:// in production mode", ErrInsecureSchemeProd, advertisedURL)
+		}
+	} else if advertisedURL != "" {
+		advParsed, err := url.Parse(advertisedURL)
+		if err != nil || advParsed.Host == "" {
+			return nil, fmt.Errorf("%w: invalid DEVORBIT_ADVERTISED_URL: %v", ErrInvalidConfig, err)
+		}
+		if advParsed.User != nil {
+			return nil, fmt.Errorf("%w: DEVORBIT_ADVERTISED_URL must not contain credentials", ErrInvalidConfig)
+		}
+		sch := strings.ToLower(advParsed.Scheme)
+		if sch != "http" && sch != "https" {
+			return nil, fmt.Errorf("%w: DEVORBIT_ADVERTISED_URL must use http:// or https://", ErrInvalidConfig)
+		}
+	}
+
+	// 4. Trusted Reverse Proxies
+	var trustedProxies []string
+	if rawProxies := os.Getenv("DEVORBIT_TRUSTED_PROXIES"); rawProxies != "" {
+		for _, p := range strings.Split(rawProxies, ",") {
+			trimmed := strings.TrimSpace(p)
+			if trimmed != "" {
+				trustedProxies = append(trustedProxies, trimmed)
+			}
+		}
 	}
 
 	// Default allowed roots
@@ -107,21 +221,21 @@ func LoadConfig() (*Config, error) {
 		}
 	}
 
-	brokerSecret := os.Getenv("DEVORBIT_BROKER_SECRET")
-	advertisedURL := os.Getenv("DEVORBIT_ADVERTISED_URL")
-
 	return &Config{
-		AllowedRoots:  roots,
-		Port:          port,
-		LogLevel:      "info",
-		MaxFileSizeMB: maxSize,
-		HostID:        hostID,
-		HostName:      hostName,
-		HostSecret:    hostSecret,
-		BrokerURL:     brokerURL,
-		BrokerSecret:  brokerSecret,
-		AdvertisedURL: advertisedURL,
-		Environment:   env,
+		AllowedRoots:    roots,
+		Port:            port,
+		LogLevel:        "info",
+		MaxFileSizeMB:   maxSize,
+		HostID:          hostID,
+		HostName:        hostName,
+		HostSecret:      hostSecret,
+		BrokerURL:       brokerWSURL, // Legacy field points to WebSocket endpoint
+		BrokerHTTPURL:   brokerHTTPURL,
+		BrokerWSURL:     brokerWSURL,
+		BrokerSecret:    brokerSecret,
+		AdvertisedURL:   advertisedURL,
+		TrustedProxies:  trustedProxies,
+		Environment:     env,
 		AllowedBinaries: []string{
 			"git", "git.exe", "gradlew", "gradlew.bat", "gradle", "gradle.bat", "adb", "adb.exe",
 		},

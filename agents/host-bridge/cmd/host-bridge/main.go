@@ -56,14 +56,17 @@ func main() {
 	if cfg.AdvertisedURL != "" {
 		serverEngine.SetAdvertisedURL(cfg.AdvertisedURL)
 	}
-	serverEngine.SetBrokerURL(cfg.BrokerURL)
+	serverEngine.SetBrokerHTTPURL(cfg.BrokerHTTPURL)
+	serverEngine.SetBrokerWSURL(cfg.BrokerWSURL)
+	serverEngine.SetTrustedProxies(cfg.TrustedProxies)
+	serverEngine.SetIsProduction(cfg.Environment == "production")
 	serverEngine.SetHostToken(cfg.HostSecret)
 
 	brokerAdminSecret := cfg.BrokerSecret
-	if brokerAdminSecret == "" {
+	if brokerAdminSecret == "" && cfg.Environment != "production" {
 		brokerAdminSecret = cfg.HostSecret
 	}
-	brokerAuthorizer := transport.NewHTTPBrokerAuthorizer(cfg.BrokerURL, brokerAdminSecret, nil)
+	brokerAuthorizer := transport.NewHTTPBrokerAuthorizer(cfg.BrokerHTTPURL, brokerAdminSecret, nil)
 	serverEngine.SetBrokerAuthorizer(brokerAuthorizer)
 
 	mux := http.NewServeMux()
@@ -78,11 +81,11 @@ func main() {
 	// 5. Outbound Connection Broker Client
 	// Established sessions must come from authenticated pairing lifecycle or explicit session provisioning.
 	// Host Bridge starts disconnected when no valid device session is provisioned.
-	brokerClient := transport.NewBrokerClient(cfg.BrokerURL, cfg.HostID, "", cfg.HostSecret, serverEngine)
+	brokerClient := transport.NewBrokerClient(cfg.BrokerWSURL, cfg.HostID, "", cfg.HostSecret, serverEngine)
 
 	// Connect authenticated QR pairing directly to Host Bridge session provisioning
-	serverEngine.SetSessionProvisioner(func(sessionID, deviceID, sessionSecret string) error {
-		return brokerClient.ProvisionSession(sessionID, deviceID, sessionSecret, 24*time.Hour)
+	serverEngine.SetSessionProvisioner(func(sessionID, deviceID, sessionSecret string, expiry time.Time) error {
+		return brokerClient.ProvisionSession(sessionID, deviceID, sessionSecret, expiry)
 	})
 
 	// Optional initial session provisioning for automated deployments
