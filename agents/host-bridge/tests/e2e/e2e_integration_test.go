@@ -25,12 +25,10 @@ func TestDevOrbit_FullEndToEndDevelopmentWorkflow(t *testing.T) {
 	}
 	defer os.RemoveAll(tempWorkspace)
 
-	// Init git repo
 	cmdGit := exec.Command("git", "init")
 	cmdGit.Dir = tempWorkspace
 	_ = cmdGit.Run()
 
-	// Create sample project structure (Android app)
 	manifestPath := filepath.Join(tempWorkspace, "app", "src", "main", "AndroidManifest.xml")
 	_ = os.MkdirAll(filepath.Dir(manifestPath), 0755)
 	_ = os.WriteFile(manifestPath, []byte("<manifest package=\"com.devorbit.test\"></manifest>"), 0644)

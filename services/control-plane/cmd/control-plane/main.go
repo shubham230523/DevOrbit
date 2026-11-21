@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -57,8 +58,25 @@ func getEnvOrDefault(key, fallback string) string {
 }
 
 func main() {
-	jwtSecret := getEnvOrDefault("DEVORBIT_JWT_SECRET", "devorbit-control-plane-jwt-secret-key-32b")
-	pairingSecret := getEnvOrDefault("DEVORBIT_PAIRING_SECRET", "devorbit-control-plane-pairing-secret-key")
+	env := strings.ToLower(getEnvOrDefault("DEVORBIT_ENV", "development"))
+	jwtSecret := os.Getenv("DEVORBIT_JWT_SECRET")
+	pairingSecret := os.Getenv("DEVORBIT_PAIRING_SECRET")
+
+	if env == "production" {
+		if jwtSecret == "" || len(jwtSecret) < 16 {
+			log.Fatalf("Control Plane Configuration Error: DEVORBIT_JWT_SECRET is required and must be at least 16 characters in production mode")
+		}
+		if pairingSecret == "" || len(pairingSecret) < 16 {
+			log.Fatalf("Control Plane Configuration Error: DEVORBIT_PAIRING_SECRET is required and must be at least 16 characters in production mode")
+		}
+	} else {
+		if jwtSecret == "" {
+			jwtSecret = "devorbit-control-plane-jwt-secret-key-32b"
+		}
+		if pairingSecret == "" {
+			pairingSecret = "devorbit-control-plane-pairing-secret-key"
+		}
+	}
 
 	authService := auth.NewService(jwtSecret)
 	pairingService := pairing.NewService(pairingSecret)
@@ -68,7 +86,7 @@ func main() {
 
 	mux.HandleFunc("/api/v1/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"status":"ok","service":"control-plane","version":"1.2.0"}`)
+		fmt.Fprintf(w, `{"status":"ok","service":"control-plane","version":"1.2.1","env":"%s"}`, env)
 	})
 
 	mux.HandleFunc("/api/v1/auth/pair", func(w http.ResponseWriter, r *http.Request) {
@@ -81,8 +99,8 @@ func main() {
 			DeviceID  string `json:"device_id"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.MachineID == "" || req.DeviceID == "" {
-			req.MachineID = "host-windows-01"
-			req.DeviceID = "phone-android-01"
+			http.Error(w, "invalid request: machine_id and device_id are required", http.StatusBadRequest)
+			return
 		}
 
 		token, err := authService.GenerateToken(req.MachineID, req.DeviceID)
@@ -99,7 +117,16 @@ func main() {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		ch, err := pairingService.CreateChallenge("host-windows-01", "Desktop Workstation", 5*time.Minute)
+		var req struct {
+			MachineID string `json:"machine_id"`
+			HostName  string `json:"host_name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.MachineID == "" {
+			req.MachineID = "host-windows-01"
+			req.HostName = "Desktop Workstation"
+		}
+
+		ch, err := pairingService.CreateChallenge(req.MachineID, req.HostName, 5*time.Minute)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -111,8 +138,8 @@ func main() {
 	mux.HandleFunc("/api/v1/machines", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			var m Machine
-			if err := json.NewDecoder(r.Body).Decode(&m); err != nil {
-				http.Error(w, "Invalid machine payload", http.StatusBadRequest)
+			if err := json.NewDecoder(r.Body).Decode(&m); err != nil || m.ID == "" {
+				http.Error(w, "Invalid machine payload: id is required", http.StatusBadRequest)
 				return
 			}
 			machineStore.Register(&m)
@@ -126,7 +153,7 @@ func main() {
 	})
 
 	port := getEnvOrDefault("DEVORBIT_CONTROL_PLANE_PORT", "8080")
-	log.Printf("DevOrbit Control Plane listening on :%s...", port)
+	log.Printf("DevOrbit Control Plane v1.2.1 listening on :%s (Env: %s)...", port, env)
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Fatalf("Control Plane server failed: %v", err)
 	}
