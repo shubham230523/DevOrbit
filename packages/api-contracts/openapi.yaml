@@ -1,10 +1,22 @@
 openapi: 3.0.3
 info:
   title: DevOrbit Control Plane & Host Bridge API
-  version: 1.0.0
+  version: 1.1.0
   description: Official OpenAPI contract governing DevOrbit mobile client, control plane, host bridge, and broker RPC endpoints.
 
 paths:
+  /api/v1/health:
+    get:
+      summary: Health check endpoint for host bridge daemon
+      operationId: healthCheck
+      responses:
+        '200':
+          description: Host bridge operational status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
   /api/v1/auth/pair:
     post:
       summary: Register and pair a mobile device with a host machine
@@ -27,7 +39,7 @@ paths:
 
   /api/v1/workspaces:
     get:
-      summary: List discovered Android Studio projects and workspaces on host
+      summary: List configured and allowed workspaces on host
       operationId: listWorkspaces
       responses:
         '200':
@@ -38,6 +50,44 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/Workspace'
+
+  /api/v1/workspaces/discover:
+    post:
+      summary: Discover Android Studio, Gradle, and Git projects under search roots
+      operationId: discoverWorkspaces
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DiscoverWorkspacesRequest'
+      responses:
+        '200':
+          description: Discovered projects
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Workspace'
+
+  /api/v1/files/list:
+    post:
+      summary: List files and subdirectories in a workspace directory
+      operationId: listDirectory
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ListDirectoryRequest'
+      responses:
+        '200':
+          description: Directory contents
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListDirectoryResponse'
 
   /api/v1/files/read:
     post:
@@ -78,9 +128,129 @@ paths:
                 $ref: '#/components/schemas/WriteFileResponse'
         '409':
           description: Conflict detected (file modified on host)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConflictResponse'
+
+  /api/v1/git/status:
+    post:
+      summary: Retrieve Git repository status for a workspace
+      operationId: getGitStatus
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorkspacePathRequest'
+      responses:
+        '200':
+          description: Git status summary
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GitStatusResponse'
+
+  /api/v1/git/diff:
+    post:
+      summary: Retrieve Git diff for a workspace
+      operationId: getGitDiff
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorkspacePathRequest'
+      responses:
+        '200':
+          description: Git diff text
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GitDiffResponse'
+
+  /api/v1/processes/execute:
+    post:
+      summary: Start a controlled process execution (git, gradlew, adb)
+      operationId: executeProcess
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExecuteProcessRequest'
+      responses:
+        '200':
+          description: Process started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProcessResponse'
+
+  /api/v1/processes/{id}:
+    get:
+      summary: Query status of a running or completed process
+      operationId: getProcessStatus
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Process status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProcessResponse'
+
+  /api/v1/processes/{id}/cancel:
+    post:
+      summary: Cancel a running process
+      operationId: cancelProcess
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Process cancelled
+
+  /api/v1/devices/adb:
+    get:
+      summary: List connected Android ADB devices
+      operationId: listADBDevices
+      responses:
+        '200':
+          description: List of ADB devices
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ADBDevice'
 
 components:
   schemas:
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - os
+        - host_bridge_version
+      properties:
+        status:
+          type: string
+        os:
+          type: string
+        host_bridge_version:
+          type: string
+        allowed_workspaces_count:
+          type: integer
+
     PairingRequest:
       type: object
       required:
@@ -123,7 +293,72 @@ components:
           type: string
         is_android_project:
           type: boolean
+        has_gradle:
+          type: boolean
+        has_git:
+          type: boolean
         gradle_version:
+          type: string
+
+    DiscoverWorkspacesRequest:
+      type: object
+      properties:
+        search_roots:
+          type: array
+          items:
+            type: string
+        max_depth:
+          type: integer
+
+    WorkspacePathRequest:
+      type: object
+      required:
+        - workspace_id
+      properties:
+        workspace_id:
+          type: string
+
+    ListDirectoryRequest:
+      type: object
+      required:
+        - workspace_id
+        - relative_path
+      properties:
+        workspace_id:
+          type: string
+        relative_path:
+          type: string
+
+    ListDirectoryResponse:
+      type: object
+      required:
+        - relative_path
+        - entries
+      properties:
+        relative_path:
+          type: string
+        entries:
+          type: array
+          items:
+            $ref: '#/components/schemas/FileEntry'
+
+    FileEntry:
+      type: object
+      required:
+        - name
+        - relative_path
+        - is_directory
+        - size_bytes
+      properties:
+        name:
+          type: string
+        relative_path:
+          type: string
+        is_directory:
+          type: boolean
+        size_bytes:
+          type: integer
+        mod_time:
           type: string
 
     ReadFileRequest:
@@ -182,4 +417,102 @@ components:
         relative_path:
           type: string
         updated_sha256:
+          type: string
+
+    ConflictResponse:
+      type: object
+      required:
+        - error
+        - current_content
+        - current_sha256
+      properties:
+        error:
+          type: string
+        current_content:
+          type: string
+        current_sha256:
+          type: string
+
+    GitStatusResponse:
+      type: object
+      required:
+        - branch
+        - is_clean
+      properties:
+        branch:
+          type: string
+        is_clean:
+          type: boolean
+        staged_files:
+          type: array
+          items:
+            type: string
+        unstaged_files:
+          type: array
+          items:
+            type: string
+        untracked_files:
+          type: array
+          items:
+            type: string
+
+    GitDiffResponse:
+      type: object
+      required:
+        - diff_text
+      properties:
+        diff_text:
+          type: string
+
+    ExecuteProcessRequest:
+      type: object
+      required:
+        - workspace_id
+        - command
+        - args
+      properties:
+        workspace_id:
+          type: string
+        command:
+          type: string
+        args:
+          type: array
+          items:
+            type: string
+        timeout_seconds:
+          type: integer
+
+    ProcessResponse:
+      type: object
+      required:
+        - process_id
+        - command
+        - status
+      properties:
+        process_id:
+          type: string
+        command:
+          type: string
+        status:
+          type: string # "running", "completed", "failed", "cancelled"
+        exit_code:
+          type: integer
+        stdout:
+          type: string
+        stderr:
+          type: string
+
+    ADBDevice:
+      type: object
+      required:
+        - serial
+        - state
+      properties:
+        serial:
+          type: string
+        state:
+          type: string # "device", "unauthorized", "offline"
+        model:
+          type: string
+        product:
           type: string
