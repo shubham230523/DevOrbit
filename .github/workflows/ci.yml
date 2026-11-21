@@ -1,0 +1,66 @@
+name: DevOrbit CI
+
+on:
+  push:
+    branches: [ main, feature/** ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test-go-services:
+    name: Test Go Microservices & Agents
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Test Control Plane
+        run: |
+          cd services/control-plane
+          go test -v ./...
+
+      - name: Test Connection Broker
+        run: |
+          cd services/connection-broker
+          go test -v ./...
+
+      - name: Test Host Bridge
+        run: |
+          cd agents/host-bridge
+          go test -v ./...
+
+      - name: Test ACP Adapter
+        run: |
+          cd agents/acp-adapter
+          go test -v ./...
+
+      - name: Test AI Router
+        run: |
+          cd agents/ai-router
+          go test -v ./...
+
+  test-flutter-mobile:
+    name: Test Flutter Mobile Application
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Flutter Pub Get & Analyze
+        run: |
+          cd apps/mobile
+          flutter pub get
+          flutter analyze
+
+      - name: Run Flutter Tests
+        run: |
+          cd apps/mobile
+          flutter test

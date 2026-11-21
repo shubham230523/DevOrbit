@@ -1,0 +1,41 @@
+# Binaries and executables
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go
+bin/
+dist/
+vendor/
+*.cover
+
+# Flutter & Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+build/
+ephemeral/
+
+# IDE & Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*.DS_Store
+*.iml
+
+# Node / JS (if any tool outputs)
+node_modules/
+
+# Local configuration & secrets
+*.env
+*.pem
+*.key
+local.properties

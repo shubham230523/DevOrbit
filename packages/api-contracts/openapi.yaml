@@ -1,0 +1,185 @@
+openapi: 3.0.3
+info:
+  title: DevOrbit Control Plane & Host Bridge API
+  version: 1.0.0
+  description: Official OpenAPI contract governing DevOrbit mobile client, control plane, host bridge, and broker RPC endpoints.
+
+paths:
+  /api/v1/auth/pair:
+    post:
+      summary: Register and pair a mobile device with a host machine
+      operationId: pairMachine
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PairingRequest'
+      responses:
+        '200':
+          description: Pairing successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PairingResponse'
+        '401':
+          description: Invalid pairing token or unauthorized host key
+
+  /api/v1/workspaces:
+    get:
+      summary: List discovered Android Studio projects and workspaces on host
+      operationId: listWorkspaces
+      responses:
+        '200':
+          description: List of workspaces
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Workspace'
+
+  /api/v1/files/read:
+    post:
+      summary: Read content of a file within an allowed workspace
+      operationId: readFile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReadFileRequest'
+      responses:
+        '200':
+          description: File content retrieved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadFileResponse'
+        '403':
+          description: Access denied (path outside allowed workspace)
+
+  /api/v1/files/write:
+    post:
+      summary: Write content to a file with SHA256 conflict detection
+      operationId: writeFile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WriteFileRequest'
+      responses:
+        '200':
+          description: File written successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WriteFileResponse'
+        '409':
+          description: Conflict detected (file modified on host)
+
+components:
+  schemas:
+    PairingRequest:
+      type: object
+      required:
+        - machine_id
+        - host_public_key
+        - pairing_code
+      properties:
+        machine_id:
+          type: string
+        host_public_key:
+          type: string
+        pairing_code:
+          type: string
+
+    PairingResponse:
+      type: object
+      required:
+        - session_token
+        - expires_at
+      properties:
+        session_token:
+          type: string
+        expires_at:
+          type: string
+          format: date-time
+
+    Workspace:
+      type: object
+      required:
+        - id
+        - name
+        - root_path
+        - is_android_project
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        root_path:
+          type: string
+        is_android_project:
+          type: boolean
+        gradle_version:
+          type: string
+
+    ReadFileRequest:
+      type: object
+      required:
+        - workspace_id
+        - relative_path
+      properties:
+        workspace_id:
+          type: string
+        relative_path:
+          type: string
+
+    ReadFileResponse:
+      type: object
+      required:
+        - relative_path
+        - content
+        - sha256_hash
+        - is_binary
+      properties:
+        relative_path:
+          type: string
+        content:
+          type: string
+        sha256_hash:
+          type: string
+        is_binary:
+          type: boolean
+        size_bytes:
+          type: integer
+
+    WriteFileRequest:
+      type: object
+      required:
+        - workspace_id
+        - relative_path
+        - new_content
+        - base_sha256
+      properties:
+        workspace_id:
+          type: string
+        relative_path:
+          type: string
+        new_content:
+          type: string
+        base_sha256:
+          type: string
+
+    WriteFileResponse:
+      type: object
+      required:
+        - relative_path
+        - updated_sha256
+      properties:
+        relative_path:
+          type: string
+        updated_sha256:
+          type: string
