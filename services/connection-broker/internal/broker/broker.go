@@ -88,7 +88,6 @@ func NewBroker() *Broker {
 func (b *Broker) checkOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
-		// Native mobile clients (Android/iOS) do not send Origin header
 		return true
 	}
 
@@ -99,7 +98,7 @@ func (b *Broker) checkOrigin(r *http.Request) bool {
 
 	hostname := strings.ToLower(u.Hostname())
 	if b.environment == "development" {
-		return true // Allow all local origins in development mode
+		return true
 	}
 
 	b.mu.RLock()
@@ -131,14 +130,12 @@ func (b *Broker) RevokeDevice(machineID, deviceID string) {
 	defer b.mu.Unlock()
 	delete(b.authorizedDev, machineID+":"+deviceID)
 
-	// Clean up client token credentials
 	for key := range b.authorizedClientTokens {
 		if strings.HasPrefix(key, machineID+":"+deviceID+":") {
 			delete(b.authorizedClientTokens, key)
 		}
 	}
 
-	// Terminate active sessions for revoked device
 	for _, sess := range b.sessions {
 		if sess.MachineID == machineID && sess.DeviceID == deviceID {
 			b.closeSessionLocked(sess.ID)
@@ -150,7 +147,6 @@ func (b *Broker) RegisterHostConnection(machineID, sessionID, token string, conn
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	// Strict Host Authentication Validation
 	expectedToken, registered := b.authorizedHost[machineID]
 	if !registered || expectedToken == "" || token != expectedToken {
 		return nil, ErrUnauthorizedSession
@@ -188,8 +184,7 @@ func (b *Broker) RegisterClientConnection(machineID, deviceID, sessionID, token 
 		return nil, ErrUnauthorizedSession
 	}
 
-	// Validate client token credential if token registration is enforced
-	if expectedToken, ok := b.authorizedClientTokens[machineID+":"+deviceID+":"+sessionID]; ok && expectedToken != "" {
+	if expectedToken, tokenRegistered := b.authorizedClientTokens[machineID+":"+deviceID+":"+sessionID]; tokenRegistered && expectedToken != "" {
 		if token != expectedToken {
 			return nil, ErrUnauthorizedSession
 		}
@@ -225,13 +220,11 @@ func (b *Broker) HandleHostWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check origin before upgrading
 	if !b.checkOrigin(r) {
 		http.Error(w, ErrInvalidOrigin.Error(), http.StatusForbidden)
 		return
 	}
 
-	// Strict Host Authentication Check
 	b.mu.RLock()
 	expectedToken, registered := b.authorizedHost[machineID]
 	b.mu.RUnlock()
@@ -294,13 +287,8 @@ func (b *Broker) HandleClientWebSocket(w http.ResponseWriter, r *http.Request) {
 	expectedToken, tokenRegistered := b.authorizedClientTokens[machineID+":"+deviceID+":"+sessionID]
 	b.mu.RUnlock()
 
-	if !isAuthorized {
-		http.Error(w, "unauthorized device identity or revoked trust", http.StatusForbidden)
-		return
-	}
-
-	if tokenRegistered && expectedToken != "" && token != expectedToken {
-		http.Error(w, "invalid client session token credential", http.StatusForbidden)
+	if !isAuthorized || (tokenRegistered && expectedToken != "" && token != expectedToken) {
+		http.Error(w, "unauthorized client device identity or invalid token credential", http.StatusForbidden)
 		return
 	}
 
