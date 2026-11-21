@@ -85,17 +85,37 @@ func NewBroker() *Broker {
 	}
 }
 
+func extractToken(r *http.Request) string {
+	// 1. Check Authorization Header: Bearer <token>
+	if authHeader := r.Header.Get("Authorization"); authHeader != "" {
+		parts := strings.SplitN(authHeader, " ", 2)
+		if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+			return strings.TrimSpace(parts[1])
+		}
+	}
+
+	// 2. Check Sec-WebSocket-Protocol Header: devorbit-token.<token>
+	if subprotocol := r.Header.Get("Sec-WebSocket-Protocol"); subprotocol != "" {
+		protocols := strings.Split(subprotocol, ",")
+		for _, p := range protocols {
+			p = strings.TrimSpace(p)
+			if strings.HasPrefix(p, "devorbit-token.") {
+				return strings.TrimPrefix(p, "devorbit-token.")
+			}
+		}
+	}
+
+	// 3. Query string fallback for legacy/testing compatibility
+	return r.URL.Query().Get("token")
+}
+
 func (b *Broker) checkOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 
 	if b.environment == "production" {
 		if origin == "" {
-			// In production, require user-agent to indicate native mobile client or reject
-			ua := r.Header.Get("User-Agent")
-			if strings.Contains(ua, "DevOrbitMobile") || strings.Contains(ua, "Dart") {
-				return true
-			}
-			return false
+			// Native mobile clients without Origin header are permitted IF AND ONLY IF valid bearer token is supplied
+			return extractToken(r) != ""
 		}
 
 		u, err := url.Parse(origin)
@@ -108,7 +128,7 @@ func (b *Broker) checkOrigin(r *http.Request) bool {
 		return b.allowedOrigins[hostname]
 	}
 
-	// Development mode allows all local connections
+	// Development mode allows local origins
 	return true
 }
 
@@ -190,7 +210,6 @@ func (b *Broker) RegisterClientConnection(machineID, deviceID, sessionID, token 
 		return nil, ErrUnauthorizedSession
 	}
 
-	// Mandatory fail-closed client token validation
 	expectedToken, tokenRegistered := b.authorizedClientTokens[machineID+":"+deviceID+":"+sessionID]
 	if !tokenRegistered || expectedToken == "" || token != expectedToken {
 		return nil, ErrUnauthorizedSession
@@ -219,10 +238,10 @@ func (b *Broker) RegisterClientConnection(machineID, deviceID, sessionID, token 
 func (b *Broker) HandleHostWebSocket(w http.ResponseWriter, r *http.Request) {
 	machineID := r.URL.Query().Get("machine_id")
 	sessionID := r.URL.Query().Get("session_id")
-	token := r.URL.Query().Get("token")
+	token := extractToken(r)
 
 	if machineID == "" || sessionID == "" || token == "" {
-		http.Error(w, "missing required machine_id, session_id, or token", http.StatusUnauthorized)
+		http.Error(w, "missing required machine_id, session_id, or bearer token credential", http.StatusUnauthorized)
 		return
 	}
 
@@ -276,10 +295,10 @@ func (b *Broker) HandleClientWebSocket(w http.ResponseWriter, r *http.Request) {
 	machineID := r.URL.Query().Get("machine_id")
 	deviceID := r.URL.Query().Get("device_id")
 	sessionID := r.URL.Query().Get("session_id")
-	token := r.URL.Query().Get("token")
+	token := extractToken(r)
 
 	if machineID == "" || deviceID == "" || sessionID == "" || token == "" {
-		http.Error(w, "missing required parameters: machine_id, device_id, session_id, token", http.StatusBadRequest)
+		http.Error(w, "missing required parameters: machine_id, device_id, session_id, or token credential", http.StatusBadRequest)
 		return
 	}
 

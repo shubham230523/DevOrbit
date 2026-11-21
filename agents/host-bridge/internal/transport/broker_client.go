@@ -102,7 +102,6 @@ func (bc *BrokerClient) Start(ctx context.Context) {
 			backoff = 1 * time.Second
 			log.Printf("HostBridge BrokerClient: Successfully connected to broker WSS at %s", bc.BrokerURL)
 
-			// Read loop
 			for {
 				var frame FrameEnvelope
 				if err := conn.ReadJSON(&frame); err != nil {
@@ -121,7 +120,6 @@ func (bc *BrokerClient) Start(ctx context.Context) {
 					continue
 				}
 
-				// Process incoming E2E encrypted application request envelope
 				if frame.Type == "data" && bc.E2ESession != nil && bc.Server != nil {
 					plainReqBytes, err := bc.E2ESession.Decrypt(security.DirClientToHost, frame.EncryptedData, frame.SeqNum, frame.Timestamp)
 					if err != nil {
@@ -135,18 +133,33 @@ func (bc *BrokerClient) Start(ctx context.Context) {
 						continue
 					}
 
-					method := appReq.Method
-					if method == "" {
-						method = "GET"
-					}
-					path := appReq.Path
-					if path == "" {
-						path = "/api/v1/health"
+					// Strict Request Validation: reject empty method or path
+					if appReq.Method == "" || appReq.Path == "" {
+						errResp := ApplicationResponseEnvelope{
+							ProtocolVersion: "1.2",
+							SessionID:       bc.SessionID,
+							RequestID:       appReq.RequestID,
+							StatusCode:      http.StatusBadRequest,
+							Body:            `{"error":"invalid request envelope: method and path are required"}`,
+							SeqNum:          frame.SeqNum,
+							Timestamp:       time.Now().UnixNano(),
+						}
+						respBytes, _ := json.Marshal(errResp)
+						encryptedRespPayload, _ := bc.E2ESession.Encrypt(security.DirHostToClient, respBytes, frame.SeqNum, time.Now().UnixNano())
+						_ = conn.WriteJSON(FrameEnvelope{
+							ProtocolVersion: "1.2",
+							SessionID:       bc.SessionID,
+							Type:            "data",
+							EncryptedData:   encryptedRespPayload,
+							SeqNum:          frame.SeqNum,
+							Timestamp:       time.Now().UnixNano(),
+						})
+						continue
 					}
 
-					req, err := http.NewRequest(method, path, strings.NewReader(appReq.Body))
+					req, err := http.NewRequest(appReq.Method, appReq.Path, strings.NewReader(appReq.Body))
 					if err != nil {
-						log.Printf("HostBridge BrokerClient: Invalid request (%s %s): %v", method, path, err)
+						log.Printf("HostBridge BrokerClient: Invalid request (%s %s): %v", appReq.Method, appReq.Path, err)
 						continue
 					}
 
