@@ -184,11 +184,17 @@ func main() {
 		}
 
 		sessBytes := make([]byte, 16)
-		_, _ = rand.Read(sessBytes)
+		if _, err := rand.Read(sessBytes); err != nil {
+			http.Error(w, "Failed to generate session ID", http.StatusInternalServerError)
+			return
+		}
 		sessionID := fmt.Sprintf("sess-%s", hex.EncodeToString(sessBytes))
 
 		secretBytes := make([]byte, 32)
-		_, _ = rand.Read(secretBytes)
+		if _, err := rand.Read(secretBytes); err != nil {
+			http.Error(w, "Failed to generate session secret", http.StatusInternalServerError)
+			return
+		}
 		sessionSecret := hex.EncodeToString(secretBytes)
 
 		w.Header().Set("Content-Type", "application/json")

@@ -53,6 +53,19 @@ func main() {
 	serverEngine.SetRateLimiter(rateLimiter)
 	serverEngine.SetIdempotencyManager(idempotencyMgr)
 
+	if cfg.AdvertisedURL != "" {
+		serverEngine.SetAdvertisedURL(cfg.AdvertisedURL)
+	}
+	serverEngine.SetBrokerURL(cfg.BrokerURL)
+	serverEngine.SetHostToken(cfg.HostSecret)
+
+	brokerAdminSecret := cfg.BrokerSecret
+	if brokerAdminSecret == "" {
+		brokerAdminSecret = cfg.HostSecret
+	}
+	brokerAuthorizer := transport.NewHTTPBrokerAuthorizer(cfg.BrokerURL, brokerAdminSecret, nil)
+	serverEngine.SetBrokerAuthorizer(brokerAuthorizer)
+
 	mux := http.NewServeMux()
 	serverEngine.RegisterRoutes(mux)
 

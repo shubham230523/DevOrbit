@@ -75,12 +75,13 @@ func TestDevOrbit_FullEndToEndDevelopmentWorkflow(t *testing.T) {
 
 	// Step C: Encrypt & Decrypt Operation Request/Response using E2E Session
 	plainPayload := []byte(readRes.Content)
-	cipherHex, err := e2eSession.Encrypt(security.DirHostToClient, plainPayload, 1, time.Now().UnixNano())
+	timestamp := time.Now().UnixMicro()
+	cipherHex, err := e2eSession.Encrypt(security.DirHostToClient, plainPayload, 1, timestamp)
 	if err != nil {
 		t.Fatalf("Failed to encrypt E2E frame: %v", err)
 	}
 
-	decryptedPayload, err := e2eSession.Decrypt(security.DirHostToClient, cipherHex, 1, time.Now().UnixNano())
+	decryptedPayload, err := e2eSession.Decrypt(security.DirHostToClient, cipherHex, 1, timestamp)
 	if err != nil || string(decryptedPayload) != readRes.Content {
 		t.Fatalf("E2E Decryption mismatch or tag failure: %v", err)
 	}

@@ -38,6 +38,8 @@ func main() {
 
 	mux.HandleFunc("/ws/host", b.HandleHostWebSocket)
 	mux.HandleFunc("/ws/client", b.HandleClientWebSocket)
+	mux.HandleFunc("/api/v1/internal/sessions/authorize", b.HandleAuthorizeSession)
+	mux.HandleFunc("/api/v1/internal/devices/revoke", b.HandleRevoke)
 
 	port := getEnvOrDefault("DEVORBIT_BROKER_PORT", "8081")
 	log.Printf("DevOrbit Connection Broker listening on :%s (Env: %s, Active Sessions: %d)", port, env, b.ActiveSessionCount())

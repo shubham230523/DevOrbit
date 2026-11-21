@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	"devorbit.net/agents/host-bridge/internal/security"
@@ -44,15 +46,42 @@ func (s *Server) HandleCreatePairingChallenge(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	confirmBaseURL := s.advertisedURL
+	if confirmBaseURL == "" {
+		confirmBaseURL = os.Getenv("DEVORBIT_ADVERTISED_URL")
+	}
+	if confirmBaseURL == "" {
+		scheme := "http"
+		if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+			scheme = "https"
+		}
+		host := r.Host
+		if host == "" {
+			host = "127.0.0.1:3000"
+		}
+		confirmBaseURL = fmt.Sprintf("%s://%s", scheme, host)
+	}
+	confirmBaseURL = strings.TrimRight(confirmBaseURL, "/")
+	confirmURL := fmt.Sprintf("%s/api/v1/pairing/confirm", confirmBaseURL)
+
+	brokerURL := s.brokerURL
+	if brokerURL == "" {
+		brokerURL = os.Getenv("DEVORBIT_BROKER_URL")
+	}
+	if brokerURL == "" {
+		brokerURL = "ws://127.0.0.1:8081"
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"v":               "1.0",
+		"v":               ch.Version,
 		"challenge_id":    ch.ID,
 		"host_id":         ch.HostID,
 		"host_name":       ch.HostName,
 		"pairing_payload": ch.Payload,
 		"pairing_secret":  ch.Secret,
-		"confirm_url":     "/api/v1/pairing/confirm",
-		"expires_at":      ch.ExpiresAt.Format(time.RFC3339),
+		"confirm_url":     confirmURL,
+		"broker_url":      brokerURL,
+		"expires_at":      ch.ExpiresAtStr,
 	})
 }
 
@@ -117,19 +146,53 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 
 	// Generate a unique session ID and session-specific E2E master secret
 	sessBytes := make([]byte, 16)
-	_, _ = rand.Read(sessBytes)
+	if _, err := rand.Read(sessBytes); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to generate random session ID")
+		return
+	}
 	sessionID := fmt.Sprintf("sess-%s", hex.EncodeToString(sessBytes))
 
 	secretBytes := make([]byte, 32)
-	_, _ = rand.Read(secretBytes)
+	if _, err := rand.Read(secretBytes); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to generate random session secret")
+		return
+	}
 	sessionSecret := hex.EncodeToString(secretBytes)
 
-	// Connect verified pairing directly to Host Bridge session provisioning
+	// 1. Authorize session with Connection Broker first
+	if s.brokerAuthorizer != nil {
+		err := s.brokerAuthorizer.AuthorizeSession(
+			r.Context(),
+			s.pairingEngine.HostID(),
+			req.DeviceID,
+			sessionID,
+			token,
+			s.hostToken,
+			24*time.Hour,
+		)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "failed to register session authorization with connection broker: "+err.Error())
+			return
+		}
+	}
+
+	// 2. Connect verified pairing directly to Host Bridge session provisioning
 	if s.sessionProvisioner != nil {
 		if err := s.sessionProvisioner(sessionID, req.DeviceID, sessionSecret); err != nil {
+			if s.brokerAuthorizer != nil {
+				_ = s.brokerAuthorizer.RevokeDevice(r.Context(), s.pairingEngine.HostID(), req.DeviceID)
+			}
 			writeError(w, http.StatusInternalServerError, "failed to provision session on host bridge: "+err.Error())
 			return
 		}
+	}
+
+	brokerURL := s.brokerURL
+	if brokerURL == "" {
+		brokerURL = os.Getenv("DEVORBIT_BROKER_URL")
+	}
+	if brokerURL == "" {
+		brokerURL = "ws://127.0.0.1:8081"
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -139,6 +202,7 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 		"session_secret": sessionSecret,
 		"machine_id":     s.pairingEngine.HostID(),
 		"device_id":      req.DeviceID,
+		"broker_url":     brokerURL,
 		"expires_at":     time.Now().Add(24 * time.Hour).Format(time.RFC3339),
 	})
 }

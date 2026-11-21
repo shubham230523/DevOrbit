@@ -49,17 +49,31 @@ class PairingClient {
       throw PairingException('Pairing challenge has expired. Generate a new QR code on the host.');
     }
 
-    final proofSig = secureStorage.generateDeviceProof(
-      payload.pairingPayload,
-      deviceId,
-      payload.pairingSecret,
+    final proofSig = secureStorage.generateBoundDeviceProof(
+      version: payload.version,
+      challengeId: payload.challengeId,
+      payload: payload.pairingPayload,
+      hostId: payload.hostId,
+      deviceId: deviceId,
+      expiresAtStr: payload.rawExpiresAt,
+      secretKey: payload.pairingSecret,
     );
 
-    final confirmUri = Uri.parse(
-      payload.confirmUrl.endsWith('/api/v1/pairing/confirm')
-          ? payload.confirmUrl
-          : '${payload.confirmUrl.replaceAll(RegExp(r'/+$'), '')}/api/v1/pairing/confirm',
-    );
+    // Validate confirmation URI: must be absolute with valid scheme and path
+    final confirmUri = Uri.tryParse(payload.confirmUrl);
+    if (confirmUri == null || !confirmUri.hasScheme || !confirmUri.hasAuthority || confirmUri.host.isEmpty) {
+      throw PairingException('Invalid confirmation URL in QR payload: ${payload.confirmUrl}');
+    }
+    final scheme = confirmUri.scheme.toLowerCase();
+    if (scheme != 'http' && scheme != 'https') {
+      throw PairingException('Unsupported URI scheme in confirm_url: $scheme. Must be http or https.');
+    }
+    if (confirmUri.hasPort && (confirmUri.port <= 0 || confirmUri.port > 65535)) {
+      throw PairingException('Invalid port in confirm_url: ${confirmUri.port}');
+    }
+    if (!confirmUri.path.endsWith('/api/v1/pairing/confirm')) {
+      throw PairingException('confirm_url path must end with /api/v1/pairing/confirm, got: ${confirmUri.path}');
+    }
 
     final reqBody = jsonEncode({
       'challenge_id': payload.challengeId,
@@ -108,16 +122,40 @@ class PairingClient {
     final Map<String, dynamic> respJson = jsonDecode(response.body) as Map<String, dynamic>;
 
     final token = respJson['session_token']?.toString();
-    final sessionId = respJson['session_id']?.toString() ?? 'sess-${DateTime.now().millisecondsSinceEpoch}';
-    final masterSecret = respJson['session_secret']?.toString() ?? payload.pairingSecret;
+    final sessionId = respJson['session_id']?.toString();
+    final masterSecret = respJson['session_secret']?.toString();
+    final respMachineId = respJson['machine_id']?.toString();
+    final respDeviceId = respJson['device_id']?.toString();
     final brokerUrl = respJson['broker_url']?.toString() ?? payload.brokerUrl;
     final expiresAtStr = respJson['expires_at']?.toString();
 
-    if (token == null || token.isEmpty) {
-      throw PairingException('Server confirmed pairing but failed to issue a valid session token');
+    // Mandatory server-issued credentials validation
+    if (token == null || token.trim().isEmpty) {
+      throw PairingException('Server confirmed pairing but failed to issue a valid session token (session_token)');
     }
-    if (masterSecret.isEmpty) {
-      throw PairingException('Server confirmed pairing but failed to provide an E2E session secret');
+    if (sessionId == null || sessionId.trim().isEmpty) {
+      throw PairingException('Server confirmed pairing but failed to issue a valid session ID (session_id)');
+    }
+    if (masterSecret == null || masterSecret.trim().isEmpty) {
+      throw PairingException('Server confirmed pairing but failed to provide an E2E session secret (session_secret)');
+    }
+    if (masterSecret == payload.pairingSecret) {
+      throw PairingException('Server insecurely echoed QR pairing secret as E2E session secret');
+    }
+    if (respMachineId == null || respMachineId.trim().isEmpty) {
+      throw PairingException('Server confirmed pairing but omitted required machine_id');
+    }
+    if (respMachineId != payload.hostId) {
+      throw PairingException('Server machine_id ($respMachineId) mismatch with QR host_id (${payload.hostId})');
+    }
+    if (respDeviceId == null || respDeviceId.trim().isEmpty) {
+      throw PairingException('Server confirmed pairing but omitted required device_id');
+    }
+    if (respDeviceId != deviceId) {
+      throw PairingException('Server device_id ($respDeviceId) mismatch with requested device_id ($deviceId)');
+    }
+    if (brokerUrl == null || brokerUrl.trim().isEmpty) {
+      throw PairingException('Server confirmed pairing but omitted broker_url');
     }
 
     // Persist securely to platform storage

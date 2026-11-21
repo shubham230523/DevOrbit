@@ -124,6 +124,14 @@ func TestBroker_AuthenticatedEndToEndWebSocketRelay(t *testing.T) {
 	}
 	defer clientConn.Close()
 
+	var ackFrame FrameEnvelope
+	if err := clientConn.ReadJSON(&ackFrame); err != nil {
+		t.Fatalf("Failed to read session_ready ack frame: %v", err)
+	}
+	if ackFrame.Type != "session_ready" {
+		t.Fatalf("Expected session_ready frame, got: %s", ackFrame.Type)
+	}
+
 	time.Sleep(50 * time.Millisecond)
 
 	// 3. Client sends E2E Encrypted Payload Frame to Broker -> Broker Relays to Host
@@ -234,6 +242,11 @@ func TestBroker_CrossComponentEndToEndSecurity(t *testing.T) {
 		t.Fatalf("Client connection failed: %v", err)
 	}
 	defer clientConn.Close()
+
+	var clientAck FrameEnvelope
+	if err := clientConn.ReadJSON(&clientAck); err != nil || clientAck.Type != "session_ready" {
+		t.Fatalf("Client failed to receive session_ready: %v", err)
+	}
 
 	// Step 3: Derive directional E2E keys
 	cKey, hKey, err := deriveTestKeys(masterSecret, sessionID, deviceID)

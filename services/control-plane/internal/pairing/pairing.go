@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -36,13 +37,15 @@ type PairedDevice struct {
 }
 
 type Challenge struct {
-	ID        string    `json:"id"`
-	MachineID string    `json:"machine_id"`
-	HostName  string    `json:"host_name"`
-	Payload   string    `json:"payload"`
-	Secret    string    `json:"pairing_secret,omitempty"`
-	Consumed  bool      `json:"consumed"`
-	ExpiresAt time.Time `json:"expires_at"`
+	Version      string    `json:"v"`
+	ID           string    `json:"id"`
+	MachineID    string    `json:"machine_id"`
+	HostName     string    `json:"host_name"`
+	Payload      string    `json:"payload"`
+	Secret       string    `json:"pairing_secret,omitempty"`
+	Consumed     bool      `json:"consumed"`
+	ExpiresAt    time.Time `json:"expires_at"`
+	ExpiresAtStr string    `json:"expires_at_str"`
 }
 
 type Service struct {
@@ -60,32 +63,52 @@ func NewService(secret string) *Service {
 	}
 }
 
+func ConstructProofAuthenticatedData(version, challengeID, payload, hostID, deviceID, expiresAtStr string) string {
+	return fmt.Sprintf("%s:%s:%s:%s:%s:%s", version, challengeID, payload, hostID, deviceID, expiresAtStr)
+}
+
+func GenerateProof(version, challengeID, payload, hostID, deviceID, expiresAtStr, ephemeralSecret string) string {
+	authData := ConstructProofAuthenticatedData(version, challengeID, payload, hostID, deviceID, expiresAtStr)
+	mac := hmac.New(sha256.New, []byte(ephemeralSecret))
+	mac.Write([]byte(authData))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
 func (s *Service) CreateChallenge(machineID, hostName string, ttl time.Duration) (*Challenge, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to generate challenge ID: %w", err)
 	}
 	chID := fmt.Sprintf("ch-%s", hex.EncodeToString(b))
 
 	payloadBytes := make([]byte, 32)
-	_, _ = rand.Read(payloadBytes)
+	if _, err := rand.Read(payloadBytes); err != nil {
+		return nil, fmt.Errorf("failed to generate pairing payload: %w", err)
+	}
 	payloadStr := hex.EncodeToString(payloadBytes)
 
 	secretBytes := make([]byte, 32)
-	_, _ = rand.Read(secretBytes)
+	if _, err := rand.Read(secretBytes); err != nil {
+		return nil, fmt.Errorf("failed to generate ephemeral pairing secret: %w", err)
+	}
 	secretStr := hex.EncodeToString(secretBytes)
 
+	expiresAt := time.Now().Add(ttl)
+	expiresAtStr := expiresAt.Format(time.RFC3339)
+
 	ch := &Challenge{
-		ID:        chID,
-		MachineID: machineID,
-		HostName:  hostName,
-		Payload:   payloadStr,
-		Secret:    secretStr,
-		Consumed:  false,
-		ExpiresAt: time.Now().Add(ttl),
+		Version:      "1.0",
+		ID:           chID,
+		MachineID:    machineID,
+		HostName:     hostName,
+		Payload:      payloadStr,
+		Secret:       secretStr,
+		Consumed:     false,
+		ExpiresAt:    expiresAt,
+		ExpiresAtStr: expiresAtStr,
 	}
 
 	s.challenges[chID] = ch
@@ -109,27 +132,18 @@ func (s *Service) ConfirmPairing(chID, deviceID, deviceName, pubKey, proofSig st
 		return nil, ErrChallengeExpired
 	}
 
-	keyToUse := s.secretKey
-	if ch.Secret != "" {
-		keyToUse = []byte(ch.Secret)
+	if ch.Secret == "" {
+		return nil, errors.New("challenge has no ephemeral pairing secret")
 	}
 
-	// Verify cryptographic proof of possession: HMAC-SHA256(key, ch.Payload + ":" + deviceID)
-	mac := hmac.New(sha256.New, keyToUse)
-	mac.Write([]byte(ch.Payload + ":" + deviceID))
+	// Verify cryptographic proof of possession EXCLUSIVELY with the challenge's ephemeral secret
+	expectedAuthData := ConstructProofAuthenticatedData(ch.Version, ch.ID, ch.Payload, ch.MachineID, deviceID, ch.ExpiresAtStr)
+	mac := hmac.New(sha256.New, []byte(ch.Secret))
+	mac.Write([]byte(expectedAuthData))
 	expectedSig := hex.EncodeToString(mac.Sum(nil))
 
-	if !hmac.Equal([]byte(proofSig), []byte(expectedSig)) {
-		if ch.Secret != "" {
-			macFallback := hmac.New(sha256.New, s.secretKey)
-			macFallback.Write([]byte(ch.Payload + ":" + deviceID))
-			fallbackSig := hex.EncodeToString(macFallback.Sum(nil))
-			if !hmac.Equal([]byte(proofSig), []byte(fallbackSig)) {
-				return nil, ErrInvalidProof
-			}
-		} else {
-			return nil, ErrInvalidProof
-		}
+	if subtle.ConstantTimeCompare([]byte(proofSig), []byte(expectedSig)) != 1 {
+		return nil, ErrInvalidProof
 	}
 
 	ch.Consumed = true
@@ -148,10 +162,15 @@ func (s *Service) ConfirmPairing(chID, deviceID, deviceName, pubKey, proofSig st
 	return dev, nil
 }
 
-func (s *Service) GenerateProof(chPayload, deviceID string) string {
-	mac := hmac.New(sha256.New, s.secretKey)
-	mac.Write([]byte(chPayload + ":" + deviceID))
-	return hex.EncodeToString(mac.Sum(nil))
+func (s *Service) GenerateProofForChallenge(chID, deviceID string) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	ch, found := s.challenges[chID]
+	if !found {
+		return "", errors.New("challenge not found")
+	}
+	return GenerateProof(ch.Version, ch.ID, ch.Payload, ch.MachineID, deviceID, ch.ExpiresAtStr, ch.Secret), nil
 }
 
 func (s *Service) RevokeDevice(machineID, deviceID string) error {
