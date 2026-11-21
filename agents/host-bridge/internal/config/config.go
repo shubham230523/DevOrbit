@@ -7,11 +7,15 @@ import (
 )
 
 type Config struct {
-	AllowedRoots   []string
-	Port           int
-	LogLevel       string
-	MaxFileSizeMB  int64
-	AllowedBinaries []string
+	AllowedRoots    []string
+	Port            int
+	LogLevel        string
+	MaxFileSizeMB   int64
+	AllowedBinaries  []string
+	HostID          string
+	HostName        string
+	HostSecret      string
+	BrokerURL       string
 }
 
 func LoadConfig() *Config {
@@ -27,6 +31,29 @@ func LoadConfig() *Config {
 		if val, err := strconv.ParseInt(m, 10, 64); err == nil {
 			maxSize = val
 		}
+	}
+
+	hostID := os.Getenv("DEVORBIT_HOST_ID")
+	if hostID == "" {
+		hostID = "host-windows-01"
+	}
+
+	hostName := os.Getenv("DEVORBIT_HOST_NAME")
+	if hostName == "" {
+		hostName, _ = os.Hostname()
+		if hostName == "" {
+			hostName = "Desktop Workstation"
+		}
+	}
+
+	hostSecret := os.Getenv("DEVORBIT_HOST_SECRET")
+	if hostSecret == "" {
+		hostSecret = "devorbit-host-bridge-master-secret-key-32b"
+	}
+
+	brokerURL := os.Getenv("DEVORBIT_BROKER_URL")
+	if brokerURL == "" {
+		brokerURL = "ws://localhost:8081"
 	}
 
 	// Default allowed roots
@@ -45,6 +72,10 @@ func LoadConfig() *Config {
 		Port:          port,
 		LogLevel:      "info",
 		MaxFileSizeMB: maxSize,
+		HostID:        hostID,
+		HostName:      hostName,
+		HostSecret:    hostSecret,
+		BrokerURL:     brokerURL,
 		AllowedBinaries: []string{
 			"git", "git.exe", "gradlew", "gradlew.bat", "gradle", "gradle.bat", "adb", "adb.exe",
 		},

@@ -31,17 +31,22 @@ class HostBridgeApiClient {
     return null;
   }
 
-  Future<List<dynamic>> listWorkspaces() async {
+  Future<Map<String, dynamic>> listWorkspaces() async {
     try {
       final res = await http.get(
         Uri.parse('$baseUrl/api/v1/workspaces'),
         headers: _headers,
       ).timeout(const Duration(seconds: 5));
+
       if (res.statusCode == 200) {
-        return jsonDecode(res.body) as List<dynamic>;
+        final list = jsonDecode(res.body) as List<dynamic>;
+        return {'success': true, 'workspaces': list};
+      } else {
+        return {'success': false, 'error': 'HTTP ${res.statusCode}: ${res.body}'};
       }
-    } catch (_) {}
-    return [];
+    } catch (e) {
+      return {'success': false, 'error': e.toString()};
+    }
   }
 
   Future<Map<String, dynamic>?> listDirectory(String workspaceId, String relativePath) async {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -48,9 +49,19 @@ func (s *MachineStore) List() []*Machine {
 	return list
 }
 
+func getEnvOrDefault(key, fallback string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
+	return fallback
+}
+
 func main() {
-	authService := auth.NewService("devorbit-secret-key")
-	pairingService := pairing.NewService("devorbit-pairing-secret-key")
+	jwtSecret := getEnvOrDefault("DEVORBIT_JWT_SECRET", "devorbit-control-plane-jwt-secret-key-32b")
+	pairingSecret := getEnvOrDefault("DEVORBIT_PAIRING_SECRET", "devorbit-control-plane-pairing-secret-key")
+
+	authService := auth.NewService(jwtSecret)
+	pairingService := pairing.NewService(pairingSecret)
 	machineStore := NewMachineStore()
 
 	mux := http.NewServeMux()
@@ -65,7 +76,16 @@ func main() {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		token, err := authService.GenerateToken("host-123", "device-456")
+		var req struct {
+			MachineID string `json:"machine_id"`
+			DeviceID  string `json:"device_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.MachineID == "" || req.DeviceID == "" {
+			req.MachineID = "host-windows-01"
+			req.DeviceID = "phone-android-01"
+		}
+
+		token, err := authService.GenerateToken(req.MachineID, req.DeviceID)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -105,8 +125,9 @@ func main() {
 		json.NewEncoder(w).Encode(machineStore.List())
 	})
 
-	log.Println("DevOrbit Control Plane listening on :8080...")
-	if err := http.ListenAndServe(":8080", mux); err != nil {
+	port := getEnvOrDefault("DEVORBIT_CONTROL_PLANE_PORT", "8080")
+	log.Printf("DevOrbit Control Plane listening on :%s...", port)
+	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Fatalf("Control Plane server failed: %v", err)
 	}
 }

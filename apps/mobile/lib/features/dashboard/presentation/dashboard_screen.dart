@@ -2,11 +2,11 @@ import 'package:flutter/material.dart';
 import '../../../core/network/api_client.dart';
 
 class DashboardScreen extends StatefulWidget {
-  final String hostBaseUrl;
+  final String? initialHostBaseUrl;
 
   const DashboardScreen({
     super.key,
-    this.hostBaseUrl = 'http://10.0.2.2:8082', // Android emulator loopback host bridge endpoint
+    this.initialHostBaseUrl,
   });
 
   @override
@@ -14,34 +14,50 @@ class DashboardScreen extends StatefulWidget {
 }
 
 class _DashboardScreenState extends State<DashboardScreen> {
+  late TextEditingController _hostController;
   late HostBridgeApiClient _apiClient;
   bool _isLoading = true;
   bool _isOnline = false;
   Map<String, dynamic>? _healthData;
   List<dynamic> _workspaces = [];
+  bool _workspaceFetchError = false;
   String? _errorMessage;
 
   @override
   void initState() {
     super.initState();
-    _apiClient = HostBridgeApiClient(baseUrl: widget.hostBaseUrl);
+    final defaultUrl = widget.initialHostBaseUrl ?? 'http://10.0.2.2:8082';
+    _hostController = TextEditingController(text: defaultUrl);
+    _apiClient = HostBridgeApiClient(baseUrl: defaultUrl);
     _fetchLiveHostData();
   }
 
   Future<void> _fetchLiveHostData() async {
+    final url = _hostController.text.trim();
+    if (url.isEmpty) return;
+
+    _apiClient = HostBridgeApiClient(baseUrl: url);
+
     setState(() {
       _isLoading = true;
       _errorMessage = null;
+      _workspaceFetchError = false;
     });
 
     final health = await _apiClient.getHealth();
     if (health != null && health['status'] == 'ok') {
-      final workspaces = await _apiClient.listWorkspaces();
+      final wsRes = await _apiClient.listWorkspaces();
       if (mounted) {
         setState(() {
           _isOnline = true;
           _healthData = health;
-          _workspaces = workspaces;
+          if (wsRes['success'] == true) {
+            _workspaces = wsRes['workspaces'] as List<dynamic>;
+            _workspaceFetchError = false;
+          } else {
+            _workspaces = [];
+            _workspaceFetchError = true;
+          }
           _isLoading = false;
         });
       }
@@ -52,10 +68,16 @@ class _DashboardScreenState extends State<DashboardScreen> {
           _healthData = null;
           _workspaces = [];
           _isLoading = false;
-          _errorMessage = 'Unable to reach Host Bridge at ${widget.hostBaseUrl}';
+          _errorMessage = 'Unable to establish session with Host Bridge at $url';
         });
       }
     }
+  }
+
+  @override
+  void dispose() {
+    _hostController.dispose();
+    super.dispose();
   }
 
   @override
@@ -72,6 +94,36 @@ class _DashboardScreenState extends State<DashboardScreen> {
       child: ListView(
         padding: const EdgeInsets.all(16.0),
         children: [
+          // Endpoint Selection Input Card
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12.0),
+              child: Row(
+                children: [
+                  const Icon(Icons.link, color: Colors.purpleAccent),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: TextField(
+                      controller: _hostController,
+                      decoration: const InputDecoration(
+                        labelText: 'Host Bridge Endpoint',
+                        hintText: 'e.g. http://192.168.1.100:8082',
+                        isDense: true,
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  ElevatedButton(
+                    onPressed: _isLoading ? null : _fetchLiveHostData,
+                    child: const Text('Connect'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+
           // Real Machine Health Status Card
           Card(
             child: ListTile(
@@ -81,7 +133,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 size: 32,
               ),
               title: Text(
-                _isOnline ? '$hostname ($osType/$arch)' : 'Host Offline',
+                _isOnline ? '$hostname ($osType/$arch)' : 'Host Session Offline',
                 style: const TextStyle(fontWeight: FontWeight.bold),
               ),
               subtitle: _isOnline
@@ -92,7 +144,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
                   Chip(
-                    label: Text(_isOnline ? 'Active' : 'Offline'),
+                    label: Text(_isOnline ? 'CONNECTED' : 'DISCONNECTED'),
                     backgroundColor: _isOnline
                         ? Colors.green.withValues(alpha: 0.2)
                         : Colors.red.withValues(alpha: 0.2),
@@ -134,8 +186,16 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     const Padding(
                       padding: EdgeInsets.all(16.0),
                       child: Text(
-                        'Host is offline. Start the Host Bridge daemon on your PC to view live projects.',
+                        'Host is offline. Connect to Host Bridge daemon to view live projects.',
                         style: TextStyle(color: Colors.grey),
+                      ),
+                    )
+                  else if (_workspaceFetchError)
+                    const Padding(
+                      padding: EdgeInsets.all(16.0),
+                      child: Text(
+                        'Error retrieving workspaces from host: Authorization or network failure.',
+                        style: TextStyle(color: Colors.orangeAccent),
                       ),
                     )
                   else if (_workspaces.isEmpty)
@@ -159,35 +219,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
                         trailing: const Icon(Icons.chevron_right),
                       );
                     }),
-                ],
-              ),
-            ),
-          ),
-          const SizedBox(height: 12),
-
-          // AI Agent Active Status Card
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16.0),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'AI Agent Integration Status',
-                    style: Theme.of(context).textTheme.titleMedium,
-                  ),
-                  const Divider(),
-                  ListTile(
-                    leading: const Icon(Icons.auto_awesome, color: Colors.amber),
-                    title: const Text('Google Antigravity Agent'),
-                    subtitle: Text('Model: Gemini 3.8 Flash • Router: ${widget.hostBaseUrl}'),
-                    trailing: Chip(
-                      label: Text(_isOnline ? 'Ready' : 'Unavailable'),
-                      backgroundColor: _isOnline
-                          ? Colors.amber.withValues(alpha: 0.2)
-                          : Colors.grey.withValues(alpha: 0.2),
-                    ),
-                  ),
                 ],
               ),
             ),

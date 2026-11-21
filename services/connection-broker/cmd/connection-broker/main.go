@@ -4,9 +4,17 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 
 	"devorbit.net/services/connection-broker/internal/broker"
 )
+
+func getEnvOrDefault(key, fallback string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
+	return fallback
+}
 
 func main() {
 	b := broker.NewBroker()
@@ -18,8 +26,12 @@ func main() {
 		fmt.Fprintf(w, `{"status":"ok","service":"connection-broker","active_sessions":%d}`, b.ActiveSessionCount())
 	})
 
-	log.Printf("DevOrbit Connection Broker listening on :8081 (Active Sessions: %d)", b.ActiveSessionCount())
-	if err := http.ListenAndServe(":8081", mux); err != nil {
+	mux.HandleFunc("/ws/host", b.HandleHostWebSocket)
+	mux.HandleFunc("/ws/client", b.HandleClientWebSocket)
+
+	port := getEnvOrDefault("DEVORBIT_BROKER_PORT", "8081")
+	log.Printf("DevOrbit Connection Broker listening on :%s (Active Sessions: %d)", port, b.ActiveSessionCount())
+	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Fatalf("Connection Broker server failed: %v", err)
 	}
 }

@@ -2,6 +2,8 @@ package broker
 
 import (
 	"errors"
+	"log"
+	"net/http"
 	"sync"
 	"time"
 
@@ -16,6 +18,14 @@ var (
 
 const MaxFrameSizeBytes = 10 * 1024 * 1024 // 10 MB
 
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024 * 1024,
+	WriteBufferSize: 1024 * 1024,
+	CheckOrigin: func(r *http.Request) bool {
+		return true // Allow all origins in local/development mode
+	},
+}
+
 type ConnectionMode string
 
 const (
@@ -29,6 +39,7 @@ type FrameEnvelope struct {
 	Type            string `json:"type"` // "data", "ping", "pong", "close"
 	EncryptedData   string `json:"encrypted_payload"`
 	SeqNum          int64  `json:"seq_num"`
+	Timestamp       int64  `json:"timestamp"`
 }
 
 type Session struct {
@@ -123,6 +134,75 @@ func (b *Broker) RegisterClientConnection(machineID, deviceID, sessionID string,
 	sess.ClientConn = conn
 
 	return sess, nil
+}
+
+func (b *Broker) HandleHostWebSocket(w http.ResponseWriter, r *http.Request) {
+	machineID := r.URL.Query().Get("machine_id")
+	sessionID := r.URL.Query().Get("session_id")
+	if machineID == "" || sessionID == "" {
+		http.Error(w, "missing machine_id or session_id query param", http.StatusBadRequest)
+		return
+	}
+
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("Failed to upgrade host WebSocket: %v", err)
+		return
+	}
+
+	sess, err := b.RegisterHostConnection(machineID, sessionID, conn)
+	if err != nil {
+		conn.Close()
+		return
+	}
+	log.Printf("Broker: Host WSS connected for machine=%s session=%s", machineID, sessionID)
+
+	defer b.CloseSession(sess.ID)
+
+	for {
+		var frame FrameEnvelope
+		if err := conn.ReadJSON(&frame); err != nil {
+			break
+		}
+		// Relay frame directly from Host to Client without decrypting payload
+		_ = b.RelayFrameFromHostToClient(sessionID, &frame)
+	}
+}
+
+func (b *Broker) HandleClientWebSocket(w http.ResponseWriter, r *http.Request) {
+	machineID := r.URL.Query().Get("machine_id")
+	deviceID := r.URL.Query().Get("device_id")
+	sessionID := r.URL.Query().Get("session_id")
+
+	if machineID == "" || deviceID == "" || sessionID == "" {
+		http.Error(w, "missing machine_id, device_id, or session_id", http.StatusBadRequest)
+		return
+	}
+
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("Failed to upgrade client WebSocket: %v", err)
+		return
+	}
+
+	sess, err := b.RegisterClientConnection(machineID, deviceID, sessionID, conn)
+	if err != nil {
+		conn.WriteJSON(map[string]string{"error": err.Error()})
+		conn.Close()
+		return
+	}
+	log.Printf("Broker: Client WSS connected for machine=%s device=%s session=%s", machineID, deviceID, sessionID)
+
+	defer b.CloseSession(sess.ID)
+
+	for {
+		var frame FrameEnvelope
+		if err := conn.ReadJSON(&frame); err != nil {
+			break
+		}
+		// Relay frame directly from Client to Host without decrypting payload
+		_ = b.RelayFrameFromClientToHost(sessionID, &frame)
+	}
 }
 
 func (b *Broker) RelayFrameFromClientToHost(sessionID string, frame *FrameEnvelope) error {

@@ -17,7 +17,8 @@ import (
 	"devorbit.net/agents/host-bridge/internal/infrastructure/git"
 	"devorbit.net/agents/host-bridge/internal/infrastructure/process"
 	"devorbit.net/agents/host-bridge/internal/security"
-	transport "devorbit.net/agents/host-bridge/internal/transport/http"
+	"devorbit.net/agents/host-bridge/internal/transport"
+	httptransport "devorbit.net/agents/host-bridge/internal/transport/http"
 )
 
 func main() {
@@ -26,7 +27,7 @@ func main() {
 	// 1. Security Layer
 	jail := security.NewWorkspaceJail(cfg.AllowedRoots)
 	policy := security.NewDefaultCommandPolicy()
-	pairingEngine := security.NewPairingEngine("host-windows-01", "Desktop Workstation", "master-host-secret-key-32-bytes")
+	pairingEngine := security.NewPairingEngine(cfg.HostID, cfg.HostName, cfg.HostSecret)
 	rateLimiter := security.NewRateLimiter(5, 10*time.Minute)
 	idempotencyMgr := security.NewIdempotencyManager(30 * time.Minute)
 
@@ -44,7 +45,7 @@ func main() {
 	dsSvc := application.NewDeviceService(adbClient)
 
 	// 4. Transport Layer
-	serverEngine := transport.NewServer(wsSvc, fsSvc, psSvc, gsSvc, dsSvc)
+	serverEngine := httptransport.NewServer(wsSvc, fsSvc, psSvc, gsSvc, dsSvc)
 	serverEngine.SetPairingEngine(pairingEngine)
 	serverEngine.SetRateLimiter(rateLimiter)
 	serverEngine.SetIdempotencyManager(idempotencyMgr)
@@ -58,8 +59,13 @@ func main() {
 		Handler: mux,
 	}
 
+	// 5. Outbound Connection Broker Client
+	brokerClient := transport.NewBrokerClient(cfg.BrokerURL, cfg.HostID, "sess-host-init-001")
+	brokerClient.Start(context.Background())
+	defer brokerClient.Stop()
+
 	go func() {
-		log.Printf("DevOrbit Host Bridge v1.2.1 listening on %s (Allowed Roots: %d)", addr, len(cfg.AllowedRoots))
+		log.Printf("DevOrbit Host Bridge v1.2.1 listening on %s (HostID: %s, Allowed Roots: %d)", addr, cfg.HostID, len(cfg.AllowedRoots))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Host Bridge server failed: %v", err)
 		}
