@@ -6,6 +6,6 @@ void main() {
     await tester.pumpWidget(const DevOrbitApp());
 
     expect(find.text('DevOrbit Dashboard'), findsOneWidget);
-    expect(find.text('Dev Host: Linux Workstation 01'), findsOneWidget);
+    expect(find.text('Live Discovered Projects'), findsOneWidget);
   });
 }

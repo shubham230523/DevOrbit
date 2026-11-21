@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
 	"runtime"
 	"strings"
 
@@ -45,9 +46,12 @@ func (s *Server) SetIdempotencyManager(mgr *security.IdempotencyManager) {
 
 func (s *Server) HandleHealth(w http.ResponseWriter, r *http.Request) {
 	wsList, _ := s.workspaceSvc.ListWorkspaces()
+	hostname, _ := os.Hostname()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":                   "ok",
 		"os":                       runtime.GOOS,
+		"arch":                     runtime.GOARCH,
+		"hostname":                 hostname,
 		"host_bridge_version":      "1.2.1",
 		"allowed_workspaces_count": len(wsList),
 	})

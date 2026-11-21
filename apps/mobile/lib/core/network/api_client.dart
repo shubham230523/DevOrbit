@@ -13,6 +13,24 @@ class HostBridgeApiClient {
         if (sessionToken != null) 'Authorization': 'Bearer $sessionToken',
       };
 
+  Future<Map<String, dynamic>?> getHealth() async {
+    try {
+      final stopwatch = Stopwatch()..start();
+      final res = await http.get(
+        Uri.parse('$baseUrl/api/v1/health'),
+        headers: _headers,
+      ).timeout(const Duration(seconds: 4));
+      stopwatch.stop();
+
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body) as Map<String, dynamic>;
+        data['latency_ms'] = stopwatch.elapsedMilliseconds;
+        return data;
+      }
+    } catch (_) {}
+    return null;
+  }
+
   Future<List<dynamic>> listWorkspaces() async {
     try {
       final res = await http.get(
