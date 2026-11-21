@@ -106,19 +106,67 @@ class _DashboardScreenState extends State<DashboardScreen> {
   Future<void> _openPairingDialog() async {
     final success = await showDialog<bool>(
       context: context,
-      builder: (context) => const QrPairingDialog(),
+      builder: (context) => QrPairingDialog(secureStorage: _storage),
     );
 
     if (success == true && mounted) {
-      await _initCredentialsAndConnect(_brokerController.text.trim());
-      if (mounted) {
+      final session = await _storage.getPairedSession();
+      if (session != null && mounted) {
+        setState(() {
+          _machineId = session['machineId'];
+          _deviceId = session['deviceId'];
+          _sessionId = session['sessionId'];
+          _token = session['token'];
+          _masterSecret = session['masterSecret'];
+          if (session['brokerUrl'] != null && session['brokerUrl']!.isNotEmpty) {
+            _brokerController.text = session['brokerUrl']!;
+          }
+          _errorMessage = null;
+        });
+
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
             content: Text('Host Machine Paired Successfully!'),
             backgroundColor: Colors.green,
           ),
         );
+
+        if (_brokerController.text.trim().isNotEmpty) {
+          _connectToBroker();
+        }
+      } else if (mounted) {
+        setState(() {
+          _errorMessage = 'Pairing verification failed: no valid session found in secure storage.';
+        });
       }
+    }
+  }
+
+  Future<void> _handleLogout() async {
+    _brokerClient?.disconnect();
+    _brokerClient?.dispose();
+    _brokerClient = null;
+
+    await _storage.clearPairedSession();
+
+    if (mounted) {
+      setState(() {
+        _machineId = null;
+        _deviceId = null;
+        _sessionId = null;
+        _token = null;
+        _masterSecret = null;
+        _connectionState = BrokerConnectionState.disconnected;
+        _healthData = null;
+        _workspaces = [];
+        _errorMessage = 'Pairing Required: No authenticated host session credentials available. Pair a host machine to connect.';
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Device unpaired. Session credentials cleared from secure storage.'),
+        ),
+      );
     }
   }
 
@@ -152,11 +200,24 @@ class _DashboardScreenState extends State<DashboardScreen> {
       _errorMessage = null;
     });
 
-    _brokerClient!.stateStream.listen((state) {
+    _brokerClient!.stateStream.listen((state) async {
       if (mounted) {
         setState(() {
           _connectionState = state;
         });
+      }
+      if (state == BrokerConnectionState.revoked) {
+        await _storage.clearPairedSession();
+        if (mounted) {
+          setState(() {
+            _machineId = null;
+            _deviceId = null;
+            _sessionId = null;
+            _token = null;
+            _masterSecret = null;
+            _errorMessage = 'Device revoked: Credentials invalidated and cleared from secure storage.';
+          });
+        }
       }
     });
 
@@ -387,13 +448,21 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       ? Text('Host Bridge $version • Via Broker WSS\nAllowed Roots: $allowedRoots')
                       : Text(_errorMessage ?? _getStatusLabel(_connectionState)),
               isThreeLine: isOnline,
-              trailing: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
+              trailing: Row(
+                mainAxisSize: MainAxisSize.min,
                 children: [
                   Chip(
                     label: Text(_getStatusLabel(_connectionState)),
                     backgroundColor: _getStatusColor(_connectionState).withValues(alpha: 0.2),
                   ),
+                  if (hasValidCredentials) ...[
+                    const SizedBox(width: 4),
+                    IconButton(
+                      icon: const Icon(Icons.link_off, color: Colors.redAccent, size: 20),
+                      tooltip: 'Unpair / Logout Session',
+                      onPressed: _handleLogout,
+                    ),
+                  ],
                 ],
               ),
             ),

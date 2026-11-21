@@ -2,10 +2,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:devorbit_mobile/core/security/secure_storage.dart';
 import 'package:devorbit_mobile/features/dashboard/presentation/dashboard_screen.dart';
+import 'helpers/test_secure_storage.dart';
 
 void main() {
   testWidgets('DashboardScreen displays Pairing Required when no credentials available', (WidgetTester tester) async {
-    final storage = SecureStorageService();
+    final driver = TestInMemoryStorageDriver();
+    final storage = SecureStorageService(driver: driver);
     await storage.clearPairedSession();
 
     await tester.pumpWidget(
@@ -33,7 +35,8 @@ void main() {
   });
 
   testWidgets('DashboardScreen accepts injected paired credentials and enables connect', (WidgetTester tester) async {
-    final storage = SecureStorageService();
+    final driver = TestInMemoryStorageDriver();
+    final storage = SecureStorageService(driver: driver);
     await storage.savePairedSession(
       machineId: 'mach-flutter-test-01',
       deviceId: 'dev-flutter-test-01',

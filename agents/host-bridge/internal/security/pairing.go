@@ -22,6 +22,7 @@ type PairingChallenge struct {
 	HostID    string    `json:"host_id"`
 	HostName  string    `json:"host_name"`
 	Payload   string    `json:"pairing_payload"`
+	Secret    string    `json:"pairing_secret,omitempty"`
 	Consumed  bool      `json:"consumed"`
 	ExpiresAt time.Time `json:"expires_at"`
 }
@@ -43,6 +44,18 @@ func NewPairingEngine(hostID, hostName, secret string) *PairingEngine {
 	}
 }
 
+func (p *PairingEngine) HostID() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.hostID
+}
+
+func (p *PairingEngine) HostName() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.hostName
+}
+
 func (p *PairingEngine) CreateChallenge(ttl time.Duration) (*PairingChallenge, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -57,11 +70,16 @@ func (p *PairingEngine) CreateChallenge(ttl time.Duration) (*PairingChallenge, e
 	_, _ = rand.Read(payloadBytes)
 	payloadStr := hex.EncodeToString(payloadBytes)
 
+	secretBytes := make([]byte, 32)
+	_, _ = rand.Read(secretBytes)
+	secretStr := hex.EncodeToString(secretBytes)
+
 	ch := &PairingChallenge{
 		ID:        chID,
 		HostID:    p.hostID,
 		HostName:  p.hostName,
 		Payload:   payloadStr,
+		Secret:    secretStr,
 		Consumed:  false,
 		ExpiresAt: time.Now().Add(ttl),
 	}
@@ -87,12 +105,27 @@ func (p *PairingEngine) ConfirmPairing(chID, deviceID, deviceName, pubKey, proof
 		return "", ErrPairingExpired
 	}
 
-	mac := hmac.New(sha256.New, p.secretKey)
+	keyToUse := p.secretKey
+	if ch.Secret != "" {
+		keyToUse = []byte(ch.Secret)
+	}
+
+	mac := hmac.New(sha256.New, keyToUse)
 	mac.Write([]byte(ch.Payload + ":" + deviceID))
 	expectedSig := hex.EncodeToString(mac.Sum(nil))
 
 	if !hmac.Equal([]byte(proofSig), []byte(expectedSig)) {
-		return "", ErrInvalidProof
+		// Fallback check against p.secretKey if keyToUse was ephemeral secret
+		if ch.Secret != "" {
+			macFallback := hmac.New(sha256.New, p.secretKey)
+			macFallback.Write([]byte(ch.Payload + ":" + deviceID))
+			fallbackSig := hex.EncodeToString(macFallback.Sum(nil))
+			if !hmac.Equal([]byte(proofSig), []byte(fallbackSig)) {
+				return "", ErrInvalidProof
+			}
+		} else {
+			return "", ErrInvalidProof
+		}
 	}
 
 	ch.Consumed = true

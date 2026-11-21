@@ -137,10 +137,71 @@ func TestHostBridge_RejectsHostSecretAsSessionSecret(t *testing.T) {
 	hostSecret := "host-wide-master-secret-32-bytes"
 	sessionSecret := hostSecret // Insecure reuse of host-wide secret!
 
-	if sessionSecret == hostSecret {
-		// Demonstrates the security check implemented in main.go
-		t.Log("Security requirement verified: Reusing host-wide secret as per-device session secret is prohibited")
-	} else {
-		t.Fail()
+	client := NewBrokerClient("ws://127.0.0.1:8081", "mach-01", "", hostSecret, nil)
+	err := client.ProvisionSession("sess-01", "dev-01", sessionSecret, 1*time.Hour)
+	if err == nil {
+		t.Fatalf("Expected ProvisionSession to reject sessionSecret identical to hostSecret")
 	}
+}
+
+func TestBrokerClient_ProvisionSessionLifecycleAndRevocation(t *testing.T) {
+	connectedCh := make(chan string, 5)
+
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sessID := r.URL.Query().Get("session_id")
+		connectedCh <- sessID
+
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err == nil {
+			defer conn.Close()
+			time.Sleep(100 * time.Millisecond)
+		}
+	}))
+	defer s.Close()
+
+	wsURL := strings.Replace(s.URL, "http://", "ws://", 1)
+
+	client := NewBrokerClient(wsURL, "mach-prov-01", "", "host-token-32b", nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client.Start(ctx)
+	time.Sleep(50 * time.Millisecond)
+
+	// Initially unprovisioned -> should not have connected
+	if len(connectedCh) != 0 {
+		t.Fatalf("Client connected before session was provisioned")
+	}
+
+	// Now provision the session
+	sessionID := "sess-authenticated-999"
+	deviceID := "dev-phone-999"
+	sessionSecret := "session-specific-secret-32-bytes-ok"
+
+	err := client.ProvisionSession(sessionID, deviceID, sessionSecret, 1*time.Hour)
+	if err != nil {
+		t.Fatalf("Failed to provision session: %v", err)
+	}
+
+	select {
+	case connectedSess := <-connectedCh:
+		if connectedSess != sessionID {
+			t.Errorf("Connected with wrong session ID: expected %s, got %s", sessionID, connectedSess)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("Timed out waiting for provisioned client to connect")
+	}
+
+	// Revoke session -> must disconnect and clear E2ESession
+	client.RevokeSession(sessionID)
+	client.mu.RLock()
+	revokedSessID := client.SessionID
+	revokedE2E := client.E2ESession
+	client.mu.RUnlock()
+
+	if revokedSessID != "" || revokedE2E != nil {
+		t.Errorf("Expected session credentials to be wiped on revocation, got sess=%s, e2e=%v", revokedSessID, revokedE2E)
+	}
+
+	client.Stop()
 }

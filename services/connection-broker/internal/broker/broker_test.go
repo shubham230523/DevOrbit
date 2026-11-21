@@ -132,7 +132,7 @@ func TestBroker_HeaderAuthenticationAndQueryTokenRejection(t *testing.T) {
 	}
 }
 
-func TestBroker_SubprotocolAuthentication(t *testing.T) {
+func TestBroker_SubprotocolTokensRejected(t *testing.T) {
 	b := NewBroker()
 	machineID := "mach-subproto-01"
 	deviceID := "dev-subproto-01"
@@ -152,24 +152,41 @@ func TestBroker_SubprotocolAuthentication(t *testing.T) {
 
 	wsURL := strings.Replace(server.URL, "http://", "ws://", 1)
 
-	// Dial with Sec-WebSocket-Protocol
+	// 1. Attempting to dial with Sec-WebSocket-Protocol carrying token must FAIL (HTTP 401 Unauthorized)
 	hostDialer := websocket.Dialer{
 		Subprotocols: []string{"devorbit-token." + hostToken},
 	}
 	cleanHostURL := fmt.Sprintf("%s/ws/host?machine_id=%s&session_id=%s", wsURL, machineID, sessionID)
-	hostConn, res, err := hostDialer.Dial(cleanHostURL, nil)
-	if err != nil || res.StatusCode != http.StatusSwitchingProtocols {
-		t.Fatalf("Expected successful host upgrade via subprotocol, got err: %v", err)
+	_, res, err := hostDialer.Dial(cleanHostURL, nil)
+	if err == nil || res == nil || res.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("Expected HTTP 401 Unauthorized when attempting auth via subprotocol token, got status: %v, err: %v", res, err)
 	}
-	defer hostConn.Close()
 
 	clientDialer := websocket.Dialer{
 		Subprotocols: []string{"devorbit-token." + clientToken},
 	}
 	cleanClientURL := fmt.Sprintf("%s/ws/client?machine_id=%s&device_id=%s&session_id=%s", wsURL, machineID, deviceID, sessionID)
-	clientConn, res, err := clientDialer.Dial(cleanClientURL, nil)
+	_, res, err = clientDialer.Dial(cleanClientURL, nil)
+	if err == nil || res == nil || res.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("Expected HTTP 401 Unauthorized when client attempts auth via subprotocol token, got status: %v, err: %v", res, err)
+	}
+
+	// 2. Dialing with standard Authorization: Bearer header succeeds cleanly
+	authHeaders := http.Header{
+		"Authorization": []string{"Bearer " + hostToken},
+	}
+	hostConn, res, err := websocket.DefaultDialer.Dial(cleanHostURL, authHeaders)
 	if err != nil || res.StatusCode != http.StatusSwitchingProtocols {
-		t.Fatalf("Expected successful client upgrade via subprotocol, got err: %v", err)
+		t.Fatalf("Expected successful host upgrade via Authorization Bearer header, got err: %v", err)
+	}
+	defer hostConn.Close()
+
+	clientAuthHeaders := http.Header{
+		"Authorization": []string{"Bearer " + clientToken},
+	}
+	clientConn, res, err := websocket.DefaultDialer.Dial(cleanClientURL, clientAuthHeaders)
+	if err != nil || res.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("Expected successful client upgrade via Authorization Bearer header, got err: %v", err)
 	}
 	defer clientConn.Close()
 }

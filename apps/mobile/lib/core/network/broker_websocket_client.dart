@@ -90,9 +90,6 @@ class BrokerWebSocketClient {
         headers: {
           'Authorization': 'Bearer $token',
         },
-        protocols: [
-          'devorbit-token.$token',
-        ],
       );
       await _channel!.ready;
 

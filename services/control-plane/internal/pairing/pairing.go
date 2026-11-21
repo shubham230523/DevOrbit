@@ -40,6 +40,7 @@ type Challenge struct {
 	MachineID string    `json:"machine_id"`
 	HostName  string    `json:"host_name"`
 	Payload   string    `json:"payload"`
+	Secret    string    `json:"pairing_secret,omitempty"`
 	Consumed  bool      `json:"consumed"`
 	ExpiresAt time.Time `json:"expires_at"`
 }
@@ -73,11 +74,16 @@ func (s *Service) CreateChallenge(machineID, hostName string, ttl time.Duration)
 	_, _ = rand.Read(payloadBytes)
 	payloadStr := hex.EncodeToString(payloadBytes)
 
+	secretBytes := make([]byte, 32)
+	_, _ = rand.Read(secretBytes)
+	secretStr := hex.EncodeToString(secretBytes)
+
 	ch := &Challenge{
 		ID:        chID,
 		MachineID: machineID,
 		HostName:  hostName,
 		Payload:   payloadStr,
+		Secret:    secretStr,
 		Consumed:  false,
 		ExpiresAt: time.Now().Add(ttl),
 	}
@@ -103,13 +109,27 @@ func (s *Service) ConfirmPairing(chID, deviceID, deviceName, pubKey, proofSig st
 		return nil, ErrChallengeExpired
 	}
 
-	// Verify cryptographic proof of possession: HMAC-SHA256(secretKey, ch.Payload + deviceID)
-	mac := hmac.New(sha256.New, s.secretKey)
+	keyToUse := s.secretKey
+	if ch.Secret != "" {
+		keyToUse = []byte(ch.Secret)
+	}
+
+	// Verify cryptographic proof of possession: HMAC-SHA256(key, ch.Payload + ":" + deviceID)
+	mac := hmac.New(sha256.New, keyToUse)
 	mac.Write([]byte(ch.Payload + ":" + deviceID))
 	expectedSig := hex.EncodeToString(mac.Sum(nil))
 
 	if !hmac.Equal([]byte(proofSig), []byte(expectedSig)) {
-		return nil, ErrInvalidProof
+		if ch.Secret != "" {
+			macFallback := hmac.New(sha256.New, s.secretKey)
+			macFallback.Write([]byte(ch.Payload + ":" + deviceID))
+			fallbackSig := hex.EncodeToString(macFallback.Sum(nil))
+			if !hmac.Equal([]byte(proofSig), []byte(fallbackSig)) {
+				return nil, ErrInvalidProof
+			}
+		} else {
+			return nil, ErrInvalidProof
+		}
 	}
 
 	ch.Consumed = true

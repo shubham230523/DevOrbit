@@ -1,7 +1,10 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -132,7 +135,94 @@ func main() {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(ch)
+		json.NewEncoder(w).Encode(map[string]any{
+			"v":               "1.0",
+			"challenge_id":    ch.ID,
+			"host_id":         ch.MachineID,
+			"host_name":       ch.HostName,
+			"pairing_payload": ch.Payload,
+			"pairing_secret":  ch.Secret,
+			"confirm_url":     "/api/v1/pairing/confirm",
+			"broker_url":      getEnvOrDefault("DEVORBIT_BROKER_URL", "ws://localhost:8081"),
+			"expires_at":      ch.ExpiresAt.Format(time.RFC3339),
+		})
+	})
+
+	mux.HandleFunc("/api/v1/pairing/confirm", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			ChallengeID     string `json:"challenge_id"`
+			DeviceID        string `json:"device_id"`
+			DeviceName      string `json:"device_name"`
+			DevicePublicKey string `json:"device_public_key"`
+			ProofSignature  string `json:"proof_signature"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ChallengeID == "" || req.DeviceID == "" || req.ProofSignature == "" {
+			http.Error(w, `{"error":"invalid request: challenge_id, device_id, and proof_signature are required"}`, http.StatusBadRequest)
+			return
+		}
+
+		dev, err := pairingService.ConfirmPairing(req.ChallengeID, req.DeviceID, req.DeviceName, req.DevicePublicKey, req.ProofSignature)
+		if err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, pairing.ErrChallengeExpired) || errors.Is(err, pairing.ErrChallengeUsed) || errors.Is(err, pairing.ErrInvalidProof) {
+				status = http.StatusBadRequest
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		token, err := authService.GenerateToken(dev.MachineID, dev.DeviceID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		sessBytes := make([]byte, 16)
+		_, _ = rand.Read(sessBytes)
+		sessionID := fmt.Sprintf("sess-%s", hex.EncodeToString(sessBytes))
+
+		secretBytes := make([]byte, 32)
+		_, _ = rand.Read(secretBytes)
+		sessionSecret := hex.EncodeToString(secretBytes)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":         "success",
+			"session_token":  token,
+			"session_id":     sessionID,
+			"session_secret": sessionSecret,
+			"machine_id":     dev.MachineID,
+			"device_id":      dev.DeviceID,
+			"broker_url":     getEnvOrDefault("DEVORBIT_BROKER_URL", "ws://localhost:8081"),
+			"expires_at":     time.Now().Add(24 * time.Hour).Format(time.RFC3339),
+		})
+	})
+
+	mux.HandleFunc("/api/v1/devices/revoke", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			MachineID string `json:"machine_id"`
+			DeviceID  string `json:"device_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.MachineID == "" || req.DeviceID == "" {
+			http.Error(w, "invalid request: machine_id and device_id are required", http.StatusBadRequest)
+			return
+		}
+		if err := pairingService.RevokeDevice(req.MachineID, req.DeviceID); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "revoked"})
 	})
 
 	mux.HandleFunc("/api/v1/machines", func(w http.ResponseWriter, r *http.Request) {
