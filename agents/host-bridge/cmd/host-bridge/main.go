@@ -63,12 +63,28 @@ func main() {
 	}
 
 	// 5. Outbound Connection Broker Client
-	brokerClient := transport.NewBrokerClient(cfg.BrokerURL, cfg.HostID, "sess-host-init-001", cfg.HostSecret, serverEngine)
-	e2eSess, _ := security.NewE2ESession("sess-host-init-001", "phone-android-01", cfg.HostSecret, 24*time.Hour)
-	brokerClient.SetE2ESession(e2eSess)
+	// Established sessions must come from authenticated pairing lifecycle or explicit session provisioning.
+	// Host Bridge starts disconnected when no valid device session is provisioned.
+	sessionID := os.Getenv("DEVORBIT_SESSION_ID")
+	deviceID := os.Getenv("DEVORBIT_DEVICE_ID")
+	sessionSecret := os.Getenv("DEVORBIT_SESSION_SECRET")
 
-	brokerClient.Start(context.Background())
-	defer brokerClient.Stop()
+	brokerClient := transport.NewBrokerClient(cfg.BrokerURL, cfg.HostID, sessionID, cfg.HostSecret, serverEngine)
+
+	if sessionID != "" && deviceID != "" && sessionSecret != "" {
+		if sessionSecret == cfg.HostSecret {
+			log.Fatalf("Host Bridge security error: per-device session secret cannot be identical to host-wide secret")
+		}
+		e2eSess, err := security.NewE2ESession(sessionID, deviceID, sessionSecret, 24*time.Hour)
+		if err != nil {
+			log.Fatalf("Host Bridge E2E session initialization failed: %v", err)
+		}
+		brokerClient.SetE2ESession(e2eSess)
+		brokerClient.Start(context.Background())
+		defer brokerClient.Stop()
+	} else {
+		log.Printf("Host Bridge: No active device session provisioned at startup. Outbound broker client remaining disconnected until session established.")
+	}
 
 	go func() {
 		log.Printf("DevOrbit Host Bridge v1.2.1 listening on %s (HostID: %s, Allowed Roots: %d)", addr, cfg.HostID, len(cfg.AllowedRoots))

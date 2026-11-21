@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import '../security/e2e_session.dart';
 
@@ -81,10 +82,18 @@ class BrokerWebSocketClient {
       );
 
       final wsUri = Uri.parse(
-        '$brokerUrl/ws/client?machine_id=$machineId&device_id=$deviceId&session_id=$sessionId&token=$token',
+        '$brokerUrl/ws/client?machine_id=$machineId&device_id=$deviceId&session_id=$sessionId',
       );
 
-      _channel = WebSocketChannel.connect(wsUri);
+      _channel = IOWebSocketChannel.connect(
+        wsUri,
+        headers: {
+          'Authorization': 'Bearer $token',
+        },
+        protocols: [
+          'devorbit-token.$token',
+        ],
+      );
       await _channel!.ready;
 
       _state = BrokerConnectionState.authenticating;

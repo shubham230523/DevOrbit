@@ -1,23 +1,27 @@
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import '../../../core/network/broker_websocket_client.dart';
+import '../../../core/security/secure_storage.dart';
+import '../../machines/presentation/qr_pairing_dialog.dart';
 
 class DashboardScreen extends StatefulWidget {
   final String? initialBrokerUrl;
-  final String machineId;
-  final String deviceId;
-  final String sessionId;
-  final String token;
-  final String masterSecret;
+  final String? machineId;
+  final String? deviceId;
+  final String? sessionId;
+  final String? token;
+  final String? masterSecret;
+  final SecureStorageService? secureStorage;
 
   const DashboardScreen({
     super.key,
     this.initialBrokerUrl,
-    this.machineId = 'host-windows-01',
-    this.deviceId = 'phone-android-01',
-    this.sessionId = 'sess-e2e-100',
-    this.token = 'valid-client-token-32b',
-    this.masterSecret = 'devorbit-master-secret-key-32b!',
+    this.machineId,
+    this.deviceId,
+    this.sessionId,
+    this.token,
+    this.masterSecret,
+    this.secureStorage,
   });
 
   @override
@@ -33,17 +37,101 @@ class _DashboardScreenState extends State<DashboardScreen> {
   List<dynamic> _workspaces = [];
   String? _errorMessage;
 
+  String? _machineId;
+  String? _deviceId;
+  String? _sessionId;
+  String? _token;
+  String? _masterSecret;
+  late final SecureStorageService _storage;
+
+  bool get hasValidCredentials =>
+      _machineId != null &&
+      _machineId!.isNotEmpty &&
+      _deviceId != null &&
+      _deviceId!.isNotEmpty &&
+      _sessionId != null &&
+      _sessionId!.isNotEmpty &&
+      _token != null &&
+      _token!.isNotEmpty &&
+      _masterSecret != null &&
+      _masterSecret!.isNotEmpty;
+
   @override
   void initState() {
     super.initState();
+    _storage = widget.secureStorage ?? SecureStorageService.instance;
+    _machineId = widget.machineId;
+    _deviceId = widget.deviceId;
+    _sessionId = widget.sessionId;
+    _token = widget.token;
+    _masterSecret = widget.masterSecret;
+
     final defaultUrl = widget.initialBrokerUrl ?? '';
     _brokerController = TextEditingController(text: defaultUrl);
+
+    _initCredentialsAndConnect(defaultUrl);
+  }
+
+  Future<void> _initCredentialsAndConnect(String defaultUrl) async {
+    if (!hasValidCredentials) {
+      final session = await _storage.getPairedSession();
+      if (session != null && mounted) {
+        setState(() {
+          _machineId = session['machineId'];
+          _deviceId = session['deviceId'];
+          _sessionId = session['sessionId'];
+          _token = session['token'];
+          _masterSecret = session['masterSecret'];
+          if (_brokerController.text.isEmpty && session['brokerUrl'] != null) {
+            _brokerController.text = session['brokerUrl']!;
+          }
+        });
+      }
+    }
+
+    if (!hasValidCredentials) {
+      if (mounted) {
+        setState(() {
+          _errorMessage = 'Pairing Required: No authenticated host session credentials available. Pair a host machine to connect.';
+        });
+      }
+      return;
+    }
+
     if (defaultUrl.isNotEmpty) {
       _connectToBroker();
     }
   }
 
+  Future<void> _openPairingDialog() async {
+    final success = await showDialog<bool>(
+      context: context,
+      builder: (context) => const QrPairingDialog(),
+    );
+
+    if (success == true && mounted) {
+      await _initCredentialsAndConnect(_brokerController.text.trim());
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Host Machine Paired Successfully!'),
+            backgroundColor: Colors.green,
+          ),
+        );
+      }
+    }
+  }
+
   Future<void> _connectToBroker() async {
+    if (!hasValidCredentials) {
+      if (mounted) {
+        setState(() {
+          _errorMessage = 'Authentication Required: Cannot initiate authenticated session without valid paired credentials.';
+        });
+      }
+      return;
+    }
+
     final url = _brokerController.text.trim();
     if (url.isEmpty) return;
 
@@ -52,11 +140,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
     _brokerClient = BrokerWebSocketClient(
       brokerUrl: url,
-      machineId: widget.machineId,
-      deviceId: widget.deviceId,
-      sessionId: widget.sessionId,
-      token: widget.token,
-      masterSecret: widget.masterSecret,
+      machineId: _machineId!,
+      deviceId: _deviceId!,
+      sessionId: _sessionId!,
+      token: _token!,
+      masterSecret: _masterSecret!,
     );
 
     setState(() {
@@ -152,6 +240,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }
 
   Color _getStatusColor(BrokerConnectionState state) {
+    if (!hasValidCredentials) {
+      return Colors.orangeAccent;
+    }
     switch (state) {
       case BrokerConnectionState.authenticatedBrokerSessionActive:
         return Colors.green;
@@ -167,6 +258,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }
 
   String _getStatusLabel(BrokerConnectionState state) {
+    if (!hasValidCredentials) {
+      return 'PAIRING REQUIRED';
+    }
     switch (state) {
       case BrokerConnectionState.authenticatedBrokerSessionActive:
         return 'AUTHENTICATED BROKER SESSION ACTIVE';
@@ -199,6 +293,47 @@ class _DashboardScreenState extends State<DashboardScreen> {
       child: ListView(
         padding: const EdgeInsets.all(16.0),
         children: [
+          // Pairing Required Warning Banner when credentials unavailable
+          if (!hasValidCredentials) ...[
+            Card(
+              color: Colors.amber.shade900.withValues(alpha: 0.25),
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Row(
+                      children: [
+                        Icon(Icons.warning_amber_rounded, color: Colors.amberAccent, size: 28),
+                        SizedBox(width: 8),
+                        Text(
+                          'Host Pairing Required',
+                          style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    const Text(
+                      'No authenticated host session credentials found. Pairing with your desktop host bridge via QR code is required before an authenticated broker connection can be established.',
+                      style: TextStyle(fontSize: 13, color: Colors.white70),
+                    ),
+                    const SizedBox(height: 12),
+                    ElevatedButton.icon(
+                      onPressed: _openPairingDialog,
+                      icon: const Icon(Icons.qr_code_scanner),
+                      label: const Text('Pair Host Machine (Scan QR)'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.purpleAccent,
+                        foregroundColor: Colors.white,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+          ],
+
           // Connection Broker Endpoint Selection Input Card
           Card(
             child: Padding(
@@ -210,17 +345,18 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   Expanded(
                     child: TextField(
                       controller: _brokerController,
-                      decoration: const InputDecoration(
+                      enabled: hasValidCredentials,
+                      decoration: InputDecoration(
                         labelText: 'Connection Broker WSS Endpoint',
-                        hintText: 'e.g. ws://localhost:8081',
+                        hintText: hasValidCredentials ? 'e.g. ws://localhost:8081' : 'Pair host machine first',
                         isDense: true,
-                        border: OutlineInputBorder(),
+                        border: const OutlineInputBorder(),
                       ),
                     ),
                   ),
                   const SizedBox(width: 8),
                   ElevatedButton(
-                    onPressed: _isLoading ? null : _connectToBroker,
+                    onPressed: (_isLoading || !hasValidCredentials) ? null : _connectToBroker,
                     child: const Text('Connect'),
                   ),
                 ],
@@ -238,12 +374,18 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 size: 32,
               ),
               title: Text(
-                isOnline ? '$hostname ($osType/$arch)' : 'Host Session Inactive',
+                !hasValidCredentials
+                    ? 'Host Session (Unpaired)'
+                    : isOnline
+                        ? '$hostname ($osType/$arch)'
+                        : 'Host Session Inactive',
                 style: const TextStyle(fontWeight: FontWeight.bold),
               ),
-              subtitle: isOnline
-                  ? Text('Host Bridge $version • Via Broker WSS\nAllowed Roots: $allowedRoots')
-                  : Text(_errorMessage ?? _getStatusLabel(_connectionState)),
+              subtitle: !hasValidCredentials
+                  ? const Text('Pair host machine to enable authenticated remote IDE connection.')
+                  : isOnline
+                      ? Text('Host Bridge $version • Via Broker WSS\nAllowed Roots: $allowedRoots')
+                      : Text(_errorMessage ?? _getStatusLabel(_connectionState)),
               isThreeLine: isOnline,
               trailing: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
@@ -274,7 +416,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       ),
                       IconButton(
                         icon: const Icon(Icons.refresh, size: 20),
-                        onPressed: _fetchLiveHostDataOverBroker,
+                        onPressed: hasValidCredentials ? _fetchLiveHostDataOverBroker : null,
                         tooltip: 'Refresh Host Status',
                       ),
                     ],
@@ -284,6 +426,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     const Padding(
                       padding: EdgeInsets.all(16.0),
                       child: Center(child: CircularProgressIndicator()),
+                    )
+                  else if (!hasValidCredentials)
+                    const Padding(
+                      padding: EdgeInsets.all(16.0),
+                      child: Text(
+                        'Device not paired. Pair with Host Bridge to view live projects.',
+                        style: TextStyle(color: Colors.grey),
+                      ),
                     )
                   else if (!isOnline)
                     const Padding(

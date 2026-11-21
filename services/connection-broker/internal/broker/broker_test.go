@@ -11,9 +11,16 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-func TestBroker_HostAndClientAuthenticationEnforcement(t *testing.T) {
+func TestBroker_HeaderAuthenticationAndQueryTokenRejection(t *testing.T) {
 	b := NewBroker()
-	b.AuthorizeHost("mach-auth-01", "valid-host-token-secret")
+	machineID := "mach-auth-01"
+	deviceID := "dev-phone-01"
+	sessionID := "sess-test-01"
+	hostToken := "valid-host-token-secret-32b"
+	clientToken := "valid-client-token-secret-32b"
+
+	b.AuthorizeHost(machineID, hostToken)
+	b.AuthorizeDevice(machineID, deviceID, sessionID, clientToken)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws/host", b.HandleHostWebSocket)
@@ -24,50 +31,73 @@ func TestBroker_HostAndClientAuthenticationEnforcement(t *testing.T) {
 
 	wsURL := strings.Replace(server.URL, "http://", "ws://", 1)
 
-	// 1. Attempt connection for COMPLETELY UNREGISTERED host -> Should receive 401
-	unregisteredHostURL := fmt.Sprintf("%s/ws/host?machine_id=mach-unregistered&session_id=sess-1&token=some-token", wsURL)
-	_, res, err := websocket.DefaultDialer.Dial(unregisteredHostURL, nil)
+	// 1. Missing credentials -> Should receive 401 Unauthorized
+	missingCredsURL := fmt.Sprintf("%s/ws/host?machine_id=%s&session_id=%s", wsURL, machineID, sessionID)
+	_, res, err := websocket.DefaultDialer.Dial(missingCredsURL, nil)
 	if err == nil || res == nil || res.StatusCode != http.StatusUnauthorized {
-		t.Errorf("Expected HTTP 401 Unauthorized for unregistered host registration attempt")
+		t.Errorf("Expected HTTP 401 Unauthorized for missing credentials, got: %v", res)
 	}
 
-	// 2. Attempt registered host with WRONG token -> Should receive 401
-	badHostURL := fmt.Sprintf("%s/ws/host?machine_id=mach-auth-01&session_id=sess-1&token=wrong-token", wsURL)
-	_, res, err = websocket.DefaultDialer.Dial(badHostURL, nil)
-	if err == nil || res == nil || res.StatusCode != http.StatusUnauthorized {
-		t.Errorf("Expected HTTP 401 Unauthorized for invalid host token attempt")
+	// 2. Query-string-only credentials -> MUST FAIL with 400 Bad Request
+	queryOnlyHostURL := fmt.Sprintf("%s/ws/host?machine_id=%s&session_id=%s&token=%s", wsURL, machineID, sessionID, hostToken)
+	_, res, err = websocket.DefaultDialer.Dial(queryOnlyHostURL, nil)
+	if err == nil || res == nil || res.StatusCode != http.StatusBadRequest {
+		t.Errorf("Expected HTTP 400 Bad Request for query-string-only credentials on host, got: %v", res)
 	}
 
-	// 3. Attempt unauthorized client device connection -> Should receive 403
-	badClientURL := fmt.Sprintf("%s/ws/client?machine_id=mach-auth-01&device_id=unauthorized-phone&session_id=sess-1&token=unauthorized-token", wsURL)
-	_, res, err = websocket.DefaultDialer.Dial(badClientURL, nil)
+	queryOnlyClientURL := fmt.Sprintf("%s/ws/client?machine_id=%s&device_id=%s&session_id=%s&token=%s", wsURL, machineID, deviceID, sessionID, clientToken)
+	_, res, err = websocket.DefaultDialer.Dial(queryOnlyClientURL, nil)
+	if err == nil || res == nil || res.StatusCode != http.StatusBadRequest {
+		t.Errorf("Expected HTTP 400 Bad Request for query-string-only credentials on client, got: %v", res)
+	}
+
+	// 3. Query-string credential present EVEN IF header is provided -> MUST FAIL with 400 Bad Request
+	headerHost := http.Header{"Authorization": []string{"Bearer " + hostToken}}
+	_, res, err = websocket.DefaultDialer.Dial(queryOnlyHostURL, headerHost)
+	if err == nil || res == nil || res.StatusCode != http.StatusBadRequest {
+		t.Errorf("Expected HTTP 400 Bad Request when credentials present in query string even with header, got: %v", res)
+	}
+
+	// 4. Invalid credentials in header -> Should fail (401 for host, 403 for client)
+	cleanHostURL := fmt.Sprintf("%s/ws/host?machine_id=%s&session_id=%s", wsURL, machineID, sessionID)
+	badHostHeader := http.Header{"Authorization": []string{"Bearer wrong-host-token"}}
+	_, res, err = websocket.DefaultDialer.Dial(cleanHostURL, badHostHeader)
+	if err == nil || res == nil || res.StatusCode != http.StatusUnauthorized {
+		t.Errorf("Expected HTTP 401 Unauthorized for wrong host token in header, got: %v", res)
+	}
+
+	cleanClientURL := fmt.Sprintf("%s/ws/client?machine_id=%s&device_id=%s&session_id=%s", wsURL, machineID, deviceID, sessionID)
+	badClientHeader := http.Header{"Authorization": []string{"Bearer wrong-client-token"}}
+	_, res, err = websocket.DefaultDialer.Dial(cleanClientURL, badClientHeader)
 	if err == nil || res == nil || res.StatusCode != http.StatusForbidden {
-		t.Errorf("Expected HTTP 403 Forbidden for unauthorized client device connection attempt")
+		t.Errorf("Expected HTTP 403 Forbidden for wrong client token in header, got: %v", res)
 	}
 
-	// 4. Authorize device & host connection
-	b.AuthorizeDevice("mach-auth-01", "dev-phone-01", "sess-1", "valid-client-token")
-	goodHostURL := fmt.Sprintf("%s/ws/host?machine_id=mach-auth-01&session_id=sess-1&token=valid-host-token-secret", wsURL)
-	hostConn, res, err := websocket.DefaultDialer.Dial(goodHostURL, nil)
+	// 5. Valid Authorization: Bearer <token> Header -> Succeeds (NO token in URL)
+	if strings.Contains(cleanHostURL, "token") || strings.Contains(cleanClientURL, "token") {
+		t.Fatalf("Security failure: credentials must never be in connection URLs")
+	}
+
+	goodHostHeader := http.Header{"Authorization": []string{"Bearer " + hostToken}}
+	hostConn, res, err := websocket.DefaultDialer.Dial(cleanHostURL, goodHostHeader)
 	if err != nil || res.StatusCode != http.StatusSwitchingProtocols {
-		t.Fatalf("Expected successful host WSS upgrade, got: %v", err)
+		t.Fatalf("Expected successful host WSS upgrade via Bearer header, got err: %v", err)
 	}
 	defer hostConn.Close()
 
-	goodClientURL := fmt.Sprintf("%s/ws/client?machine_id=mach-auth-01&device_id=dev-phone-01&session_id=sess-1&token=valid-client-token", wsURL)
-	clientConn, res, err := websocket.DefaultDialer.Dial(goodClientURL, nil)
+	goodClientHeader := http.Header{"Authorization": []string{"Bearer " + clientToken}}
+	clientConn, res, err := websocket.DefaultDialer.Dial(cleanClientURL, goodClientHeader)
 	if err != nil || res.StatusCode != http.StatusSwitchingProtocols {
-		t.Fatalf("Expected successful client WSS upgrade, got: %v", err)
+		t.Fatalf("Expected successful client WSS upgrade via Bearer header, got err: %v", err)
 	}
 	defer clientConn.Close()
 
-	time.Sleep(50 * time.Millisecond)
-
-	// 5. Test Bidirectional Opaque Payload Frame Relaying
-	opaquePayload := "a1b2c3d4_opaque_e2e_ciphertext_payload"
+	// 6. Test Bidirectional Opaque Payload Frame Relaying
+	time.Sleep(30 * time.Millisecond)
+	opaquePayload := "sec_payload_e2e_verified_opaque_data"
 	clientFrame := FrameEnvelope{
 		ProtocolVersion: "1.2",
-		SessionID:       "sess-1",
+		SessionID:       sessionID,
 		Type:            "data",
 		EncryptedData:   opaquePayload,
 		SeqNum:          1,
@@ -84,14 +114,180 @@ func TestBroker_HostAndClientAuthenticationEnforcement(t *testing.T) {
 	}
 
 	if hostFrame.EncryptedData != opaquePayload {
-		t.Errorf("Payload mismatch! Expected opaque frame '%s', got '%s'", opaquePayload, hostFrame.EncryptedData)
+		t.Errorf("Payload mismatch! Expected '%s', got '%s'", opaquePayload, hostFrame.EncryptedData)
 	}
 
-	// 6. Test Device Revocation Teardown
-	b.RevokeDevice("mach-auth-01", "dev-phone-01")
-	time.Sleep(50 * time.Millisecond)
+	// 7. Test Device Revocation Teardown
+	b.RevokeDevice(machineID, deviceID)
+	time.Sleep(30 * time.Millisecond)
 
 	if b.ActiveSessionCount() != 0 {
-		t.Errorf("Expected 0 active sessions after device revocation")
+		t.Errorf("Expected active sessions to be 0 after revocation")
+	}
+
+	// Reconnect attempt for revoked device must fail
+	_, res, err = websocket.DefaultDialer.Dial(cleanClientURL, goodClientHeader)
+	if err == nil || res == nil || res.StatusCode != http.StatusForbidden {
+		t.Errorf("Expected HTTP 403 Forbidden for revoked device reconnect attempt, got: %v", res)
+	}
+}
+
+func TestBroker_SubprotocolAuthentication(t *testing.T) {
+	b := NewBroker()
+	machineID := "mach-subproto-01"
+	deviceID := "dev-subproto-01"
+	sessionID := "sess-subproto-01"
+	hostToken := "host-token-subproto-32b"
+	clientToken := "client-token-subproto-32b"
+
+	b.AuthorizeHost(machineID, hostToken)
+	b.AuthorizeDevice(machineID, deviceID, sessionID, clientToken)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws/host", b.HandleHostWebSocket)
+	mux.HandleFunc("/ws/client", b.HandleClientWebSocket)
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	wsURL := strings.Replace(server.URL, "http://", "ws://", 1)
+
+	// Dial with Sec-WebSocket-Protocol
+	hostDialer := websocket.Dialer{
+		Subprotocols: []string{"devorbit-token." + hostToken},
+	}
+	cleanHostURL := fmt.Sprintf("%s/ws/host?machine_id=%s&session_id=%s", wsURL, machineID, sessionID)
+	hostConn, res, err := hostDialer.Dial(cleanHostURL, nil)
+	if err != nil || res.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("Expected successful host upgrade via subprotocol, got err: %v", err)
+	}
+	defer hostConn.Close()
+
+	clientDialer := websocket.Dialer{
+		Subprotocols: []string{"devorbit-token." + clientToken},
+	}
+	cleanClientURL := fmt.Sprintf("%s/ws/client?machine_id=%s&device_id=%s&session_id=%s", wsURL, machineID, deviceID, sessionID)
+	clientConn, res, err := clientDialer.Dial(cleanClientURL, nil)
+	if err != nil || res.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("Expected successful client upgrade via subprotocol, got err: %v", err)
+	}
+	defer clientConn.Close()
+}
+
+func TestBroker_NativeAndBrowserOriginPolicy(t *testing.T) {
+	b := NewBroker()
+	machineID := "mach-origin-01"
+	deviceID := "dev-origin-01"
+	sessionID := "sess-origin-01"
+	token := "valid-token-32b"
+
+	b.AuthorizeDevice(machineID, deviceID, sessionID, token)
+	b.AddAllowedOrigin("https://app.devorbit.net")
+	b.AddAllowedOrigin("http://localhost:8081")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws/client", b.HandleClientWebSocket)
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	wsURL := strings.Replace(server.URL, "http://", "ws://", 1)
+	cleanClientURL := fmt.Sprintf("%s/ws/client?machine_id=%s&device_id=%s&session_id=%s", wsURL, machineID, deviceID, sessionID)
+
+	// 1. Native Client (Missing Origin Header) with valid credentials -> Succeeds
+	nativeHeaders := http.Header{
+		"Authorization": []string{"Bearer " + token},
+	}
+	conn, res, err := websocket.DefaultDialer.Dial(cleanClientURL, nativeHeaders)
+	if err != nil || res.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("Expected native client without Origin header to succeed with valid credentials, got: %v", err)
+	}
+	conn.Close()
+
+	// 2. Native Client (Missing Origin Header) with invalid credentials -> Fails (403)
+	badNativeHeaders := http.Header{
+		"Authorization": []string{"Bearer invalid-token"},
+	}
+	_, res, err = websocket.DefaultDialer.Dial(cleanClientURL, badNativeHeaders)
+	if err == nil || res == nil || res.StatusCode != http.StatusForbidden {
+		t.Errorf("Expected invalid credentials to fail for native client, got: %v", res)
+	}
+
+	// 3. Allowed Browser Origin with valid credentials -> Succeeds
+	allowedBrowserHeaders := http.Header{
+		"Authorization": []string{"Bearer " + token},
+		"Origin":        []string{"https://app.devorbit.net"},
+	}
+	conn, res, err = websocket.DefaultDialer.Dial(cleanClientURL, allowedBrowserHeaders)
+	if err != nil || res.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("Expected allowed browser origin to succeed, got: %v", err)
+	}
+	conn.Close()
+
+	// 4. Unapproved Browser Origin -> Fails with HTTP 403 Forbidden
+	unapprovedBrowserHeaders := http.Header{
+		"Authorization": []string{"Bearer " + token},
+		"Origin":        []string{"https://malicious-phishing-site.com"},
+	}
+	_, res, err = websocket.DefaultDialer.Dial(cleanClientURL, unapprovedBrowserHeaders)
+	if err == nil || res == nil || res.StatusCode != http.StatusForbidden {
+		t.Errorf("Expected HTTP 403 Forbidden for unapproved browser origin, got: %v", res)
+	}
+
+	// 5. Spoofed User-Agent with Unapproved Origin -> Fails with HTTP 403 Forbidden
+	spoofedHeaders := http.Header{
+		"Authorization": []string{"Bearer " + token},
+		"Origin":        []string{"https://malicious-phishing-site.com"},
+		"User-Agent":    []string{"DevOrbit-Mobile-App-Android/1.2.1"},
+	}
+	_, res, err = websocket.DefaultDialer.Dial(cleanClientURL, spoofedHeaders)
+	if err == nil || res == nil || res.StatusCode != http.StatusForbidden {
+		t.Errorf("Expected HTTP 403 Forbidden for spoofed User-Agent with unapproved Origin, got: %v", res)
+	}
+
+	// 6. Browser Origin with Wrong Port or Scheme -> Fails with HTTP 403 Forbidden
+	wrongPortHeaders := http.Header{
+		"Authorization": []string{"Bearer " + token},
+		"Origin":        []string{"http://localhost:9999"},
+	}
+	_, res, err = websocket.DefaultDialer.Dial(cleanClientURL, wrongPortHeaders)
+	if err == nil || res == nil || res.StatusCode != http.StatusForbidden {
+		t.Errorf("Expected HTTP 403 Forbidden for origin with unapproved port, got: %v", res)
+	}
+}
+
+func TestBroker_ExpiredSessionRejection(t *testing.T) {
+	b := NewBroker()
+	machineID := "mach-exp-01"
+	deviceID := "dev-exp-01"
+	sessionID := "sess-exp-01"
+	hostToken := "host-token-32b"
+	clientToken := "client-token-32b"
+
+	b.AuthorizeHost(machineID, hostToken)
+	b.AuthorizeDevice(machineID, deviceID, sessionID, clientToken)
+
+	// Pre-seed an expired session
+	b.sessions[sessionID] = &Session{
+		ID:        sessionID,
+		MachineID: machineID,
+		DeviceID:  deviceID,
+		Token:     clientToken,
+		ExpiresAt: time.Now().Add(-5 * time.Minute), // Already expired
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws/client", b.HandleClientWebSocket)
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	wsURL := strings.Replace(server.URL, "http://", "ws://", 1)
+	cleanClientURL := fmt.Sprintf("%s/ws/client?machine_id=%s&device_id=%s&session_id=%s", wsURL, machineID, deviceID, sessionID)
+
+	clientHeader := http.Header{"Authorization": []string{"Bearer " + clientToken}}
+	_, res, err := websocket.DefaultDialer.Dial(cleanClientURL, clientHeader)
+	if err == nil || res == nil || res.StatusCode != http.StatusUnauthorized {
+		t.Errorf("Expected HTTP 401 Unauthorized for expired session attempt, got: %v", res)
 	}
 }

@@ -14,10 +14,12 @@ import (
 )
 
 var (
-	ErrSessionNotFound     = errors.New("session not found or host offline")
-	ErrUnauthorizedSession = errors.New("unauthorized connection or invalid session token")
-	ErrFrameTooLarge       = errors.New("frame size exceeds broker maximum limit")
-	ErrInvalidOrigin       = errors.New("websocket connection rejected due to untrusted origin")
+	ErrSessionNotFound          = errors.New("session not found or host offline")
+	ErrUnauthorizedSession      = errors.New("unauthorized connection or invalid session token")
+	ErrFrameTooLarge            = errors.New("frame size exceeds broker maximum limit")
+	ErrInvalidOrigin            = errors.New("websocket connection rejected due to untrusted origin")
+	ErrQueryCredentialsRejected = errors.New("credentials supplied via URL query parameters are rejected")
+	ErrMissingCredentials       = errors.New("missing authentication credentials in headers")
 )
 
 const MaxFrameSizeBytes = 10 * 1024 * 1024 // 10 MB
@@ -68,10 +70,15 @@ func NewBroker() *Broker {
 	}
 
 	origins := map[string]bool{
-		"localhost":        true,
-		"127.0.0.1":        true,
-		"10.0.2.2":         true,
-		"app.devorbit.net": true,
+		"https://app.devorbit.net": true,
+	}
+
+	if env != "production" {
+		origins["http://localhost"] = true
+		origins["http://localhost:8081"] = true
+		origins["http://127.0.0.1"] = true
+		origins["http://127.0.0.1:8081"] = true
+		origins["http://10.0.2.2:8081"] = true
 	}
 
 	return &Broker{
@@ -85,51 +92,78 @@ func NewBroker() *Broker {
 	}
 }
 
-func extractToken(r *http.Request) string {
-	// 1. Check Authorization Header: Bearer <token>
+func (b *Broker) AddAllowedOrigin(origin string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.allowedOrigins[origin] = true
+	if u, err := url.Parse(origin); err == nil && u.Scheme != "" && u.Host != "" {
+		norm := strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host)
+		b.allowedOrigins[norm] = true
+	}
+}
+
+func extractToken(r *http.Request) (string, error) {
+	// 1. Explicitly reject credentials supplied through URL query parameters
+	if r.URL.Query().Get("token") != "" || r.URL.Query().Has("token") ||
+		r.URL.Query().Get("credential") != "" || r.URL.Query().Has("credential") ||
+		r.URL.Query().Get("secret") != "" || r.URL.Query().Has("secret") {
+		return "", ErrQueryCredentialsRejected
+	}
+
+	// 2. Check Authorization Header: Bearer <token>
 	if authHeader := r.Header.Get("Authorization"); authHeader != "" {
 		parts := strings.SplitN(authHeader, " ", 2)
 		if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
-			return strings.TrimSpace(parts[1])
+			token := strings.TrimSpace(parts[1])
+			if token != "" {
+				return token, nil
+			}
 		}
 	}
 
-	// 2. Check Sec-WebSocket-Protocol Header: devorbit-token.<token>
+	// 3. Check Sec-WebSocket-Protocol Header: devorbit-token.<token>
 	if subprotocol := r.Header.Get("Sec-WebSocket-Protocol"); subprotocol != "" {
 		protocols := strings.Split(subprotocol, ",")
 		for _, p := range protocols {
 			p = strings.TrimSpace(p)
 			if strings.HasPrefix(p, "devorbit-token.") {
-				return strings.TrimPrefix(p, "devorbit-token.")
+				token := strings.TrimPrefix(p, "devorbit-token.")
+				if token != "" {
+					return token, nil
+				}
 			}
 		}
 	}
 
-	// 3. Query string fallback for legacy/testing compatibility
-	return r.URL.Query().Get("token")
+	return "", ErrMissingCredentials
 }
 
 func (b *Broker) checkOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 
-	if b.environment == "production" {
-		if origin == "" {
-			// Native mobile clients without Origin header are permitted IF AND ONLY IF valid bearer token is supplied
-			return extractToken(r) != ""
-		}
-
-		u, err := url.Parse(origin)
-		if err != nil {
-			return false
-		}
-		hostname := strings.ToLower(u.Hostname())
-		b.mu.RLock()
-		defer b.mu.RUnlock()
-		return b.allowedOrigins[hostname]
+	if origin == "" {
+		// Native client (no Origin header sent by native mobile or Go CLI apps)
+		// Native clients authenticate via supported headers validated in the handler prior to WebSocket upgrade.
+		return true
 	}
 
-	// Development mode allows local origins
-	return true
+	// Browser request with Origin header: must match configured allowlist exactly (scheme, hostname, and port)
+	u, err := url.Parse(origin)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return false
+	}
+
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" && scheme != "ws" && scheme != "wss" {
+		return false
+	}
+
+	normOrigin := scheme + "://" + strings.ToLower(u.Host)
+
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	return b.allowedOrigins[normOrigin] || b.allowedOrigins[origin]
 }
 
 func (b *Broker) AuthorizeHost(machineID, token string) {
@@ -236,20 +270,39 @@ func (b *Broker) RegisterClientConnection(machineID, deviceID, sessionID, token 
 }
 
 func (b *Broker) HandleHostWebSocket(w http.ResponseWriter, r *http.Request) {
-	machineID := r.URL.Query().Get("machine_id")
-	sessionID := r.URL.Query().Get("session_id")
-	token := extractToken(r)
-
-	if machineID == "" || sessionID == "" || token == "" {
-		http.Error(w, "missing required machine_id, session_id, or bearer token credential", http.StatusUnauthorized)
+	// 1. Explicitly reject credentials supplied through URL query parameters
+	if r.URL.Query().Get("token") != "" || r.URL.Query().Has("token") ||
+		r.URL.Query().Get("credential") != "" || r.URL.Query().Has("credential") ||
+		r.URL.Query().Get("secret") != "" || r.URL.Query().Has("secret") {
+		http.Error(w, "credentials in URL query parameters are strictly forbidden; use WebSocket authentication headers", http.StatusBadRequest)
 		return
 	}
 
+	machineID := r.URL.Query().Get("machine_id")
+	sessionID := r.URL.Query().Get("session_id")
+	if machineID == "" || sessionID == "" {
+		http.Error(w, "missing required machine_id or session_id query parameters", http.StatusBadRequest)
+		return
+	}
+
+	// 2. Extract credential from supported headers
+	token, err := extractToken(r)
+	if err != nil {
+		if errors.Is(err, ErrQueryCredentialsRejected) {
+			http.Error(w, "credentials in URL query parameters are strictly forbidden", http.StatusBadRequest)
+			return
+		}
+		http.Error(w, "missing required authentication credential in headers", http.StatusUnauthorized)
+		return
+	}
+
+	// 3. Strict Origin Validation
 	if !b.checkOrigin(r) {
 		http.Error(w, ErrInvalidOrigin.Error(), http.StatusForbidden)
 		return
 	}
 
+	// 4. Validate credentials server-side BEFORE completing WebSocket upgrade
 	b.mu.RLock()
 	expectedToken, registered := b.authorizedHost[machineID]
 	b.mu.RUnlock()
@@ -259,13 +312,26 @@ func (b *Broker) HandleHostWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 5. Complete WebSocket upgrade only after credentials validated
+	var respHeader http.Header
+	if subproto := r.Header.Get("Sec-WebSocket-Protocol"); subproto != "" {
+		respHeader = make(http.Header)
+		for _, p := range strings.Split(subproto, ",") {
+			p = strings.TrimSpace(p)
+			if strings.HasPrefix(p, "devorbit-token.") {
+				respHeader.Set("Sec-WebSocket-Protocol", p)
+				break
+			}
+		}
+	}
+
 	upgrader := websocket.Upgrader{
 		ReadBufferSize:  1024 * 1024,
 		WriteBufferSize: 1024 * 1024,
 		CheckOrigin:     b.checkOrigin,
 	}
 
-	conn, err := upgrader.Upgrade(w, r, nil)
+	conn, err := upgrader.Upgrade(w, r, respHeader)
 	if err != nil {
 		log.Printf("Failed to upgrade host WebSocket: %v", err)
 		return
@@ -292,29 +358,67 @@ func (b *Broker) HandleHostWebSocket(w http.ResponseWriter, r *http.Request) {
 }
 
 func (b *Broker) HandleClientWebSocket(w http.ResponseWriter, r *http.Request) {
-	machineID := r.URL.Query().Get("machine_id")
-	deviceID := r.URL.Query().Get("device_id")
-	sessionID := r.URL.Query().Get("session_id")
-	token := extractToken(r)
-
-	if machineID == "" || deviceID == "" || sessionID == "" || token == "" {
-		http.Error(w, "missing required parameters: machine_id, device_id, session_id, or token credential", http.StatusBadRequest)
+	// 1. Explicitly reject credentials supplied through URL query parameters
+	if r.URL.Query().Get("token") != "" || r.URL.Query().Has("token") ||
+		r.URL.Query().Get("credential") != "" || r.URL.Query().Has("credential") ||
+		r.URL.Query().Get("secret") != "" || r.URL.Query().Has("secret") {
+		http.Error(w, "credentials in URL query parameters are strictly forbidden; use WebSocket authentication headers", http.StatusBadRequest)
 		return
 	}
 
+	machineID := r.URL.Query().Get("machine_id")
+	deviceID := r.URL.Query().Get("device_id")
+	sessionID := r.URL.Query().Get("session_id")
+	if machineID == "" || deviceID == "" || sessionID == "" {
+		http.Error(w, "missing required parameters: machine_id, device_id, or session_id", http.StatusBadRequest)
+		return
+	}
+
+	// 2. Extract credential from supported headers
+	token, err := extractToken(r)
+	if err != nil {
+		if errors.Is(err, ErrQueryCredentialsRejected) {
+			http.Error(w, "credentials in URL query parameters are strictly forbidden", http.StatusBadRequest)
+			return
+		}
+		http.Error(w, "missing required authentication credential in headers", http.StatusUnauthorized)
+		return
+	}
+
+	// 3. Strict Origin Validation
 	if !b.checkOrigin(r) {
 		http.Error(w, ErrInvalidOrigin.Error(), http.StatusForbidden)
 		return
 	}
 
+	// 4. Validate client device identity and token server-side BEFORE completing WebSocket upgrade
 	b.mu.RLock()
 	isAuthorized := b.authorizedDev[machineID+":"+deviceID]
 	expectedToken, tokenRegistered := b.authorizedClientTokens[machineID+":"+deviceID+":"+sessionID]
+	sessExisting, sessExists := b.sessions[sessionID]
 	b.mu.RUnlock()
 
 	if !isAuthorized || !tokenRegistered || expectedToken == "" || token != expectedToken {
 		http.Error(w, "unauthorized client device identity or invalid token credential", http.StatusForbidden)
 		return
+	}
+
+	if sessExists && sessExisting != nil && time.Now().After(sessExisting.ExpiresAt) {
+		http.Error(w, "session expired", http.StatusUnauthorized)
+		return
+	}
+
+	// 5. Complete WebSocket upgrade only after credentials validated
+	var respHeader http.Header
+	if subproto := r.Header.Get("Sec-WebSocket-Protocol"); subproto != "" {
+		respHeader = make(http.Header)
+		for _, p := range strings.Split(subproto, ",") {
+			p = strings.TrimSpace(p)
+			if strings.HasPrefix(p, "devorbit-token.") {
+				respHeader.Set("Sec-WebSocket-Protocol", p)
+				break
+			}
+		}
 	}
 
 	upgrader := websocket.Upgrader{
@@ -323,7 +427,7 @@ func (b *Broker) HandleClientWebSocket(w http.ResponseWriter, r *http.Request) {
 		CheckOrigin:     b.checkOrigin,
 	}
 
-	conn, err := upgrader.Upgrade(w, r, nil)
+	conn, err := upgrader.Upgrade(w, r, respHeader)
 	if err != nil {
 		log.Printf("Failed to upgrade client WebSocket: %v", err)
 		return

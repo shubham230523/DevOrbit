@@ -41,7 +41,7 @@ func TestDevOrbit_FullEndToEndDevelopmentWorkflow(t *testing.T) {
 	policy := security.NewDefaultCommandPolicy()
 
 	// 3. Establish HKDF Directional E2E Session Keys
-	e2eSession, err := security.NewE2ESession("sess-e2e-001", "phone-android-01", "master-e2e-secret-key-32-bytes!", 1*time.Hour)
+	e2eSession, err := security.NewE2ESession("sess-e2e-001", "dev-phone-e2e-01", "master-e2e-secret-key-32-bytes!", 1*time.Hour)
 	if err != nil {
 		t.Fatalf("Failed to create E2E session: %v", err)
 	}

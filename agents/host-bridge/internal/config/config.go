@@ -48,17 +48,30 @@ func LoadConfig() (*Config, error) {
 		}
 	}
 
-	hostID := os.Getenv("DEVORBIT_HOST_ID")
-	if hostID == "" {
-		hostID = "host-windows-01"
-	}
-
 	hostName := os.Getenv("DEVORBIT_HOST_NAME")
 	if hostName == "" {
 		hostName, _ = os.Hostname()
 		if hostName == "" {
 			hostName = "Desktop Workstation"
 		}
+	}
+
+	hostID := os.Getenv("DEVORBIT_HOST_ID")
+	if hostID == "" {
+		sanitizedHost := strings.Map(func(r rune) rune {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+				return r
+			}
+			if r >= 'A' && r <= 'Z' {
+				return r + ('a' - 'A')
+			}
+			return '-'
+		}, hostName)
+		sanitizedHost = strings.Trim(sanitizedHost, "-")
+		if sanitizedHost == "" {
+			sanitizedHost = "node"
+		}
+		hostID = fmt.Sprintf("host-%s", sanitizedHost)
 	}
 
 	hostSecret := os.Getenv("DEVORBIT_HOST_SECRET")

@@ -7,7 +7,7 @@ import (
 func TestAuthService_TokenLifecycle(t *testing.T) {
 	svc := NewService("test-secret-key-32-bytes-long!")
 
-	token, err := svc.GenerateToken("machine-dev-01", "phone-android-01")
+	token, err := svc.GenerateToken("machine-dev-01", "device-pixel-01")
 	if err != nil {
 		t.Fatalf("Failed to generate token: %v", err)
 	}
@@ -20,8 +20,8 @@ func TestAuthService_TokenLifecycle(t *testing.T) {
 	if machineID != "machine-dev-01" {
 		t.Errorf("Expected machineID 'machine-dev-01', got '%s'", machineID)
 	}
-	if deviceID != "phone-android-01" {
-		t.Errorf("Expected deviceID 'phone-android-01', got '%s'", deviceID)
+	if deviceID != "device-pixel-01" {
+		t.Errorf("Expected deviceID 'device-pixel-01', got '%s'", deviceID)
 	}
 }
 

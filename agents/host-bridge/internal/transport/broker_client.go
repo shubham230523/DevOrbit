@@ -74,6 +74,15 @@ func (bc *BrokerClient) SetE2ESession(sess *security.E2ESession) {
 
 func (bc *BrokerClient) Start(ctx context.Context) {
 	go func() {
+		if bc.MachineID == "" || bc.SessionID == "" || bc.HostToken == "" {
+			log.Printf("HostBridge BrokerClient: Incomplete session configuration; remaining disconnected.")
+			return
+		}
+		if bc.E2ESession == nil || bc.E2ESession.IsExpired() {
+			log.Printf("HostBridge BrokerClient: No active or valid E2E session provisioned. Remaining disconnected.")
+			return
+		}
+
 		backoff := 1 * time.Second
 		maxBackoff := 30 * time.Second
 
@@ -86,8 +95,16 @@ func (bc *BrokerClient) Start(ctx context.Context) {
 			default:
 			}
 
-			wsURL := fmt.Sprintf("%s/ws/host?machine_id=%s&session_id=%s&token=%s", bc.BrokerURL, bc.MachineID, bc.SessionID, bc.HostToken)
-			conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
+			if bc.E2ESession == nil || bc.E2ESession.IsExpired() {
+				log.Printf("HostBridge BrokerClient: Cannot reconnect - session credentials expired or missing. Terminating connection loop.")
+				return
+			}
+
+			wsURL := fmt.Sprintf("%s/ws/host?machine_id=%s&session_id=%s", bc.BrokerURL, bc.MachineID, bc.SessionID)
+			headers := http.Header{
+				"Authorization": []string{"Bearer " + bc.HostToken},
+			}
+			conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, headers)
 			if err != nil {
 				log.Printf("HostBridge BrokerClient: Connection failed (%v), retrying in %v...", err, backoff)
 				time.Sleep(backoff)

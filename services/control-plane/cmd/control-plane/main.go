@@ -122,8 +122,8 @@ func main() {
 			HostName  string `json:"host_name"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.MachineID == "" {
-			req.MachineID = "host-windows-01"
-			req.HostName = "Desktop Workstation"
+			http.Error(w, "invalid request: machine_id is required", http.StatusBadRequest)
+			return
 		}
 
 		ch, err := pairingService.CreateChallenge(req.MachineID, req.HostName, 5*time.Minute)
