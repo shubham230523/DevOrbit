@@ -73,6 +73,29 @@ class QrPairingPayload {
     if (!uri.path.endsWith('/api/v1/pairing/confirm')) {
       throw FormatException('confirm_url path must end with /api/v1/pairing/confirm, got: ${uri.path}');
     }
+    if (uri.userInfo.isNotEmpty) {
+      throw const FormatException('confirm_url must not contain embedded user credentials');
+    }
+    if (uri.hasQuery) {
+      throw const FormatException('confirm_url must not contain query parameters');
+    }
+    if (uri.hasFragment) {
+      throw const FormatException('confirm_url must not contain URL fragments');
+    }
+
+    if (brokerUrl != null && brokerUrl.isNotEmpty) {
+      final bUri = Uri.tryParse(brokerUrl);
+      if (bUri == null || !bUri.hasScheme || !bUri.hasAuthority || bUri.host.isEmpty) {
+        throw FormatException('broker_url must be a valid absolute URI: $brokerUrl');
+      }
+      final bScheme = bUri.scheme.toLowerCase();
+      if (bScheme != 'ws' && bScheme != 'wss') {
+        throw FormatException('Unsupported URI scheme in broker_url: $bScheme. Must be ws or wss.');
+      }
+      if (bUri.userInfo.isNotEmpty) {
+        throw const FormatException('broker_url must not contain embedded user credentials');
+      }
+    }
 
     final expiresAt = DateTime.parse(expiresAtStr);
 

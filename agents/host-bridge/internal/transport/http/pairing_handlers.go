@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -20,10 +21,6 @@ func (s *Server) SetPairingEngine(engine *security.PairingEngine) {
 
 func (s *Server) SetRateLimiter(limiter *security.RateLimiter) {
 	s.rateLimiter = limiter
-}
-
-func (s *Server) SetSessionProvisioner(provisioner func(sessionID, deviceID, sessionSecret string) error) {
-	s.sessionProvisioner = provisioner
 }
 
 func (s *Server) HandleCreatePairingChallenge(w http.ResponseWriter, r *http.Request) {
@@ -46,30 +43,83 @@ func (s *Server) HandleCreatePairingChallenge(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	confirmBaseURL := s.advertisedURL
-	if confirmBaseURL == "" {
+	var confirmBaseURL string
+	if s.advertisedURL != "" {
+		confirmBaseURL = s.advertisedURL
+	} else {
 		confirmBaseURL = os.Getenv("DEVORBIT_ADVERTISED_URL")
 	}
-	if confirmBaseURL == "" {
-		scheme := "http"
-		if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
-			scheme = "https"
+
+	if s.isProduction {
+		if confirmBaseURL == "" {
+			writeError(w, http.StatusInternalServerError, "advertised URL must be configured in production mode")
+			return
 		}
-		host := r.Host
-		if host == "" {
-			host = "127.0.0.1:3000"
+		u, err := url.Parse(confirmBaseURL)
+		if err != nil || u.Host == "" || strings.ToLower(u.Scheme) != "https" || u.User != nil {
+			writeError(w, http.StatusInternalServerError, "invalid advertised URL in production: must be a valid https URL without credentials")
+			return
 		}
-		confirmBaseURL = fmt.Sprintf("%s://%s", scheme, host)
+	} else {
+		if confirmBaseURL == "" {
+			remoteIP := r.RemoteAddr
+			if idx := strings.LastIndex(remoteIP, ":"); idx != -1 {
+				remoteIP = remoteIP[:idx]
+			}
+			remoteIP = strings.Trim(remoteIP, "[]")
+
+			isTrustedProxy := false
+			for _, tp := range s.trustedProxies {
+				if tp == remoteIP || tp == "127.0.0.1" || tp == "::1" || tp == "localhost" {
+					isTrustedProxy = true
+					break
+				}
+			}
+
+			scheme := "http"
+			host := ""
+
+			if isTrustedProxy {
+				if proto := r.Header.Get("X-Forwarded-Proto"); strings.EqualFold(proto, "https") {
+					scheme = "https"
+				}
+				if fwdHost := r.Header.Get("X-Forwarded-Host"); fwdHost != "" {
+					host = fwdHost
+				}
+			}
+
+			if host == "" {
+				host = r.Host
+			}
+
+			if host == "" || strings.ContainsAny(host, "/\\?#@ \t\r\n") {
+				host = "127.0.0.1:8082"
+			}
+			confirmBaseURL = fmt.Sprintf("%s://%s", scheme, host)
+		}
 	}
+
+	u, err := url.Parse(confirmBaseURL)
+	if err != nil || u.Host == "" || u.User != nil || (strings.ToLower(u.Scheme) != "http" && strings.ToLower(u.Scheme) != "https") {
+		writeError(w, http.StatusInternalServerError, "invalid advertised base URL: must be valid http or https URL without credentials")
+		return
+	}
+
 	confirmBaseURL = strings.TrimRight(confirmBaseURL, "/")
 	confirmURL := fmt.Sprintf("%s/api/v1/pairing/confirm", confirmBaseURL)
 
-	brokerURL := s.brokerURL
-	if brokerURL == "" {
-		brokerURL = os.Getenv("DEVORBIT_BROKER_URL")
+	brokerWSURL := s.brokerWSURL
+	if brokerWSURL == "" {
+		brokerWSURL = s.brokerURL
 	}
-	if brokerURL == "" {
-		brokerURL = "ws://127.0.0.1:8081"
+	if brokerWSURL == "" {
+		brokerWSURL = os.Getenv("DEVORBIT_BROKER_WS_URL")
+	}
+	if brokerWSURL == "" {
+		brokerWSURL = os.Getenv("DEVORBIT_BROKER_URL")
+	}
+	if brokerWSURL == "" {
+		brokerWSURL = "ws://127.0.0.1:8081"
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -80,7 +130,7 @@ func (s *Server) HandleCreatePairingChallenge(w http.ResponseWriter, r *http.Req
 		"pairing_payload": ch.Payload,
 		"pairing_secret":  ch.Secret,
 		"confirm_url":     confirmURL,
-		"broker_url":      brokerURL,
+		"broker_url":      brokerWSURL,
 		"expires_at":      ch.ExpiresAtStr,
 	})
 }
@@ -160,6 +210,9 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 	sessionSecret := hex.EncodeToString(secretBytes)
 
 	// 1. Authorize session with Connection Broker first
+	ttl := 24 * time.Hour
+	expiry := time.Now().UTC().Add(ttl)
+
 	if s.brokerAuthorizer != nil {
 		err := s.brokerAuthorizer.AuthorizeSession(
 			r.Context(),
@@ -168,7 +221,7 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 			sessionID,
 			token,
 			s.hostToken,
-			24*time.Hour,
+			ttl,
 		)
 		if err != nil {
 			writeError(w, http.StatusBadGateway, "failed to register session authorization with connection broker: "+err.Error())
@@ -178,7 +231,7 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 
 	// 2. Connect verified pairing directly to Host Bridge session provisioning
 	if s.sessionProvisioner != nil {
-		if err := s.sessionProvisioner(sessionID, req.DeviceID, sessionSecret); err != nil {
+		if err := s.sessionProvisioner(sessionID, req.DeviceID, sessionSecret, expiry); err != nil {
 			if s.brokerAuthorizer != nil {
 				_ = s.brokerAuthorizer.RevokeDevice(r.Context(), s.pairingEngine.HostID(), req.DeviceID)
 			}
@@ -187,12 +240,18 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	brokerURL := s.brokerURL
-	if brokerURL == "" {
-		brokerURL = os.Getenv("DEVORBIT_BROKER_URL")
+	brokerWSURL := s.brokerWSURL
+	if brokerWSURL == "" {
+		brokerWSURL = s.brokerURL
 	}
-	if brokerURL == "" {
-		brokerURL = "ws://127.0.0.1:8081"
+	if brokerWSURL == "" {
+		brokerWSURL = os.Getenv("DEVORBIT_BROKER_WS_URL")
+	}
+	if brokerWSURL == "" {
+		brokerWSURL = os.Getenv("DEVORBIT_BROKER_URL")
+	}
+	if brokerWSURL == "" {
+		brokerWSURL = "ws://127.0.0.1:8081"
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -202,7 +261,7 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 		"session_secret": sessionSecret,
 		"machine_id":     s.pairingEngine.HostID(),
 		"device_id":      req.DeviceID,
-		"broker_url":     brokerURL,
-		"expires_at":     time.Now().Add(24 * time.Hour).Format(time.RFC3339),
+		"broker_url":     brokerWSURL,
+		"expires_at":     expiry.Format(time.RFC3339),
 	})
 }

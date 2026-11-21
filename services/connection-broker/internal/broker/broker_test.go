@@ -414,3 +414,128 @@ func TestBroker_ServiceToServiceAuthorizationAndRevocation(t *testing.T) {
 		t.Fatalf("Expected HTTP 403 Forbidden after device revocation, got: %v", resBlocked)
 	}
 }
+
+func TestBroker_ConsistentSessionExpiryAndReconnect(t *testing.T) {
+	adminSecret := "broker-admin-secret-32b-verified!"
+	b := NewBrokerWithSecret(adminSecret)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/internal/sessions/authorize", b.HandleAuthorizeSession)
+	mux.HandleFunc("/ws/host", b.HandleHostWebSocket)
+	mux.HandleFunc("/ws/client", b.HandleClientWebSocket)
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	wsURL := strings.Replace(server.URL, "http://", "ws://", 1)
+	machineID := "mach-exp-01"
+	deviceID := "dev-exp-01"
+	sessionID := "sess-exp-01"
+	clientToken := "client-token-exp-32b"
+	hostToken := "host-token-exp-32b"
+
+	// 1. Authorize with short TTL (10s)
+	authBody := fmt.Sprintf(`{
+		"machine_id": "%s",
+		"device_id": "%s",
+		"session_id": "%s",
+		"client_token": "%s",
+		"host_token": "%s",
+		"ttl_seconds": 10
+	}`, machineID, deviceID, sessionID, clientToken, hostToken)
+
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/internal/sessions/authorize", strings.NewReader(authBody))
+	req.Header.Set("Authorization", "Bearer "+adminSecret)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("Failed to authorize session: %v, resp: %v", err, resp)
+	}
+
+	// 2. Connect Host
+	hostDialURL := fmt.Sprintf("%s/ws/host?machine_id=%s&session_id=%s", wsURL, machineID, sessionID)
+	hostHeader := http.Header{"Authorization": []string{"Bearer " + hostToken}}
+	hostConn, _, err := websocket.DefaultDialer.Dial(hostDialURL, hostHeader)
+	if err != nil {
+		t.Fatalf("Failed to connect host: %v", err)
+	}
+	defer hostConn.Close()
+
+	// 3. Connect Client
+	clientDialURL := fmt.Sprintf("%s/ws/client?machine_id=%s&device_id=%s&session_id=%s", wsURL, machineID, deviceID, sessionID)
+	clientHeader := http.Header{"Authorization": []string{"Bearer " + clientToken}}
+	clientConn, _, err := websocket.DefaultDialer.Dial(clientDialURL, clientHeader)
+	if err != nil {
+		t.Fatalf("Failed to connect client: %v", err)
+	}
+	var ack FrameEnvelope
+	_ = clientConn.ReadJSON(&ack)
+	clientConn.Close()
+
+	// 4. Reconnect host: verify it does not reset or extend expiry
+	hostConn2, _, err := websocket.DefaultDialer.Dial(hostDialURL, hostHeader)
+	if err != nil {
+		t.Fatalf("Host reconnect failed: %v", err)
+	}
+	defer hostConn2.Close()
+
+	// Verify session in broker reflects the authoritative 10s expiry
+	b.mu.RLock()
+	sess := b.sessions[sessionID]
+	b.mu.RUnlock()
+	if sess == nil {
+		t.Fatalf("Expected active session")
+	}
+	if time.Until(sess.ExpiresAt) > 11*time.Second {
+		t.Fatalf("Expected expiry to be bounded to ~10s, got remaining: %v", time.Until(sess.ExpiresAt))
+	}
+}
+
+func TestBroker_BoundedTTLAndIdentityHardening(t *testing.T) {
+	adminSecret := "broker-admin-secret-32b-verified!"
+	b := NewBrokerWithSecret(adminSecret)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/internal/sessions/authorize", b.HandleAuthorizeSession)
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	authURL := server.URL + "/api/v1/internal/sessions/authorize"
+
+	// 1. Invalid TTL (< 10s) must be rejected
+	bodyTooShort := `{"machine_id":"m1","device_id":"d1","session_id":"s1","client_token":"t1","ttl_seconds":5}`
+	req, _ := http.NewRequest(http.MethodPost, authURL, strings.NewReader(bodyTooShort))
+	req.Header.Set("Authorization", "Bearer "+adminSecret)
+	resp, _ := http.DefaultClient.Do(req)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("Expected HTTP 400 for ttl < 10s, got %d", resp.StatusCode)
+	}
+
+	// 2. Register valid host
+	bodyValid := `{"machine_id":"m1","device_id":"d1","session_id":"s1","client_token":"t1","host_token":"h-token-original","ttl_seconds":3600}`
+	req, _ = http.NewRequest(http.MethodPost, authURL, strings.NewReader(bodyValid))
+	req.Header.Set("Authorization", "Bearer "+adminSecret)
+	resp, _ = http.DefaultClient.Do(req)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected HTTP 200 for valid registration, got %d", resp.StatusCode)
+	}
+
+	// 3. Attempt to hijack machine_id with a different host token must fail with 409 Conflict
+	bodyHijack := `{"machine_id":"m1","device_id":"d2","session_id":"s2","client_token":"t2","host_token":"h-token-attacker","ttl_seconds":3600}`
+	req, _ = http.NewRequest(http.MethodPost, authURL, strings.NewReader(bodyHijack))
+	req.Header.Set("Authorization", "Bearer "+adminSecret)
+	resp, _ = http.DefaultClient.Do(req)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("Expected HTTP 409 Conflict for host token replacement attempt, got %d", resp.StatusCode)
+	}
+
+	// 4. Attempt to register same session_id with different client_token must fail with 409 Conflict
+	bodyConflict := `{"machine_id":"m1","device_id":"d1","session_id":"s1","client_token":"different-token","ttl_seconds":3600}`
+	req, _ = http.NewRequest(http.MethodPost, authURL, strings.NewReader(bodyConflict))
+	req.Header.Set("Authorization", "Bearer "+adminSecret)
+	resp, _ = http.DefaultClient.Do(req)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("Expected HTTP 409 Conflict for conflicting client token on existing session, got %d", resp.StatusCode)
+	}
+}

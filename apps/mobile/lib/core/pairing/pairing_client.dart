@@ -74,6 +74,15 @@ class PairingClient {
     if (!confirmUri.path.endsWith('/api/v1/pairing/confirm')) {
       throw PairingException('confirm_url path must end with /api/v1/pairing/confirm, got: ${confirmUri.path}');
     }
+    if (confirmUri.userInfo.isNotEmpty) {
+      throw PairingException('confirm_url must not contain embedded user credentials');
+    }
+    if (confirmUri.hasQuery) {
+      throw PairingException('confirm_url must not contain query parameters');
+    }
+    if (confirmUri.hasFragment) {
+      throw PairingException('confirm_url must not contain URL fragments');
+    }
 
     final reqBody = jsonEncode({
       'challenge_id': payload.challengeId,
@@ -156,6 +165,17 @@ class PairingClient {
     }
     if (brokerUrl == null || brokerUrl.trim().isEmpty) {
       throw PairingException('Server confirmed pairing but omitted broker_url');
+    }
+    final bUri = Uri.tryParse(brokerUrl);
+    if (bUri == null || !bUri.hasScheme || !bUri.hasAuthority || bUri.host.isEmpty) {
+      throw PairingException('Server returned invalid broker_url: $brokerUrl');
+    }
+    final bScheme = bUri.scheme.toLowerCase();
+    if (bScheme != 'ws' && bScheme != 'wss') {
+      throw PairingException('Server returned non-WebSocket broker_url scheme ($bScheme). Must be ws or wss.');
+    }
+    if (bUri.userInfo.isNotEmpty) {
+      throw PairingException('Server returned broker_url containing embedded user credentials');
     }
 
     // Persist securely to platform storage
