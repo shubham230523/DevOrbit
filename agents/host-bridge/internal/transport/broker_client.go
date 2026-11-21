@@ -4,26 +4,49 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"time"
 
+	"devorbit.net/agents/host-bridge/internal/security"
+	httptransport "devorbit.net/agents/host-bridge/internal/transport/http"
 	"github.com/gorilla/websocket"
 )
 
-type BrokerClient struct {
-	BrokerURL string
-	MachineID string
-	SessionID string
-	conn      *websocket.Conn
-	stopChan  chan struct{}
+type FrameEnvelope struct {
+	ProtocolVersion string `json:"v"`
+	SessionID       string `json:"session_id"`
+	Type            string `json:"type"` // "data", "ping", "pong", "close"
+	EncryptedData   string `json:"encrypted_payload"`
+	SeqNum          int64  `json:"seq_num"`
+	Timestamp       int64  `json:"timestamp"`
 }
 
-func NewBrokerClient(brokerURL, machineID, sessionID string) *BrokerClient {
+type BrokerClient struct {
+	BrokerURL  string
+	MachineID  string
+	SessionID  string
+	HostToken  string
+	Server     *httptransport.Server
+	E2ESession *security.E2ESession
+	conn       *websocket.Conn
+	stopChan   chan struct{}
+}
+
+func NewBrokerClient(brokerURL, machineID, sessionID, hostToken string, server *httptransport.Server) *BrokerClient {
 	return &BrokerClient{
 		BrokerURL: brokerURL,
 		MachineID: machineID,
 		SessionID: sessionID,
+		HostToken: hostToken,
+		Server:    server,
 		stopChan:  make(chan struct{}),
 	}
+}
+
+func (bc *BrokerClient) SetE2ESession(sess *security.E2ESession) {
+	bc.E2ESession = sess
 }
 
 func (bc *BrokerClient) Start(ctx context.Context) {
@@ -40,7 +63,7 @@ func (bc *BrokerClient) Start(ctx context.Context) {
 			default:
 			}
 
-			wsURL := fmt.Sprintf("%s/ws/host?machine_id=%s&session_id=%s", bc.BrokerURL, bc.MachineID, bc.SessionID)
+			wsURL := fmt.Sprintf("%s/ws/host?machine_id=%s&session_id=%s&token=%s", bc.BrokerURL, bc.MachineID, bc.SessionID, bc.HostToken)
 			conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
 			if err != nil {
 				log.Printf("HostBridge BrokerClient: Connection failed (%v), retrying in %v...", err, backoff)
@@ -58,11 +81,63 @@ func (bc *BrokerClient) Start(ctx context.Context) {
 
 			// Read loop
 			for {
-				_, _, err := conn.ReadMessage()
-				if err != nil {
+				var frame FrameEnvelope
+				if err := conn.ReadJSON(&frame); err != nil {
 					log.Printf("HostBridge BrokerClient: Disconnected from broker WSS (%v)", err)
 					conn.Close()
 					break
+				}
+
+				if frame.Type == "ping" {
+					_ = conn.WriteJSON(FrameEnvelope{
+						ProtocolVersion: "1.2",
+						SessionID:       bc.SessionID,
+						Type:            "pong",
+						Timestamp:       time.Now().UnixNano(),
+					})
+					continue
+				}
+
+				// Process incoming E2E encrypted client request frame
+				if frame.Type == "data" && bc.E2ESession != nil && bc.Server != nil {
+					plainReq, err := bc.E2ESession.Decrypt(security.DirClientToHost, frame.EncryptedData, frame.SeqNum, frame.Timestamp)
+					if err != nil {
+						log.Printf("HostBridge BrokerClient: Decryption failed for frame seq=%d: %v", frame.SeqNum, err)
+						continue
+					}
+
+					// Route request internally to local HTTP handler
+					reqURL := "/api/v1/health"
+					reqMethod := "GET"
+					if len(plainReq) > 0 {
+						parts := strings.SplitN(string(plainReq), " ", 2)
+						if len(parts) >= 1 {
+							reqMethod = parts[0]
+						}
+						if len(parts) >= 2 {
+							reqURL = parts[1]
+						}
+					}
+
+					req := httptest.NewRequest(reqMethod, reqURL, nil)
+					w := httptest.NewRecorder()
+
+					mux := http.NewServeMux()
+					bc.Server.RegisterRoutes(mux)
+					mux.ServeHTTP(w, req)
+
+					respBytes := w.Body.Bytes()
+					encryptedResp, err := bc.E2ESession.Encrypt(security.DirHostToClient, respBytes, frame.SeqNum, time.Now().UnixNano())
+					if err == nil {
+						_ = conn.WriteJSON(FrameEnvelope{
+							ProtocolVersion: "1.2",
+							SessionID:       bc.SessionID,
+							Type:            "data",
+							EncryptedData:   encryptedResp,
+							SeqNum:          frame.SeqNum,
+							Timestamp:       time.Now().UnixNano(),
+						})
+					}
 				}
 			}
 		}

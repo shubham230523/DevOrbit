@@ -22,7 +22,10 @@ import (
 )
 
 func main() {
-	cfg := config.LoadConfig()
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		log.Fatalf("Host Bridge configuration error: %v", err)
+	}
 
 	// 1. Security Layer
 	jail := security.NewWorkspaceJail(cfg.AllowedRoots)
@@ -60,7 +63,10 @@ func main() {
 	}
 
 	// 5. Outbound Connection Broker Client
-	brokerClient := transport.NewBrokerClient(cfg.BrokerURL, cfg.HostID, "sess-host-init-001")
+	brokerClient := transport.NewBrokerClient(cfg.BrokerURL, cfg.HostID, "sess-host-init-001", cfg.HostSecret, serverEngine)
+	e2eSess, _ := security.NewE2ESession("sess-host-init-001", "phone-android-01", cfg.HostSecret, 24*time.Hour)
+	brokerClient.SetE2ESession(e2eSess)
+
 	brokerClient.Start(context.Background())
 	defer brokerClient.Stop()
 

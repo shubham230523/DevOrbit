@@ -22,7 +22,7 @@ var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024 * 1024,
 	WriteBufferSize: 1024 * 1024,
 	CheckOrigin: func(r *http.Request) bool {
-		return true // Allow all origins in local/development mode
+		return true
 	},
 }
 
@@ -59,14 +59,22 @@ type Broker struct {
 	sessions      map[string]*Session            // Key: SessionID
 	hostSessions  map[string]map[string]*Session // Key: MachineID -> map[SessionID]*Session
 	authorizedDev map[string]bool                // Key: MachineID + ":" + DeviceID
+	authorizedHost map[string]string             // Key: MachineID -> Expected Token
 }
 
 func NewBroker() *Broker {
 	return &Broker{
-		sessions:      make(map[string]*Session),
-		hostSessions:  make(map[string]map[string]*Session),
-		authorizedDev: make(map[string]bool),
+		sessions:       make(map[string]*Session),
+		hostSessions:   make(map[string]map[string]*Session),
+		authorizedDev:  make(map[string]bool),
+		authorizedHost: make(map[string]string),
 	}
+}
+
+func (b *Broker) AuthorizeHost(machineID, token string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.authorizedHost[machineID] = token
 }
 
 func (b *Broker) AuthorizeDevice(machineID, deviceID string) {
@@ -88,20 +96,32 @@ func (b *Broker) RevokeDevice(machineID, deviceID string) {
 	}
 }
 
-func (b *Broker) RegisterHostConnection(machineID, sessionID string, conn *websocket.Conn) (*Session, error) {
+func (b *Broker) RegisterHostConnection(machineID, sessionID, token string, conn *websocket.Conn) (*Session, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	// Validate Host Authentication
+	if expectedToken, ok := b.authorizedHost[machineID]; ok && expectedToken != "" {
+		if token != expectedToken {
+			return nil, ErrUnauthorizedSession
+		}
+	}
 
 	sess, ok := b.sessions[sessionID]
 	if !ok {
 		sess = &Session{
 			ID:        sessionID,
 			MachineID: machineID,
+			Token:     token,
 			ExpiresAt: time.Now().Add(1 * time.Hour),
 		}
 		b.sessions[sessionID] = sess
 	}
 
+	if sess.HostConn != nil && sess.HostConn != conn {
+		// Close existing stale host connection
+		_ = sess.HostConn.Close()
+	}
 	sess.HostConn = conn
 
 	if _, ok := b.hostSessions[machineID]; !ok {
@@ -112,7 +132,7 @@ func (b *Broker) RegisterHostConnection(machineID, sessionID string, conn *webso
 	return sess, nil
 }
 
-func (b *Broker) RegisterClientConnection(machineID, deviceID, sessionID string, conn *websocket.Conn) (*Session, error) {
+func (b *Broker) RegisterClientConnection(machineID, deviceID, sessionID, token string, conn *websocket.Conn) (*Session, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -130,6 +150,10 @@ func (b *Broker) RegisterClientConnection(machineID, deviceID, sessionID string,
 		return nil, errors.New("session expired")
 	}
 
+	if sess.ClientConn != nil && sess.ClientConn != conn {
+		_ = sess.ClientConn.Close()
+	}
+
 	sess.DeviceID = deviceID
 	sess.ClientConn = conn
 
@@ -139,8 +163,19 @@ func (b *Broker) RegisterClientConnection(machineID, deviceID, sessionID string,
 func (b *Broker) HandleHostWebSocket(w http.ResponseWriter, r *http.Request) {
 	machineID := r.URL.Query().Get("machine_id")
 	sessionID := r.URL.Query().Get("session_id")
+	token := r.URL.Query().Get("token")
+
 	if machineID == "" || sessionID == "" {
 		http.Error(w, "missing machine_id or session_id query param", http.StatusBadRequest)
+		return
+	}
+
+	b.mu.RLock()
+	expectedToken, hostEnforced := b.authorizedHost[machineID]
+	b.mu.RUnlock()
+
+	if hostEnforced && expectedToken != "" && token != expectedToken {
+		http.Error(w, "unauthorized host authentication token", http.StatusUnauthorized)
 		return
 	}
 
@@ -150,12 +185,13 @@ func (b *Broker) HandleHostWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sess, err := b.RegisterHostConnection(machineID, sessionID, conn)
+	sess, err := b.RegisterHostConnection(machineID, sessionID, token, conn)
 	if err != nil {
+		conn.WriteJSON(map[string]string{"error": err.Error()})
 		conn.Close()
 		return
 	}
-	log.Printf("Broker: Host WSS connected for machine=%s session=%s", machineID, sessionID)
+	log.Printf("Broker: Authenticated Host WSS connected for machine=%s session=%s", machineID, sessionID)
 
 	defer b.CloseSession(sess.ID)
 
@@ -173,9 +209,19 @@ func (b *Broker) HandleClientWebSocket(w http.ResponseWriter, r *http.Request) {
 	machineID := r.URL.Query().Get("machine_id")
 	deviceID := r.URL.Query().Get("device_id")
 	sessionID := r.URL.Query().Get("session_id")
+	token := r.URL.Query().Get("token")
 
 	if machineID == "" || deviceID == "" || sessionID == "" {
 		http.Error(w, "missing machine_id, device_id, or session_id", http.StatusBadRequest)
+		return
+	}
+
+	b.mu.RLock()
+	isAuthorized := b.authorizedDev[machineID+":"+deviceID]
+	b.mu.RUnlock()
+
+	if !isAuthorized {
+		http.Error(w, "unauthorized device identity or revoked trust", http.StatusForbidden)
 		return
 	}
 
@@ -185,13 +231,13 @@ func (b *Broker) HandleClientWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sess, err := b.RegisterClientConnection(machineID, deviceID, sessionID, conn)
+	sess, err := b.RegisterClientConnection(machineID, deviceID, sessionID, token, conn)
 	if err != nil {
 		conn.WriteJSON(map[string]string{"error": err.Error()})
 		conn.Close()
 		return
 	}
-	log.Printf("Broker: Client WSS connected for machine=%s device=%s session=%s", machineID, deviceID, sessionID)
+	log.Printf("Broker: Authenticated Client WSS connected for machine=%s device=%s session=%s", machineID, deviceID, sessionID)
 
 	defer b.CloseSession(sess.ID)
 

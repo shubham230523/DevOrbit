@@ -1,9 +1,18 @@
 package config
 
 import (
+	"errors"
+	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
+)
+
+var (
+	ErrMissingSecret      = errors.New("config error: required secret key is missing or too short")
+	ErrInsecureSchemeProd = errors.New("config error: production mode requires wss:// or https:// endpoints")
 )
 
 type Config struct {
@@ -11,14 +20,20 @@ type Config struct {
 	Port            int
 	LogLevel        string
 	MaxFileSizeMB   int64
-	AllowedBinaries  []string
+	AllowedBinaries []string
 	HostID          string
 	HostName        string
 	HostSecret      string
 	BrokerURL       string
+	Environment     string
 }
 
-func LoadConfig() *Config {
+func LoadConfig() (*Config, error) {
+	env := strings.ToLower(os.Getenv("DEVORBIT_ENV"))
+	if env == "" {
+		env = "development"
+	}
+
 	port := 8082
 	if p := os.Getenv("DEVORBIT_PORT"); p != "" {
 		if val, err := strconv.Atoi(p); err == nil {
@@ -48,12 +63,22 @@ func LoadConfig() *Config {
 
 	hostSecret := os.Getenv("DEVORBIT_HOST_SECRET")
 	if hostSecret == "" {
+		if env == "production" {
+			return nil, fmt.Errorf("%w: DEVORBIT_HOST_SECRET is required in production mode", ErrMissingSecret)
+		}
 		hostSecret = "devorbit-host-bridge-master-secret-key-32b"
+		log.Println("Config Warning: Using default development host secret. Set DEVORBIT_HOST_SECRET in production.")
+	} else if len(hostSecret) < 16 {
+		return nil, fmt.Errorf("%w: DEVORBIT_HOST_SECRET must be at least 16 characters", ErrMissingSecret)
 	}
 
 	brokerURL := os.Getenv("DEVORBIT_BROKER_URL")
 	if brokerURL == "" {
 		brokerURL = "ws://localhost:8081"
+	}
+
+	if env == "production" && !strings.HasPrefix(brokerURL, "wss://") && !strings.HasPrefix(brokerURL, "https://") {
+		return nil, fmt.Errorf("%w: DEVORBIT_BROKER_URL '%s' must use wss:// or https:// in production mode", ErrInsecureSchemeProd, brokerURL)
 	}
 
 	// Default allowed roots
@@ -76,8 +101,9 @@ func LoadConfig() *Config {
 		HostName:      hostName,
 		HostSecret:    hostSecret,
 		BrokerURL:     brokerURL,
+		Environment:   env,
 		AllowedBinaries: []string{
 			"git", "git.exe", "gradlew", "gradlew.bat", "gradle", "gradle.bat", "adb", "adb.exe",
 		},
-	}
+	}, nil
 }

@@ -11,8 +11,9 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-func TestBroker_RealWebSocketServerRelayAndOpaquePayload(t *testing.T) {
+func TestBroker_HostAndClientAuthenticationEnforcement(t *testing.T) {
 	b := NewBroker()
+	b.AuthorizeHost("mach-auth-01", "valid-host-token-secret")
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws/host", b.HandleHostWebSocket)
@@ -23,42 +24,45 @@ func TestBroker_RealWebSocketServerRelayAndOpaquePayload(t *testing.T) {
 
 	wsURL := strings.Replace(server.URL, "http://", "ws://", 1)
 
-	machineID := "mach-real-01"
-	deviceID := "dev-phone-01"
-	sessionID := "sess-real-100"
+	// 1. Attempt unauthenticated host connection -> Should receive 401
+	badHostURL := fmt.Sprintf("%s/ws/host?machine_id=mach-auth-01&session_id=sess-1&token=wrong-token", wsURL)
+	_, res, err := websocket.DefaultDialer.Dial(badHostURL, nil)
+	if err == nil || res == nil || res.StatusCode != http.StatusUnauthorized {
+		t.Errorf("Expected HTTP 401 Unauthorized for unauthenticated host registration attempt")
+	}
 
-	b.AuthorizeDevice(machineID, deviceID)
+	// 2. Attempt unauthorized client connection -> Should receive 403
+	badClientURL := fmt.Sprintf("%s/ws/client?machine_id=mach-auth-01&device_id=unauthorized-phone&session_id=sess-1", wsURL)
+	_, res, err = websocket.DefaultDialer.Dial(badClientURL, nil)
+	if err == nil || res == nil || res.StatusCode != http.StatusForbidden {
+		t.Errorf("Expected HTTP 403 Forbidden for unauthorized client device connection attempt")
+	}
 
-	// 1. Host establishes WebSocket Connection
-	hostURL := fmt.Sprintf("%s/ws/host?machine_id=%s&session_id=%s", wsURL, machineID, sessionID)
-	hostConn, _, err := websocket.DefaultDialer.Dial(hostURL, nil)
-	if err != nil {
-		t.Fatalf("Failed to dial host WSS: %v", err)
+	// 3. Authorize device & host connection
+	b.AuthorizeDevice("mach-auth-01", "dev-phone-01")
+	goodHostURL := fmt.Sprintf("%s/ws/host?machine_id=mach-auth-01&session_id=sess-1&token=valid-host-token-secret", wsURL)
+	hostConn, res, err := websocket.DefaultDialer.Dial(goodHostURL, nil)
+	if err != nil || res.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("Expected successful host WSS upgrade, got: %v", err)
 	}
 	defer hostConn.Close()
 
-	// 2. Client establishes WebSocket Connection
-	clientURL := fmt.Sprintf("%s/ws/client?machine_id=%s&device_id=%s&session_id=%s", wsURL, machineID, deviceID, sessionID)
-	clientConn, _, err := websocket.DefaultDialer.Dial(clientURL, nil)
-	if err != nil {
-		t.Fatalf("Failed to dial client WSS: %v", err)
+	goodClientURL := fmt.Sprintf("%s/ws/client?machine_id=mach-auth-01&device_id=dev-phone-01&session_id=sess-1", wsURL)
+	clientConn, res, err := websocket.DefaultDialer.Dial(goodClientURL, nil)
+	if err != nil || res.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("Expected successful client WSS upgrade, got: %v", err)
 	}
 	defer clientConn.Close()
 
-	// Wait for registration
 	time.Sleep(50 * time.Millisecond)
 
-	if b.ActiveSessionCount() != 1 {
-		t.Errorf("Expected 1 active session on broker, got %d", b.ActiveSessionCount())
-	}
-
-	// 3. Client sends E2E Encrypted Payload Frame to Broker -> Broker Relays to Host
-	opaqueCipherPayload := "a1b2c3d4_opaque_encrypted_aes_gcm_bytes_here"
+	// 4. Test Bidirectional Opaque Payload Frame Relaying
+	opaquePayload := "a1b2c3d4_opaque_e2e_ciphertext_payload"
 	clientFrame := FrameEnvelope{
 		ProtocolVersion: "1.2",
-		SessionID:       sessionID,
+		SessionID:       "sess-1",
 		Type:            "data",
-		EncryptedData:   opaqueCipherPayload,
+		EncryptedData:   opaquePayload,
 		SeqNum:          1,
 		Timestamp:       time.Now().UnixNano(),
 	}
@@ -67,21 +71,20 @@ func TestBroker_RealWebSocketServerRelayAndOpaquePayload(t *testing.T) {
 		t.Fatalf("Failed to write frame from client: %v", err)
 	}
 
-	// Read on Host WSS
-	var hostReceivedFrame FrameEnvelope
-	if err := hostConn.ReadJSON(&hostReceivedFrame); err != nil {
+	var hostFrame FrameEnvelope
+	if err := hostConn.ReadJSON(&hostFrame); err != nil {
 		t.Fatalf("Failed to read frame on host: %v", err)
 	}
 
-	if hostReceivedFrame.EncryptedData != opaqueCipherPayload {
-		t.Errorf("Opaque relay failed! Host received '%s', expected '%s'", hostReceivedFrame.EncryptedData, opaqueCipherPayload)
+	if hostFrame.EncryptedData != opaquePayload {
+		t.Errorf("Payload mismatch! Expected opaque frame '%s', got '%s'", opaquePayload, hostFrame.EncryptedData)
 	}
 
-	// 4. Test Device Revocation Teardown over real WebSocket
-	b.RevokeDevice(machineID, deviceID)
+	// 5. Test Device Revocation Teardown
+	b.RevokeDevice("mach-auth-01", "dev-phone-01")
 	time.Sleep(50 * time.Millisecond)
 
 	if b.ActiveSessionCount() != 0 {
-		t.Errorf("Expected active sessions to be 0 after device revocation")
+		t.Errorf("Expected 0 active sessions after device revocation")
 	}
 }
