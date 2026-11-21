@@ -25,6 +25,8 @@ type Config struct {
 	HostName        string
 	HostSecret      string
 	BrokerURL       string
+	BrokerSecret    string
+	AdvertisedURL   string
 	Environment     string
 }
 
@@ -105,6 +107,9 @@ func LoadConfig() (*Config, error) {
 		}
 	}
 
+	brokerSecret := os.Getenv("DEVORBIT_BROKER_SECRET")
+	advertisedURL := os.Getenv("DEVORBIT_ADVERTISED_URL")
+
 	return &Config{
 		AllowedRoots:  roots,
 		Port:          port,
@@ -114,6 +119,8 @@ func LoadConfig() (*Config, error) {
 		HostName:      hostName,
 		HostSecret:    hostSecret,
 		BrokerURL:     brokerURL,
+		BrokerSecret:  brokerSecret,
+		AdvertisedURL: advertisedURL,
 		Environment:   env,
 		AllowedBinaries: []string{
 			"git", "git.exe", "gradlew", "gradlew.bat", "gradle", "gradle.bat", "adb", "adb.exe",

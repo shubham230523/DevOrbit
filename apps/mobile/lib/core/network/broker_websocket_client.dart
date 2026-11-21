@@ -7,6 +7,7 @@ import '../security/e2e_session.dart';
 enum BrokerConnectionState {
   disconnected,
   connecting,
+  transportConnected,
   authenticating,
   authenticatedBrokerSessionActive,
   reconnecting,
@@ -93,6 +94,9 @@ class BrokerWebSocketClient {
       );
       await _channel!.ready;
 
+      _state = BrokerConnectionState.transportConnected;
+      _stateController.add(_state);
+
       _state = BrokerConnectionState.authenticating;
       _stateController.add(_state);
 
@@ -101,43 +105,76 @@ class BrokerWebSocketClient {
           try {
             final jsonMap = jsonDecode(data.toString()) as Map<String, dynamic>;
             final frameType = jsonMap['type'];
+
+            // 1. Server-confirmed session acknowledgment
+            if (frameType == 'session_ready' || frameType == 'auth_ack') {
+              _state = BrokerConnectionState.authenticatedBrokerSessionActive;
+              _stateController.add(_state);
+              return;
+            }
+
+            // 2. Server-side session revocation
+            if (frameType == 'revoked') {
+              _state = BrokerConnectionState.revoked;
+              _stateController.add(_state);
+              _failPendingRequests(Exception('Session revoked by server'));
+              _channel?.sink.close();
+              _channel = null;
+              return;
+            }
+
             final cipherHex = jsonMap['encrypted_payload']?.toString();
             final seqNum = jsonMap['seq_num'] as int? ?? 1;
             final timestamp = jsonMap['timestamp'] as int? ?? DateTime.now().microsecondsSinceEpoch;
 
             if (frameType == 'data' && cipherHex != null && _e2eSession != null) {
-              final decryptedJsonStr = await _e2eSession!.decrypt(
-                direction: Direction.hostToClient,
-                cipherTextHex: cipherHex,
-                seqNum: seqNum,
-                timestamp: timestamp,
-              );
+              try {
+                final decryptedJsonStr = await _e2eSession!.decrypt(
+                  direction: Direction.hostToClient,
+                  cipherTextHex: cipherHex,
+                  seqNum: seqNum,
+                  timestamp: timestamp,
+                );
 
-              final appRespJson = jsonDecode(decryptedJsonStr) as Map<String, dynamic>;
-              final appResp = ApplicationResponseEnvelope.fromJson(appRespJson);
+                final appRespJson = jsonDecode(decryptedJsonStr) as Map<String, dynamic>;
+                final appResp = ApplicationResponseEnvelope.fromJson(appRespJson);
 
-              if (_pendingRequests.containsKey(appResp.requestId)) {
-                _pendingRequests.remove(appResp.requestId)!.complete(appResp);
-              }
+                if (_pendingRequests.containsKey(appResp.requestId)) {
+                  _pendingRequests.remove(appResp.requestId)!.complete(appResp);
+                }
+              } catch (_) {}
             }
           } catch (_) {}
         },
         onError: (error) {
-          _state = BrokerConnectionState.reconnecting;
-          _stateController.add(_state);
+          if (_state != BrokerConnectionState.revoked) {
+            _state = BrokerConnectionState.reconnecting;
+            _stateController.add(_state);
+          }
+          _failPendingRequests(Exception('WebSocket error: $error'));
         },
         onDone: () {
-          _state = BrokerConnectionState.disconnected;
-          _stateController.add(_state);
+          if (_state != BrokerConnectionState.revoked) {
+            _state = BrokerConnectionState.disconnected;
+            _stateController.add(_state);
+          }
+          _failPendingRequests(Exception('WebSocket connection closed'));
         },
       );
-
-      _state = BrokerConnectionState.authenticatedBrokerSessionActive;
-      _stateController.add(_state);
     } catch (e) {
       _state = BrokerConnectionState.authFailed;
       _stateController.add(_state);
+      _failPendingRequests(Exception('Authentication failed: $e'));
     }
+  }
+
+  void _failPendingRequests(Exception error) {
+    for (final completer in _pendingRequests.values) {
+      if (!completer.isCompleted) {
+        completer.completeError(error);
+      }
+    }
+    _pendingRequests.clear();
   }
 
   Future<ApplicationResponseEnvelope> sendRequest({
@@ -201,8 +238,10 @@ class BrokerWebSocketClient {
 
   void disconnect() {
     _channel?.sink.close();
+    _channel = null;
     _state = BrokerConnectionState.disconnected;
     _stateController.add(_state);
+    _failPendingRequests(Exception('Client disconnected'));
   }
 
   void dispose() {

@@ -204,9 +204,16 @@ class _DashboardScreenState extends State<DashboardScreen> {
       if (mounted) {
         setState(() {
           _connectionState = state;
+          if (state == BrokerConnectionState.authenticatedBrokerSessionActive) {
+            _isLoading = false;
+            _errorMessage = null;
+          }
         });
       }
-      if (state == BrokerConnectionState.revoked) {
+
+      if (state == BrokerConnectionState.authenticatedBrokerSessionActive) {
+        await _fetchLiveHostDataOverBroker();
+      } else if (state == BrokerConnectionState.revoked) {
         await _storage.clearPairedSession();
         if (mounted) {
           setState(() {
@@ -215,23 +222,21 @@ class _DashboardScreenState extends State<DashboardScreen> {
             _sessionId = null;
             _token = null;
             _masterSecret = null;
+            _isLoading = false;
             _errorMessage = 'Device revoked: Credentials invalidated and cleared from secure storage.';
+          });
+        }
+      } else if (state == BrokerConnectionState.authFailed) {
+        if (mounted) {
+          setState(() {
+            _isLoading = false;
+            _errorMessage = 'Authentication failed: connection rejected by broker.';
           });
         }
       }
     });
 
     await _brokerClient!.connect();
-    if (_brokerClient!.state == BrokerConnectionState.authenticatedBrokerSessionActive) {
-      await _fetchLiveHostDataOverBroker();
-    } else {
-      if (mounted) {
-        setState(() {
-          _isLoading = false;
-          _errorMessage = 'Failed to establish authenticated session with Connection Broker at $url';
-        });
-      }
-    }
   }
 
   Future<void> _fetchLiveHostDataOverBroker() async {
@@ -308,6 +313,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       case BrokerConnectionState.authenticatedBrokerSessionActive:
         return Colors.green;
       case BrokerConnectionState.connecting:
+      case BrokerConnectionState.transportConnected:
       case BrokerConnectionState.authenticating:
       case BrokerConnectionState.reconnecting:
         return Colors.amber;
@@ -327,6 +333,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
         return 'AUTHENTICATED BROKER SESSION ACTIVE';
       case BrokerConnectionState.connecting:
         return 'CONNECTING TO BROKER';
+      case BrokerConnectionState.transportConnected:
+        return 'TRANSPORT CONNECTED';
       case BrokerConnectionState.authenticating:
         return 'AUTHENTICATING';
       case BrokerConnectionState.reconnecting:

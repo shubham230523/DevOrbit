@@ -1,6 +1,8 @@
 package broker
 
 import (
+	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
@@ -59,11 +61,17 @@ type Broker struct {
 	authorizedDev          map[string]bool                // Key: MachineID + ":" + DeviceID
 	authorizedHost         map[string]string             // Key: MachineID -> Expected Token
 	authorizedClientTokens map[string]string             // Key: MachineID + ":" + DeviceID + ":" + SessionID -> Token
+	authorizedExpiries     map[string]time.Time          // Key: MachineID + ":" + DeviceID + ":" + SessionID -> Expiry
 	allowedOrigins         map[string]bool                // Key: Origin domain
 	environment            string
+	adminSecret            string
 }
 
 func NewBroker() *Broker {
+	return NewBrokerWithSecret(os.Getenv("DEVORBIT_BROKER_SECRET"))
+}
+
+func NewBrokerWithSecret(adminSecret string) *Broker {
 	env := strings.ToLower(os.Getenv("DEVORBIT_ENV"))
 	if env == "" {
 		env = "development"
@@ -87,8 +95,10 @@ func NewBroker() *Broker {
 		authorizedDev:          make(map[string]bool),
 		authorizedHost:         make(map[string]string),
 		authorizedClientTokens: make(map[string]string),
+		authorizedExpiries:     make(map[string]time.Time),
 		allowedOrigins:         origins,
 		environment:            env,
+		adminSecret:            adminSecret,
 	}
 }
 
@@ -161,12 +171,20 @@ func (b *Broker) AuthorizeHost(machineID, token string) {
 }
 
 func (b *Broker) AuthorizeDevice(machineID, deviceID, sessionID, clientToken string) {
+	b.AuthorizeDeviceWithExpiry(machineID, deviceID, sessionID, clientToken, 24*time.Hour)
+}
+
+func (b *Broker) AuthorizeDeviceWithExpiry(machineID, deviceID, sessionID, clientToken string, ttl time.Duration) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if machineID != "" && deviceID != "" {
 		b.authorizedDev[machineID+":"+deviceID] = true
 		if sessionID != "" && clientToken != "" {
-			b.authorizedClientTokens[machineID+":"+deviceID+":"+sessionID] = clientToken
+			key := machineID + ":" + deviceID + ":" + sessionID
+			b.authorizedClientTokens[key] = clientToken
+			if ttl > 0 {
+				b.authorizedExpiries[key] = time.Now().Add(ttl)
+			}
 		}
 	}
 }
@@ -176,9 +194,11 @@ func (b *Broker) RevokeDevice(machineID, deviceID string) {
 	defer b.mu.Unlock()
 	delete(b.authorizedDev, machineID+":"+deviceID)
 
+	prefix := machineID + ":" + deviceID + ":"
 	for key := range b.authorizedClientTokens {
-		if strings.HasPrefix(key, machineID+":"+deviceID+":") {
+		if strings.HasPrefix(key, prefix) {
 			delete(b.authorizedClientTokens, key)
+			delete(b.authorizedExpiries, key)
 		}
 	}
 
@@ -369,11 +389,17 @@ func (b *Broker) HandleClientWebSocket(w http.ResponseWriter, r *http.Request) {
 	b.mu.RLock()
 	isAuthorized := b.authorizedDev[machineID+":"+deviceID]
 	expectedToken, tokenRegistered := b.authorizedClientTokens[machineID+":"+deviceID+":"+sessionID]
+	tokenExpiry, hasTokenExpiry := b.authorizedExpiries[machineID+":"+deviceID+":"+sessionID]
 	sessExisting, sessExists := b.sessions[sessionID]
 	b.mu.RUnlock()
 
 	if !isAuthorized || !tokenRegistered || expectedToken == "" || token != expectedToken {
 		http.Error(w, "unauthorized client device identity or invalid token credential", http.StatusForbidden)
+		return
+	}
+
+	if hasTokenExpiry && time.Now().After(tokenExpiry) {
+		http.Error(w, "session authorization token has expired", http.StatusUnauthorized)
 		return
 	}
 
@@ -403,6 +429,18 @@ func (b *Broker) HandleClientWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("Broker: Authenticated Client WSS connected for machine=%s device=%s session=%s", machineID, deviceID, sessionID)
+
+	// Explicit server-confirmed session acknowledgment frame
+	ackFrame := FrameEnvelope{
+		ProtocolVersion: "1.0",
+		SessionID:       sessionID,
+		Type:            "session_ready",
+		Timestamp:       time.Now().UnixMicro(),
+	}
+	if err := conn.WriteJSON(ackFrame); err != nil {
+		conn.Close()
+		return
+	}
 
 	defer b.CloseSession(sess.ID)
 
@@ -457,11 +495,11 @@ func (b *Broker) closeSessionLocked(sessionID string) {
 		return
 	}
 
-	if sess.HostConn != nil {
-		_ = sess.HostConn.Close()
-	}
 	if sess.ClientConn != nil {
 		_ = sess.ClientConn.Close()
+	}
+	if sess.HostConn != nil {
+		_ = sess.HostConn.Close()
 	}
 
 	if m, ok := b.hostSessions[sess.MachineID]; ok {
@@ -478,4 +516,125 @@ func (b *Broker) ActiveSessionCount() int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return len(b.sessions)
+}
+
+func (b *Broker) verifyAdminAuth(r *http.Request) bool {
+	b.mu.RLock()
+	adminSecret := b.adminSecret
+	b.mu.RUnlock()
+
+	if adminSecret == "" {
+		return false
+	}
+
+	authHeader := r.Header.Get("Authorization")
+	if authHeader != "" {
+		parts := strings.SplitN(authHeader, " ", 2)
+		if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+			token := strings.TrimSpace(parts[1])
+			if subtle.ConstantTimeCompare([]byte(token), []byte(adminSecret)) == 1 {
+				return true
+			}
+		}
+	}
+
+	if secretHeader := r.Header.Get("X-Broker-Secret"); secretHeader != "" {
+		return subtle.ConstantTimeCompare([]byte(secretHeader), []byte(adminSecret)) == 1
+	}
+
+	return false
+}
+
+type AuthorizeSessionRequest struct {
+	MachineID   string `json:"machine_id"`
+	DeviceID    string `json:"device_id"`
+	SessionID   string `json:"session_id"`
+	ClientToken string `json:"client_token"`
+	HostToken   string `json:"host_token,omitempty"`
+	TTLSeconds  int64  `json:"ttl_seconds,omitempty"`
+}
+
+func (b *Broker) HandleAuthorizeSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if !b.verifyAdminAuth(r) {
+		http.Error(w, "Unauthorized: invalid service-to-service credentials", http.StatusUnauthorized)
+		return
+	}
+
+	var req AuthorizeSessionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+
+	if req.MachineID == "" || req.DeviceID == "" || req.SessionID == "" || req.ClientToken == "" {
+		http.Error(w, "missing required parameters: machine_id, device_id, session_id, and client_token are required", http.StatusBadRequest)
+		return
+	}
+
+	ttl := 24 * time.Hour
+	if req.TTLSeconds > 0 {
+		ttl = time.Duration(req.TTLSeconds) * time.Second
+	}
+
+	b.AuthorizeDeviceWithExpiry(req.MachineID, req.DeviceID, req.SessionID, req.ClientToken, ttl)
+
+	if req.HostToken != "" {
+		b.AuthorizeHost(req.MachineID, req.HostToken)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":     "authorized",
+		"session_id": req.SessionID,
+		"machine_id": req.MachineID,
+		"device_id":  req.DeviceID,
+		"expires_at": time.Now().Add(ttl).Format(time.RFC3339),
+	})
+}
+
+type RevokeRequest struct {
+	MachineID string `json:"machine_id"`
+	DeviceID  string `json:"device_id,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
+}
+
+func (b *Broker) HandleRevoke(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if !b.verifyAdminAuth(r) {
+		http.Error(w, "Unauthorized: invalid service-to-service credentials", http.StatusUnauthorized)
+		return
+	}
+
+	var req RevokeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+
+	if req.MachineID == "" {
+		http.Error(w, "machine_id is required", http.StatusBadRequest)
+		return
+	}
+
+	if req.DeviceID != "" {
+		b.RevokeDevice(req.MachineID, req.DeviceID)
+	}
+
+	if req.SessionID != "" {
+		b.CloseSession(req.SessionID)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"status": "revoked",
+	})
 }

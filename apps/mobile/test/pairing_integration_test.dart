@@ -62,6 +62,7 @@ void main() {
     });
 
     test('Rejects expired pairing challenge before network request', () async {
+      final now = DateTime.now().subtract(const Duration(seconds: 10));
       final expiredPayload = QrPairingPayload(
         version: '1.0',
         challengeId: 'qr-exp-01',
@@ -69,8 +70,9 @@ void main() {
         hostName: 'Host Exp',
         pairingPayload: 'payload-exp',
         pairingSecret: 'secret-exp',
-        confirmUrl: 'http://127.0.0.1:8080',
-        expiresAt: DateTime.now().subtract(const Duration(seconds: 10)),
+        confirmUrl: 'http://127.0.0.1:8080/api/v1/pairing/confirm',
+        expiresAt: now,
+        rawExpiresAt: now.toIso8601String(),
       );
 
       final client = PairingClient();
@@ -85,7 +87,49 @@ void main() {
       );
     });
 
+    test('Rejects relative, unsupported scheme, or malformed confirmation URLs', () {
+      // 1. Relative URI
+      expect(
+        () => QrPairingPayload.fromJson({
+          'v': '1.0',
+          'challenge_id': 'qr-01',
+          'host_id': 'h-01',
+          'pairing_payload': 'p-01',
+          'confirm_url': '/api/v1/pairing/confirm',
+          'expires_at': DateTime.now().add(const Duration(minutes: 5)).toIso8601String(),
+        }),
+        throwsA(isA<FormatException>()),
+      );
+
+      // 2. Unsupported scheme (ftp)
+      expect(
+        () => QrPairingPayload.fromJson({
+          'v': '1.0',
+          'challenge_id': 'qr-01',
+          'host_id': 'h-01',
+          'pairing_payload': 'p-01',
+          'confirm_url': 'ftp://127.0.0.1:8080/api/v1/pairing/confirm',
+          'expires_at': DateTime.now().add(const Duration(minutes: 5)).toIso8601String(),
+        }),
+        throwsA(isA<FormatException>()),
+      );
+
+      // 3. Incorrect endpoint path
+      expect(
+        () => QrPairingPayload.fromJson({
+          'v': '1.0',
+          'challenge_id': 'qr-01',
+          'host_id': 'h-01',
+          'pairing_payload': 'p-01',
+          'confirm_url': 'http://127.0.0.1:8080/api/v1/wrong/path',
+          'expires_at': DateTime.now().add(const Duration(minutes: 5)).toIso8601String(),
+        }),
+        throwsA(isA<FormatException>()),
+      );
+    });
+
     test('Successful backend confirmation persists credentials and survives restart', () async {
+      final now = DateTime.now().add(const Duration(minutes: 5));
       final payload = QrPairingPayload(
         version: '1.0',
         challengeId: 'qr-test-01',
@@ -95,7 +139,8 @@ void main() {
         pairingSecret: 'secret-ephemeral-32b',
         confirmUrl: 'http://127.0.0.1:8080/api/v1/pairing/confirm',
         brokerUrl: 'ws://127.0.0.1:8081',
-        expiresAt: DateTime.now().add(const Duration(minutes: 5)),
+        expiresAt: now,
+        rawExpiresAt: now.toIso8601String(),
       );
 
       final mockHttp = MockClient((request) async {
@@ -145,6 +190,7 @@ void main() {
     });
 
     test('Backend challenge consumed / replay error surfaces actionable message', () async {
+      final now = DateTime.now().add(const Duration(minutes: 5));
       final payload = QrPairingPayload(
         version: '1.0',
         challengeId: 'qr-consumed-01',
@@ -153,7 +199,8 @@ void main() {
         pairingPayload: 'payload-hex-32b',
         pairingSecret: 'secret-ephemeral-32b',
         confirmUrl: 'http://127.0.0.1:8080/api/v1/pairing/confirm',
-        expiresAt: DateTime.now().add(const Duration(minutes: 5)),
+        expiresAt: now,
+        rawExpiresAt: now.toIso8601String(),
       );
 
       final mockHttp = MockClient((request) async {
@@ -180,6 +227,74 @@ void main() {
           contains('already been consumed'),
         );
       }
+    });
+
+    test('Negative tests: rejects missing, empty, or mismatched server credentials', () async {
+      final now = DateTime.now().add(const Duration(minutes: 5));
+      final payload = QrPairingPayload(
+        version: '1.0',
+        challengeId: 'qr-neg-01',
+        hostId: 'host-win-01',
+        hostName: 'Windows Desktop',
+        pairingPayload: 'payload-hex-32b',
+        pairingSecret: 'secret-ephemeral-32b',
+        confirmUrl: 'http://127.0.0.1:8080/api/v1/pairing/confirm',
+        brokerUrl: 'ws://127.0.0.1:8081',
+        expiresAt: now,
+        rawExpiresAt: now.toIso8601String(),
+      );
+
+      final validBase = {
+        'status': 'success',
+        'session_token': 'valid-token-32b',
+        'session_id': 'sess-100',
+        'session_secret': 'valid-secret-32b',
+        'machine_id': 'host-win-01',
+        'device_id': 'dev-phone-01',
+        'broker_url': 'ws://127.0.0.1:8081',
+        'expires_at': now.toIso8601String(),
+      };
+
+      Future<void> assertThrowsForBody(Map<String, dynamic> body, String expectedSubstring) async {
+        final mock = MockClient((_) async => http.Response(jsonEncode(body), 200, headers: {'content-type': 'application/json'}));
+        final client = PairingClient(httpClient: mock);
+        try {
+          await client.confirmPairing(
+            payload: payload,
+            deviceId: 'dev-phone-01',
+            deviceName: 'Phone',
+            secureStorage: storage,
+          );
+          fail('Expected PairingException for: $body');
+        } catch (e) {
+          expect(e, isA<PairingException>());
+          expect((e as PairingException).message, contains(expectedSubstring));
+        }
+      }
+
+      // 1. Missing session_token
+      final noToken = Map<String, dynamic>.from(validBase)..remove('session_token');
+      await assertThrowsForBody(noToken, 'session_token');
+
+      // 2. Missing session_id
+      final noSessionId = Map<String, dynamic>.from(validBase)..remove('session_id');
+      await assertThrowsForBody(noSessionId, 'session_id');
+
+      // 3. Missing session_secret
+      final noSecret = Map<String, dynamic>.from(validBase)..remove('session_secret');
+      await assertThrowsForBody(noSecret, 'session_secret');
+
+      // 4. Insecurely echoed pairing secret
+      final echoedSecret = Map<String, dynamic>.from(validBase)..['session_secret'] = 'secret-ephemeral-32b';
+      await assertThrowsForBody(echoedSecret, 'insecurely echoed');
+
+      // 5. Mismatched machine_id
+      final wrongMachine = Map<String, dynamic>.from(validBase)..['machine_id'] = 'wrong-host-id';
+      await assertThrowsForBody(wrongMachine, 'machine_id');
+
+      // 6. Mismatched device_id
+      final wrongDevice = Map<String, dynamic>.from(validBase)..['device_id'] = 'wrong-device-id';
+      await assertThrowsForBody(wrongDevice, 'device_id');
     });
   });
 

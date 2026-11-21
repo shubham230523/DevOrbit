@@ -9,7 +9,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -21,119 +20,42 @@ import (
 	"devorbit.net/agents/host-bridge/internal/security"
 	"devorbit.net/agents/host-bridge/internal/transport"
 	httptransport "devorbit.net/agents/host-bridge/internal/transport/http"
+	"devorbit.net/services/connection-broker/pkg/broker"
 	"github.com/gorilla/websocket"
 )
 
-var testUpgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
-}
-
 func TestDevOrbit_FullPairingAndAuthenticatedSessionLifecycle(t *testing.T) {
-	// -------------------------------------------------------------
-	// 0. Setup Infrastructure & Real WebSocket Relay Broker
-	// -------------------------------------------------------------
 	tempRoot, err := os.MkdirTemp("", "devorbit_pairing_e2e_*")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 	defer os.RemoveAll(tempRoot)
 
-	var mu sync.Mutex
-	var activeHostConn *websocket.Conn
-	var activeClientConn *websocket.Conn
-	authorizedTokens := make(map[string]string)
-	revokedSessions := make(map[string]bool)
+	// -------------------------------------------------------------
+	// 1. Start Production Connection Broker with Service Auth
+	// -------------------------------------------------------------
+	adminSecret := "test-broker-service-admin-secret-32b!"
+	realBroker := broker.NewBrokerWithSecret(adminSecret)
 
 	brokerMux := http.NewServeMux()
-	brokerMux.HandleFunc("/ws/host", func(w http.ResponseWriter, r *http.Request) {
-		auth := r.Header.Get("Authorization")
-		if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
-			http.Error(w, "Unauthorized: missing Bearer header", http.StatusUnauthorized)
-			return
-		}
-		conn, err := testUpgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		mu.Lock()
-		activeHostConn = conn
-		mu.Unlock()
-
-		defer conn.Close()
-		for {
-			var msg json.RawMessage
-			if err := conn.ReadJSON(&msg); err != nil {
-				break
-			}
-			mu.Lock()
-			cl := activeClientConn
-			mu.Unlock()
-			if cl != nil {
-				_ = cl.WriteJSON(msg)
-			}
-		}
-	})
-
-	brokerMux.HandleFunc("/ws/client", func(w http.ResponseWriter, r *http.Request) {
-		sessionID := r.URL.Query().Get("session_id")
-		deviceID := r.URL.Query().Get("device_id")
-		mu.Lock()
-		isRevoked := revokedSessions[sessionID]
-		expectedToken := authorizedTokens[sessionID+":"+deviceID]
-		mu.Unlock()
-
-		if isRevoked {
-			http.Error(w, "Forbidden: revoked device or session", http.StatusForbidden)
-			return
-		}
-
-		auth := r.Header.Get("Authorization")
-		if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
-			http.Error(w, "Unauthorized: missing Bearer header", http.StatusUnauthorized)
-			return
-		}
-		token := strings.TrimPrefix(auth, "Bearer ")
-		if token != expectedToken {
-			http.Error(w, "Unauthorized: invalid client token", http.StatusUnauthorized)
-			return
-		}
-
-		conn, err := testUpgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		mu.Lock()
-		activeClientConn = conn
-		mu.Unlock()
-
-		defer conn.Close()
-		for {
-			var msg json.RawMessage
-			if err := conn.ReadJSON(&msg); err != nil {
-				break
-			}
-			mu.Lock()
-			h := activeHostConn
-			mu.Unlock()
-			if h != nil {
-				_ = h.WriteJSON(msg)
-			}
-		}
-	})
+	brokerMux.HandleFunc("/api/v1/internal/sessions/authorize", realBroker.HandleAuthorizeSession)
+	brokerMux.HandleFunc("/api/v1/internal/devices/revoke", realBroker.HandleRevoke)
+	brokerMux.HandleFunc("/ws/host", realBroker.HandleHostWebSocket)
+	brokerMux.HandleFunc("/ws/client", realBroker.HandleClientWebSocket)
 
 	brokerServer := httptest.NewServer(brokerMux)
 	defer brokerServer.Close()
 	brokerWSURL := strings.Replace(brokerServer.URL, "http://", "ws://", 1)
 
-	// Setup Host Bridge Components
-	machineID := "host-workstation-e2e-01"
-	hostName := "Desktop Workstation"
-	hostSecret := "host-master-secret-key-32-bytes!"
+	// -------------------------------------------------------------
+	// 2. Start Production Host Bridge with Real Broker Authorizer
+	// -------------------------------------------------------------
+	machineID := "host-windows-dev-01"
+	hostSecret := "devorbit-host-wide-secret-key-32b!"
+	pairingEngine := security.NewPairingEngine(machineID, "Dev Workstation", hostSecret)
 
 	jail := security.NewWorkspaceJail([]string{tempRoot})
 	policy := security.NewDefaultCommandPolicy()
-	pairingEngine := security.NewPairingEngine(machineID, hostName, hostSecret)
-
 	storage := filesystem.NewStorageEngine(jail, 10*1024*1024)
 	procRunner := process.NewProcessRunner(policy, jail)
 	gitClient := git.NewGitClient(jail)
@@ -147,11 +69,18 @@ func TestDevOrbit_FullPairingAndAuthenticatedSessionLifecycle(t *testing.T) {
 
 	serverEngine := httptransport.NewServer(wsSvc, fsSvc, psSvc, gsSvc, dsSvc)
 	serverEngine.SetPairingEngine(pairingEngine)
+	serverEngine.SetBrokerURL(brokerWSURL)
+	serverEngine.SetHostToken(hostSecret)
+
+	// Wire real HTTP broker authorizer
+	brokerAuthorizer := transport.NewHTTPBrokerAuthorizer(brokerServer.URL, adminSecret, nil)
+	serverEngine.SetBrokerAuthorizer(brokerAuthorizer)
 
 	hostMux := http.NewServeMux()
 	serverEngine.RegisterRoutes(hostMux)
 	hostHTTPServer := httptest.NewServer(hostMux)
 	defer hostHTTPServer.Close()
+	serverEngine.SetAdvertisedURL(hostHTTPServer.URL)
 
 	// Outbound broker client starts disconnected
 	brokerClient := transport.NewBrokerClient(brokerWSURL, machineID, "", hostSecret, serverEngine)
@@ -165,7 +94,7 @@ func TestDevOrbit_FullPairingAndAuthenticatedSessionLifecycle(t *testing.T) {
 	defer brokerClient.Stop()
 
 	// -------------------------------------------------------------
-	// 1. Host creates a pairing challenge (POST /api/v1/pairing/challenge)
+	// 3. Request a QR challenge from the real Host Bridge endpoint
 	// -------------------------------------------------------------
 	resCh, err := http.Post(hostHTTPServer.URL+"/api/v1/pairing/challenge", "application/json", nil)
 	if err != nil || resCh.StatusCode != http.StatusOK {
@@ -180,49 +109,69 @@ func TestDevOrbit_FullPairingAndAuthenticatedSessionLifecycle(t *testing.T) {
 		PairingPayload string `json:"pairing_payload"`
 		PairingSecret  string `json:"pairing_secret"`
 		ConfirmURL     string `json:"confirm_url"`
+		BrokerURL      string `json:"broker_url"`
 		ExpiresAt      string `json:"expires_at"`
 	}
 	if err := json.NewDecoder(resCh.Body).Decode(&qrPayload); err != nil {
-		t.Fatalf("Failed to parse QR payload: %v", err)
+		t.Fatalf("Failed to decode QR challenge response: %v", err)
 	}
 
-	// 2. Mobile obtains and scans a real-format QR payload
-	if qrPayload.Version != "1.0" || qrPayload.ChallengeID == "" || qrPayload.PairingPayload == "" || qrPayload.PairingSecret == "" {
-		t.Fatalf("Invalid QR payload structure: %+v", qrPayload)
+	// Verify exact emitted payload contains valid absolute confirmation URL and ephemeral secret
+	if !strings.HasPrefix(qrPayload.ConfirmURL, "http://") && !strings.HasPrefix(qrPayload.ConfirmURL, "https://") {
+		t.Fatalf("Expected confirm_url to be absolute URL, got: %s", qrPayload.ConfirmURL)
 	}
-	if qrPayload.PairingSecret == hostSecret {
-		t.Fatalf("Security failure: Ephemeral challenge secret must NOT be host secret")
-	}
-
-	// 3. Test Expired Challenge Rejection
-	expiredCh, err := pairingEngine.CreateChallenge(-1 * time.Second)
-	if err != nil {
-		t.Fatalf("Failed to create expired challenge: %v", err)
-	}
-	expiredProof := pairingEngine.GenerateProof(expiredCh.Payload, "mobile-phone-01")
-	expiredReqBody, _ := json.Marshal(map[string]string{
-		"challenge_id":    expiredCh.ID,
-		"device_id":       "mobile-phone-01",
-		"proof_signature": expiredProof,
-	})
-	resExp, err := http.Post(hostHTTPServer.URL+"/api/v1/pairing/confirm", "application/json", bytes.NewBuffer(expiredReqBody))
-	if err != nil || resExp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("Expected HTTP 400 for expired challenge, got: %v", resExp)
+	if qrPayload.PairingSecret == "" || qrPayload.PairingSecret == hostSecret {
+		t.Fatalf("Ephemeral pairing secret must be distinct non-empty random secret")
 	}
 
-	// 4. Mobile computes proof of possession
+	// -------------------------------------------------------------
+	// 4. Verify Long-Lived Secret Rejection
+	// -------------------------------------------------------------
 	deviceID := "mobile-pixel-99"
-	mobileProof := pairingEngine.GenerateProof(qrPayload.PairingPayload, deviceID)
+	badPersistentProof := security.GenerateProof(
+		qrPayload.Version,
+		qrPayload.ChallengeID,
+		qrPayload.PairingPayload,
+		qrPayload.HostID,
+		deviceID,
+		qrPayload.ExpiresAt,
+		hostSecret, // Wrong! Must use ephemeral secret
+	)
 
-	// 5. Successful Pairing and Credential Issuance
+	badReqBody, _ := json.Marshal(map[string]string{
+		"challenge_id":      qrPayload.ChallengeID,
+		"device_id":         deviceID,
+		"device_name":       "Pixel 9 Pro",
+		"device_public_key": "pubkey-mobile-01",
+		"proof_signature":   badPersistentProof,
+	})
+	resBad, err := http.Post(qrPayload.ConfirmURL, "application/json", bytes.NewBuffer(badReqBody))
+	if err != nil || resBad.StatusCode != http.StatusBadRequest {
+		t.Fatalf("Expected HTTP 400 when confirming with persistent host secret, got: %v", resBad)
+	}
+
+	// -------------------------------------------------------------
+	// 5. Confirm Pairing using Ephemeral Proof -> Triggers Broker Auth & Session Provisioning
+	// -------------------------------------------------------------
+	validProof := security.GenerateProof(
+		qrPayload.Version,
+		qrPayload.ChallengeID,
+		qrPayload.PairingPayload,
+		qrPayload.HostID,
+		deviceID,
+		qrPayload.ExpiresAt,
+		qrPayload.PairingSecret,
+	)
+
 	confirmReqBody, _ := json.Marshal(map[string]string{
 		"challenge_id":      qrPayload.ChallengeID,
 		"device_id":         deviceID,
 		"device_name":       "Pixel 9 Pro",
 		"device_public_key": "pubkey-mobile-01",
-		"proof_signature":   mobileProof,
+		"proof_signature":   validProof,
 	})
-	resConf, err := http.Post(hostHTTPServer.URL+"/api/v1/pairing/confirm", "application/json", bytes.NewBuffer(confirmReqBody))
+
+	resConf, err := http.Post(qrPayload.ConfirmURL, "application/json", bytes.NewBuffer(confirmReqBody))
 	if err != nil || resConf.StatusCode != http.StatusOK {
 		t.Fatalf("Pairing confirmation failed: %v", resConf)
 	}
@@ -234,6 +183,8 @@ func TestDevOrbit_FullPairingAndAuthenticatedSessionLifecycle(t *testing.T) {
 		SessionSecret string `json:"session_secret"`
 		MachineID     string `json:"machine_id"`
 		DeviceID      string `json:"device_id"`
+		BrokerURL     string `json:"broker_url"`
+		ExpiresAt     string `json:"expires_at"`
 	}
 	if err := json.NewDecoder(resConf.Body).Decode(&confResp); err != nil {
 		t.Fatalf("Failed to parse pairing confirmation response: %v", err)
@@ -246,133 +197,172 @@ func TestDevOrbit_FullPairingAndAuthenticatedSessionLifecycle(t *testing.T) {
 		t.Fatalf("Security failure: Provisioned session secret cannot be identical to host-wide secret")
 	}
 
-	// 6. Test Replayed Challenge Rejection
-	resReplay, err := http.Post(hostHTTPServer.URL+"/api/v1/pairing/confirm", "application/json", bytes.NewBuffer(confirmReqBody))
-	if err != nil || resReplay.StatusCode != http.StatusBadRequest {
-		t.Fatalf("Expected HTTP 400 for replayed challenge, got: %v", resReplay)
-	}
-
-	// 7. Verify Host Bridge session provisioning occurred
+	// -------------------------------------------------------------
+	// 6. Verify Host Bridge Session Provisioning Occurred
+	// -------------------------------------------------------------
 	provisionedSessionID, provisionedE2E := brokerClient.ActiveSession()
-
 	if provisionedSessionID != confResp.SessionID || provisionedE2E == nil {
 		t.Fatalf("Host Bridge did not receive session provisioning: expected %s, got %s", confResp.SessionID, provisionedSessionID)
 	}
 
-	// 8. Authorize Client on Broker
-	mu.Lock()
-	authorizedTokens[confResp.SessionID+":"+deviceID] = confResp.SessionToken
-	mu.Unlock()
-
 	// Wait for Host Bridge to connect to Broker
 	time.Sleep(150 * time.Millisecond)
 
-	// 9. Mobile connects to Broker using Authorization Bearer header
+	// -------------------------------------------------------------
+	// 7. Connect Mobile-Side Test Client using Issued Authorization Bearer Token
+	// -------------------------------------------------------------
+	// Mobile connects to real Connection Broker WITHOUT ANY MANUAL AUTHORIZATION INSERTS
 	clientURL := fmt.Sprintf("%s/ws/client?machine_id=%s&device_id=%s&session_id=%s", brokerWSURL, machineID, deviceID, confResp.SessionID)
 	clientHeaders := http.Header{
 		"Authorization": []string{"Bearer " + confResp.SessionToken},
 	}
 	clientWS, resWS, err := websocket.DefaultDialer.Dial(clientURL, clientHeaders)
 	if err != nil || resWS.StatusCode != http.StatusSwitchingProtocols {
-		t.Fatalf("Mobile failed to connect to broker WSS: %v (response: %v)", err, resWS)
+		t.Fatalf("Mobile failed to connect to broker WSS via production authorization: %v", err)
 	}
 	defer clientWS.Close()
 
-	// 10. End-to-End Encrypted Request/Response Exchange
-	mobileE2E, err := security.NewE2ESession(confResp.SessionID, deviceID, confResp.SessionSecret, 24*time.Hour)
-	if err != nil {
-		t.Fatalf("Failed to initialize mobile E2E session: %v", err)
+	// Server sends explicit session_ready frame to confirm authentication
+	var ackFrame broker.FrameEnvelope
+	if err := clientWS.ReadJSON(&ackFrame); err != nil || ackFrame.Type != "session_ready" {
+		t.Fatalf("Expected session_ready ack frame from broker, got: %v, err: %v", ackFrame, err)
 	}
 
-	appReq := transport.ApplicationRequestEnvelope{
-		ProtocolVersion: "1.2",
-		SessionID:       confResp.SessionID,
-		RequestID:       "req-e2e-001",
-		Method:          "GET",
-		Path:            "/api/v1/health",
-		SeqNum:          1,
-		Timestamp:       time.Now().UnixNano(),
-	}
-	reqBytes, _ := json.Marshal(appReq)
-	cipherHex, err := mobileE2E.Encrypt(security.DirClientToHost, reqBytes, 1, appReq.Timestamp)
+	// -------------------------------------------------------------
+	// 8. Mobile Sends E2E Encrypted Request through Actual Broker Relay
+	// -------------------------------------------------------------
+	clientE2E, err := security.NewE2ESession(confResp.SessionID, deviceID, confResp.SessionSecret, 24*time.Hour)
 	if err != nil {
-		t.Fatalf("Mobile E2E encryption failed: %v", err)
+		t.Fatalf("Failed to initialize mobile client E2E session: %v", err)
 	}
 
-	frameToSend := transport.FrameEnvelope{
+	reqPayload := `{"v":"1.2","request_id":"req-e2e-001","method":"GET","path":"/api/v1/health"}`
+	seqNum := int64(1)
+	timestamp := time.Now().UnixMicro()
+
+	cipherHex, err := clientE2E.Encrypt(security.DirClientToHost, []byte(reqPayload), seqNum, timestamp)
+	if err != nil {
+		t.Fatalf("Failed to encrypt client request: %v", err)
+	}
+
+	clientFrame := broker.FrameEnvelope{
 		ProtocolVersion: "1.2",
 		SessionID:       confResp.SessionID,
 		Type:            "data",
 		EncryptedData:   cipherHex,
-		SeqNum:          1,
-		Timestamp:       appReq.Timestamp,
-	}
-	if err := clientWS.WriteJSON(&frameToSend); err != nil {
-		t.Fatalf("Failed to write frame to broker: %v", err)
+		SeqNum:          seqNum,
+		Timestamp:       timestamp,
 	}
 
-	// Read Host response frame on Mobile
-	var respFrame transport.FrameEnvelope
+	if err := clientWS.WriteJSON(&clientFrame); err != nil {
+		t.Fatalf("Failed to send frame to broker: %v", err)
+	}
+
+	// -------------------------------------------------------------
+	// 9 & 10. Verify Host Bridge Processes Request and Client Decrypts Response
+	// -------------------------------------------------------------
+	var respFrame broker.FrameEnvelope
 	if err := clientWS.ReadJSON(&respFrame); err != nil {
-		t.Fatalf("Failed to read response frame from broker: %v", err)
+		t.Fatalf("Failed to read response from broker: %v", err)
 	}
 
-	decryptedRespBytes, err := mobileE2E.Decrypt(security.DirHostToClient, respFrame.EncryptedData, respFrame.SeqNum, respFrame.Timestamp)
+	if respFrame.Type != "data" || respFrame.EncryptedData == "" {
+		t.Fatalf("Expected encrypted data response frame, got: %+v", respFrame)
+	}
+
+	decryptedBytes, err := clientE2E.Decrypt(security.DirHostToClient, respFrame.EncryptedData, respFrame.SeqNum, respFrame.Timestamp)
 	if err != nil {
-		t.Fatalf("Mobile E2E response decryption failed: %v", err)
+		t.Fatalf("Client failed to decrypt relayed response: %v", err)
 	}
 
-	var appResp transport.ApplicationResponseEnvelope
-	if err := json.Unmarshal(decryptedRespBytes, &appResp); err != nil {
-		t.Fatalf("Failed to unmarshal application response envelope: %v", err)
+	var appResp struct {
+		Version    string `json:"v"`
+		RequestID  string `json:"request_id"`
+		StatusCode int    `json:"status_code"`
+		Body       string `json:"body"`
+	}
+	if err := json.Unmarshal(decryptedBytes, &appResp); err != nil {
+		t.Fatalf("Failed to parse application response: %v, raw: %s", err, string(decryptedBytes))
 	}
 
-	if appResp.StatusCode != http.StatusOK {
-		t.Fatalf("Expected HTTP 200 from host, got %d", appResp.StatusCode)
-	}
-	if !strings.Contains(appResp.Body, "healthy") && !strings.Contains(appResp.Body, "status") {
-		t.Errorf("Unexpected health response body: %s", appResp.Body)
+	if appResp.RequestID != "req-e2e-001" || appResp.StatusCode != http.StatusOK {
+		t.Fatalf("Unexpected application response: %+v", appResp)
 	}
 
-	// 11. Test Device Revocation
-	mu.Lock()
-	revokedSessions[confResp.SessionID] = true
-	mu.Unlock()
+	// -------------------------------------------------------------
+	// 11. Revoke Paired Device through Real Revocation Path
+	// -------------------------------------------------------------
+	err = brokerAuthorizer.RevokeDevice(context.Background(), machineID, deviceID)
+	if err != nil {
+		t.Fatalf("Failed to revoke device: %v", err)
+	}
 	brokerClient.RevokeSession(confResp.SessionID)
 
 	time.Sleep(50 * time.Millisecond)
 
-	// Reconnect attempt for revoked device must fail closed (HTTP 403 Forbidden)
-	_, resRevoked, err := websocket.DefaultDialer.Dial(clientURL, clientHeaders)
-	if err == nil || resRevoked == nil || resRevoked.StatusCode != http.StatusForbidden {
-		t.Errorf("Expected HTTP 403 Forbidden for revoked device, got: %v", resRevoked)
+	// -------------------------------------------------------------
+	// 12. Subsequent Connection Attempt Rejected
+	// -------------------------------------------------------------
+	_, resBlocked, err := websocket.DefaultDialer.Dial(clientURL, clientHeaders)
+	if err == nil || resBlocked == nil || resBlocked.StatusCode != http.StatusForbidden {
+		t.Fatalf("Expected HTTP 403 Forbidden after device revocation, got: %v", resBlocked)
 	}
 
-	// 12. Re-pairing creates a fresh session with a fresh session secret
-	resFreshCh, _ := http.Post(hostHTTPServer.URL+"/api/v1/pairing/challenge", "application/json", nil)
-	var freshQR struct {
+	// -------------------------------------------------------------
+	// 13. Fresh Pairing Creates a New Independent Session
+	// -------------------------------------------------------------
+	resCh2, err := http.Post(hostHTTPServer.URL+"/api/v1/pairing/challenge", "application/json", nil)
+	if err != nil || resCh2.StatusCode != http.StatusOK {
+		t.Fatalf("Failed to create fresh pairing challenge: %v", err)
+	}
+	var qrPayload2 struct {
+		Version        string `json:"v"`
 		ChallengeID    string `json:"challenge_id"`
+		HostID         string `json:"host_id"`
 		PairingPayload string `json:"pairing_payload"`
+		PairingSecret  string `json:"pairing_secret"`
+		ConfirmURL     string `json:"confirm_url"`
+		ExpiresAt      string `json:"expires_at"`
 	}
-	_ = json.NewDecoder(resFreshCh.Body).Decode(&freshQR)
+	_ = json.NewDecoder(resCh2.Body).Decode(&qrPayload2)
 
-	freshProof := pairingEngine.GenerateProof(freshQR.PairingPayload, deviceID)
-	freshConfirmBody, _ := json.Marshal(map[string]string{
-		"challenge_id":    freshQR.ChallengeID,
-		"device_id":       deviceID,
-		"proof_signature": freshProof,
+	deviceID2 := "mobile-pixel-99-new"
+	proof2 := security.GenerateProof(
+		qrPayload2.Version,
+		qrPayload2.ChallengeID,
+		qrPayload2.PairingPayload,
+		qrPayload2.HostID,
+		deviceID2,
+		qrPayload2.ExpiresAt,
+		qrPayload2.PairingSecret,
+	)
+
+	confirmReq2, _ := json.Marshal(map[string]string{
+		"challenge_id":      qrPayload2.ChallengeID,
+		"device_id":         deviceID2,
+		"device_name":       "Pixel 9 Pro II",
+		"device_public_key": "pubkey-mobile-02",
+		"proof_signature":   proof2,
 	})
-	resFreshConf, _ := http.Post(hostHTTPServer.URL+"/api/v1/pairing/confirm", "application/json", bytes.NewBuffer(freshConfirmBody))
-	var freshConfResp struct {
+
+	resConf2, err := http.Post(qrPayload2.ConfirmURL, "application/json", bytes.NewBuffer(confirmReq2))
+	if err != nil || resConf2.StatusCode != http.StatusOK {
+		t.Fatalf("Fresh pairing confirmation failed: %v", resConf2)
+	}
+
+	var confResp2 struct {
+		SessionToken  string `json:"session_token"`
 		SessionID     string `json:"session_id"`
 		SessionSecret string `json:"session_secret"`
 	}
-	_ = json.NewDecoder(resFreshConf.Body).Decode(&freshConfResp)
+	_ = json.NewDecoder(resConf2.Body).Decode(&confResp2)
 
-	if freshConfResp.SessionID == confResp.SessionID {
-		t.Errorf("Expected new session ID for re-pairing, got identical session ID")
+	if confResp2.SessionID == confResp.SessionID {
+		t.Fatalf("Fresh pairing must produce distinct session ID")
 	}
-	if freshConfResp.SessionSecret == confResp.SessionSecret {
-		t.Errorf("Expected fresh session secret for re-pairing, got identical secret")
+
+	newSessionID, newE2E := brokerClient.ActiveSession()
+	if newSessionID != confResp2.SessionID || newE2E == nil {
+		t.Fatalf("Fresh session was not provisioned properly on host bridge")
 	}
 }

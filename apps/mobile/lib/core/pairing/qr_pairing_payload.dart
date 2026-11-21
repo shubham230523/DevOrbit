@@ -10,6 +10,7 @@ class QrPairingPayload {
   final String confirmUrl;
   final String? brokerUrl;
   final DateTime expiresAt;
+  final String rawExpiresAt;
 
   QrPairingPayload({
     required this.version,
@@ -21,6 +22,7 @@ class QrPairingPayload {
     required this.confirmUrl,
     this.brokerUrl,
     required this.expiresAt,
+    required this.rawExpiresAt,
   });
 
   bool get isExpired => DateTime.now().isAfter(expiresAt);
@@ -56,6 +58,22 @@ class QrPairingPayload {
       throw const FormatException('QR pairing payload missing expires_at');
     }
 
+    // Validate absolute URI format, scheme, authority, and path
+    final uri = Uri.tryParse(confirmUrl);
+    if (uri == null || !uri.hasScheme || !uri.hasAuthority || uri.host.isEmpty) {
+      throw FormatException('confirm_url must be a valid absolute URI (http or https): $confirmUrl');
+    }
+    final scheme = uri.scheme.toLowerCase();
+    if (scheme != 'http' && scheme != 'https') {
+      throw FormatException('Unsupported URI scheme in confirm_url: $scheme. Must be http or https.');
+    }
+    if (uri.hasPort && (uri.port <= 0 || uri.port > 65535)) {
+      throw FormatException('Invalid port in confirm_url: ${uri.port}');
+    }
+    if (!uri.path.endsWith('/api/v1/pairing/confirm')) {
+      throw FormatException('confirm_url path must end with /api/v1/pairing/confirm, got: ${uri.path}');
+    }
+
     final expiresAt = DateTime.parse(expiresAtStr);
 
     return QrPairingPayload(
@@ -68,6 +86,7 @@ class QrPairingPayload {
       confirmUrl: confirmUrl,
       brokerUrl: brokerUrl,
       expiresAt: expiresAt,
+      rawExpiresAt: expiresAtStr,
     );
   }
 

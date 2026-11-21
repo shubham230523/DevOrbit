@@ -92,6 +92,15 @@ func TestBroker_HeaderAuthenticationAndQueryTokenRejection(t *testing.T) {
 	}
 	defer clientConn.Close()
 
+	// Server sends explicit session_ready frame to client upon connection
+	var ackFrame FrameEnvelope
+	if err := clientConn.ReadJSON(&ackFrame); err != nil {
+		t.Fatalf("Failed to read session_ready ack frame: %v", err)
+	}
+	if ackFrame.Type != "session_ready" {
+		t.Fatalf("Expected session_ready ack frame, got: %s", ackFrame.Type)
+	}
+
 	// 6. Test Bidirectional Opaque Payload Frame Relaying
 	time.Sleep(30 * time.Millisecond)
 	opaquePayload := "sec_payload_e2e_verified_opaque_data"
@@ -306,5 +315,102 @@ func TestBroker_ExpiredSessionRejection(t *testing.T) {
 	_, res, err := websocket.DefaultDialer.Dial(cleanClientURL, clientHeader)
 	if err == nil || res == nil || res.StatusCode != http.StatusUnauthorized {
 		t.Errorf("Expected HTTP 401 Unauthorized for expired session attempt, got: %v", res)
+	}
+}
+
+func TestBroker_ServiceToServiceAuthorizationAndRevocation(t *testing.T) {
+	adminSecret := "test-broker-service-secret-32b!"
+	b := NewBrokerWithSecret(adminSecret)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/internal/sessions/authorize", b.HandleAuthorizeSession)
+	mux.HandleFunc("/api/v1/internal/devices/revoke", b.HandleRevoke)
+	mux.HandleFunc("/ws/host", b.HandleHostWebSocket)
+	mux.HandleFunc("/ws/client", b.HandleClientWebSocket)
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	authURL := server.URL + "/api/v1/internal/sessions/authorize"
+	revokeURL := server.URL + "/api/v1/internal/devices/revoke"
+
+	machineID := "mach-srv-01"
+	deviceID := "dev-srv-01"
+	sessionID := "sess-srv-01"
+	clientToken := "client-srv-token-32b"
+	hostToken := "host-srv-token-32b"
+
+	reqBody := fmt.Sprintf(`{
+		"machine_id": "%s",
+		"device_id": "%s",
+		"session_id": "%s",
+		"client_token": "%s",
+		"host_token": "%s",
+		"ttl_seconds": 3600
+	}`, machineID, deviceID, sessionID, clientToken, hostToken)
+
+	// 1. Missing service auth -> 401
+	res, err := http.Post(authURL, "application/json", strings.NewReader(reqBody))
+	if err != nil || res.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("Expected HTTP 401 for missing service auth, got: %v", res)
+	}
+
+	// 2. Wrong service auth -> 401
+	req, _ := http.NewRequest(http.MethodPost, authURL, strings.NewReader(reqBody))
+	req.Header.Set("Authorization", "Bearer wrong-secret")
+	req.Header.Set("Content-Type", "application/json")
+	res, err = http.DefaultClient.Do(req)
+	if err != nil || res.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("Expected HTTP 401 for wrong service auth, got: %v", res)
+	}
+
+	// 3. Valid service auth -> 200 OK
+	req, _ = http.NewRequest(http.MethodPost, authURL, strings.NewReader(reqBody))
+	req.Header.Set("Authorization", "Bearer "+adminSecret)
+	req.Header.Set("Content-Type", "application/json")
+	res, err = http.DefaultClient.Do(req)
+	if err != nil || res.StatusCode != http.StatusOK {
+		t.Fatalf("Expected HTTP 200 for valid service auth, got: %v", res)
+	}
+
+	// 4. Verify host and client can connect with registered credentials
+	wsURL := strings.Replace(server.URL, "http://", "ws://", 1)
+
+	hostDialURL := fmt.Sprintf("%s/ws/host?machine_id=%s&session_id=%s", wsURL, machineID, sessionID)
+	hostHeader := http.Header{"Authorization": []string{"Bearer " + hostToken}}
+	hostConn, resHost, err := websocket.DefaultDialer.Dial(hostDialURL, hostHeader)
+	if err != nil || resHost.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("Expected host to connect successfully: %v", err)
+	}
+	defer hostConn.Close()
+
+	clientDialURL := fmt.Sprintf("%s/ws/client?machine_id=%s&device_id=%s&session_id=%s", wsURL, machineID, deviceID, sessionID)
+	clientHeader := http.Header{"Authorization": []string{"Bearer " + clientToken}}
+	clientConn, resClient, err := websocket.DefaultDialer.Dial(clientDialURL, clientHeader)
+	if err != nil || resClient.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("Expected client to connect successfully: %v", err)
+	}
+	defer clientConn.Close()
+
+	// Client receives session_ready frame
+	var ack FrameEnvelope
+	if err := clientConn.ReadJSON(&ack); err != nil || ack.Type != "session_ready" {
+		t.Fatalf("Expected session_ready ack frame, got: %v, err: %v", ack, err)
+	}
+
+	// 5. Revoke device via service-to-service API
+	revokeBody := fmt.Sprintf(`{"machine_id":"%s","device_id":"%s"}`, machineID, deviceID)
+	reqRevoke, _ := http.NewRequest(http.MethodPost, revokeURL, strings.NewReader(revokeBody))
+	reqRevoke.Header.Set("Authorization", "Bearer "+adminSecret)
+	reqRevoke.Header.Set("Content-Type", "application/json")
+	resRev, err := http.DefaultClient.Do(reqRevoke)
+	if err != nil || resRev.StatusCode != http.StatusOK {
+		t.Fatalf("Expected HTTP 200 for device revocation, got: %v", resRev)
+	}
+
+	// 6. Subsequent client connection attempt MUST be rejected (403 Forbidden)
+	_, resBlocked, err := websocket.DefaultDialer.Dial(clientDialURL, clientHeader)
+	if err == nil || resBlocked == nil || resBlocked.StatusCode != http.StatusForbidden {
+		t.Fatalf("Expected HTTP 403 Forbidden after device revocation, got: %v", resBlocked)
 	}
 }

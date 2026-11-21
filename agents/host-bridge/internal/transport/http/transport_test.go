@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"devorbit.net/agents/host-bridge/internal/application"
@@ -70,9 +71,15 @@ func TestTransport_HTTPAPIEndpointsAndPairing(t *testing.T) {
 	}
 
 	var ch struct {
+		Version        string `json:"v"`
 		ChallengeID    string `json:"challenge_id"`
+		HostID         string `json:"host_id"`
+		HostName       string `json:"host_name"`
 		PairingPayload string `json:"pairing_payload"`
 		PairingSecret  string `json:"pairing_secret"`
+		ConfirmURL     string `json:"confirm_url"`
+		BrokerURL      string `json:"broker_url"`
+		ExpiresAt      string `json:"expires_at"`
 	}
 	_ = json.NewDecoder(resCh.Body).Decode(&ch)
 
@@ -80,8 +87,16 @@ func TestTransport_HTTPAPIEndpointsAndPairing(t *testing.T) {
 		t.Errorf("Invalid challenge response payload: %+v", ch)
 	}
 
+	// Verify confirm_url is absolute URL
+	if !strings.HasPrefix(ch.ConfirmURL, "http://") && !strings.HasPrefix(ch.ConfirmURL, "https://") {
+		t.Errorf("Expected confirm_url to be absolute URL, got: %s", ch.ConfirmURL)
+	}
+
 	// 3. Test Confirm Pairing Endpoint
-	proofSig := pairingEngine.GenerateProof(ch.PairingPayload, "phone-test-01")
+	proofSig, err := pairingEngine.GenerateProofForChallenge(ch.ChallengeID, "phone-test-01")
+	if err != nil {
+		t.Fatalf("Failed to generate proof: %v", err)
+	}
 	confirmReq := map[string]string{
 		"challenge_id":      ch.ChallengeID,
 		"device_id":         "phone-test-01",

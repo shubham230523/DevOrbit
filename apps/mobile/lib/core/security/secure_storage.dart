@@ -99,6 +99,10 @@ class SecureStorageService {
   SecureStorageService({SecureStorageDriver? driver})
       : _driver = driver ?? PlatformSecureStorageDriver();
 
+  /// Transaction commit hash providing atomic multi-key partial write detection.
+  /// Note: Cryptographic confidentiality and tamper resistance are provided by
+  /// the underlying hardware-backed platform storage (Android Keystore / iOS Keychain).
+  /// This hash specifically detects partial/interrupted multi-key transactions.
   static String _calculateCommitSignature({
     required String machineId,
     required String deviceId,
@@ -249,6 +253,24 @@ class SecureStorageService {
     } catch (e) {
       throw SecureStorageException('Failed to clear secure session credentials', e);
     }
+  }
+
+  /// Computes HMAC-SHA256 proof of possession binding challenge, host identity,
+  /// device identity, protocol version, and expiry with the ephemeral challenge secret.
+  String generateBoundDeviceProof({
+    required String version,
+    required String challengeId,
+    required String payload,
+    required String hostId,
+    required String deviceId,
+    required String expiresAtStr,
+    required String secretKey,
+  }) {
+    final authData = '$version:$challengeId:$payload:$hostId:$deviceId:$expiresAtStr';
+    final key = utf8.encode(secretKey);
+    final bytes = utf8.encode(authData);
+    final hmacSha256 = Hmac(sha256, key);
+    return hmacSha256.convert(bytes).toString();
   }
 
   String generateDeviceProof(String challengePayload, String deviceId, String secretKey) {

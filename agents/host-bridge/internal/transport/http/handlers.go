@@ -1,6 +1,7 @@
 package http
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -8,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"devorbit.net/agents/host-bridge/internal/application"
 	"devorbit.net/agents/host-bridge/internal/domain"
@@ -24,8 +26,33 @@ type Server struct {
 	rateLimiter        *security.RateLimiter
 	idempotency        *security.IdempotencyManager
 	sessionProvisioner func(sessionID, deviceID, sessionSecret string) error
+	brokerAuthorizer   BrokerAuthorizer
+	advertisedURL      string
+	brokerURL          string
+	hostToken          string
 	muxOnce            sync.Once
-	cachedMux     *http.ServeMux
+	cachedMux          *http.ServeMux
+}
+
+type BrokerAuthorizer interface {
+	AuthorizeSession(ctx context.Context, machineID, deviceID, sessionID, clientToken, hostToken string, ttl time.Duration) error
+	RevokeDevice(ctx context.Context, machineID, deviceID string) error
+}
+
+func (s *Server) SetBrokerAuthorizer(authorizer BrokerAuthorizer) {
+	s.brokerAuthorizer = authorizer
+}
+
+func (s *Server) SetAdvertisedURL(url string) {
+	s.advertisedURL = url
+}
+
+func (s *Server) SetBrokerURL(url string) {
+	s.brokerURL = url
+}
+
+func (s *Server) SetHostToken(token string) {
+	s.hostToken = token
 }
 
 func NewServer(
