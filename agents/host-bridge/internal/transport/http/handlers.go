@@ -9,6 +9,7 @@ import (
 
 	"devorbit.net/agents/host-bridge/internal/application"
 	"devorbit.net/agents/host-bridge/internal/domain"
+	"devorbit.net/agents/host-bridge/internal/security"
 )
 
 type Server struct {
@@ -17,6 +18,7 @@ type Server struct {
 	processSvc    *application.ProcessService
 	gitSvc        *application.GitService
 	deviceSvc     *application.DeviceService
+	pairingEngine *security.PairingEngine
 }
 
 func NewServer(
@@ -40,7 +42,7 @@ func (s *Server) HandleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":                   "ok",
 		"os":                       runtime.GOOS,
-		"host_bridge_version":      "1.1.0",
+		"host_bridge_version":      "1.2.0",
 		"allowed_workspaces_count": len(wsList),
 	})
 }
@@ -231,7 +233,6 @@ func (s *Server) HandleProcessById(w http.ResponseWriter, r *http.Request) {
 func (s *Server) HandleListADBDevices(w http.ResponseWriter, r *http.Request) {
 	devices, err := s.deviceSvc.ListADBDevices(r.Context())
 	if err != nil {
-		// Return empty list if ADB is unavailable or fails cleanly
 		writeJSON(w, http.StatusOK, []domain.ADBDevice{})
 		return
 	}

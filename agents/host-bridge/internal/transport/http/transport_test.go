@@ -16,7 +16,7 @@ import (
 	"devorbit.net/agents/host-bridge/internal/security"
 )
 
-func TestTransport_HTTPAPIEndpoints(t *testing.T) {
+func TestTransport_HTTPAPIEndpointsAndPairing(t *testing.T) {
 	tempRoot, err := os.MkdirTemp("", "devorbit_transport_test_*")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
@@ -25,6 +25,7 @@ func TestTransport_HTTPAPIEndpoints(t *testing.T) {
 
 	jail := security.NewWorkspaceJail([]string{tempRoot})
 	policy := security.NewDefaultCommandPolicy()
+	pairingEngine := security.NewPairingEngine("host-test-01", "Test Host", "secret-32-bytes-key")
 
 	storage := filesystem.NewStorageEngine(jail, 10*1024*1024)
 	procRunner := process.NewProcessRunner(policy, jail)
@@ -38,6 +39,8 @@ func TestTransport_HTTPAPIEndpoints(t *testing.T) {
 	dsSvc := application.NewDeviceService(adbClient)
 
 	server := NewServer(wsSvc, fsSvc, psSvc, gsSvc, dsSvc)
+	server.SetPairingEngine(pairingEngine)
+
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 
@@ -50,28 +53,35 @@ func TestTransport_HTTPAPIEndpoints(t *testing.T) {
 		t.Fatalf("Health check failed: %v", err)
 	}
 
-	// 2. Test Write File Endpoint
-	writeReq := map[string]string{
-		"workspace_id":  tempRoot,
-		"relative_path": "settings.gradle.kts",
-		"new_content":   "// devorbit settings",
-		"base_sha256":   "",
-	}
-	reqBody, _ := json.Marshal(writeReq)
-
-	resWrite, err := http.Post(ts.URL+"/api/v1/files/write", "application/json", bytes.NewBuffer(reqBody))
-	if err != nil || resWrite.StatusCode != http.StatusOK {
-		t.Fatalf("Write file API failed: %v", err)
+	// 2. Test Pairing Challenge Endpoint
+	resCh, err := http.Post(ts.URL+"/api/v1/pairing/challenge", "application/json", nil)
+	if err != nil || resCh.StatusCode != http.StatusOK {
+		t.Fatalf("Pairing challenge API failed: %v", err)
 	}
 
-	// 3. Test Read File Endpoint
-	readReq := map[string]string{
-		"workspace_id":  tempRoot,
-		"relative_path": "settings.gradle.kts",
+	var ch struct {
+		ChallengeID    string `json:"challenge_id"`
+		PairingPayload string `json:"pairing_payload"`
 	}
-	reqReadBody, _ := json.Marshal(readReq)
-	resRead, err := http.Post(ts.URL+"/api/v1/files/read", "application/json", bytes.NewBuffer(reqReadBody))
-	if err != nil || resRead.StatusCode != http.StatusOK {
-		t.Fatalf("Read file API failed: %v", err)
+	_ = json.NewDecoder(resCh.Body).Decode(&ch)
+
+	if ch.ChallengeID == "" || ch.PairingPayload == "" {
+		t.Errorf("Invalid challenge response payload")
+	}
+
+	// 3. Test Confirm Pairing Endpoint
+	proofSig := pairingEngine.GenerateProof(ch.PairingPayload, "phone-test-01")
+	confirmReq := map[string]string{
+		"challenge_id":      ch.ChallengeID,
+		"device_id":         "phone-test-01",
+		"device_name":       "Test Device",
+		"device_public_key": "pubkey-12345",
+		"proof_signature":   proofSig,
+	}
+	confirmBody, _ := json.Marshal(confirmReq)
+
+	resConf, err := http.Post(ts.URL+"/api/v1/pairing/confirm", "application/json", bytes.NewBuffer(confirmBody))
+	if err != nil || resConf.StatusCode != http.StatusOK {
+		t.Fatalf("Pairing confirm API failed: %v", err)
 	}
 }

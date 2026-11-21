@@ -1,8 +1,8 @@
 openapi: 3.0.3
 info:
-  title: DevOrbit Control Plane & Host Bridge API
-  version: 1.1.0
-  description: Official OpenAPI contract governing DevOrbit mobile client, control plane, host bridge, and broker RPC endpoints.
+  title: DevOrbit Control Plane, Host Bridge & Connection Broker API
+  version: 1.2.0
+  description: Official OpenAPI contract governing DevOrbit mobile client, control plane, host bridge, and connection broker RPC/REST endpoints.
 
 paths:
   /api/v1/health:
@@ -11,7 +11,7 @@ paths:
       operationId: healthCheck
       responses:
         '200':
-          description: Host bridge operational status
+          description: Operational status
           content:
             application/json:
               schema:
@@ -19,7 +19,7 @@ paths:
 
   /api/v1/auth/pair:
     post:
-      summary: Register and pair a mobile device with a host machine
+      summary: Legacy direct machine pairing endpoint
       operationId: pairMachine
       requestBody:
         required: true
@@ -34,8 +34,86 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PairingResponse'
-        '401':
-          description: Invalid pairing token or unauthorized host key
+
+  /api/v1/pairing/challenge:
+    post:
+      summary: Generate single-use QR code pairing challenge on Host Bridge
+      operationId: createPairingChallenge
+      responses:
+        '200':
+          description: Single-use pairing challenge generated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PairingChallengeResponse'
+
+  /api/v1/pairing/confirm:
+    post:
+      summary: Confirm QR pairing with device identity proof
+      operationId: confirmPairing
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PairingConfirmRequest'
+      responses:
+        '200':
+          description: Pairing confirmed & session token issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PairingResponse'
+        '400':
+          description: Expired challenge, invalid signature, or replayed challenge
+
+  /api/v1/auth/register-device:
+    post:
+      summary: Register paired device identity on Control Plane
+      operationId: registerDevice
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterDeviceRequest'
+      responses:
+        '200':
+          description: Device registered successfully
+
+  /api/v1/auth/revoke-device:
+    post:
+      summary: Revoke trusted device identity
+      operationId: revokeDevice
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RevokeDeviceRequest'
+      responses:
+        '200':
+          description: Device revoked successfully
+
+  /api/v1/sessions/authorize:
+    post:
+      summary: Authorize a mobile session for LAN or Connection Broker connection
+      operationId: authorizeSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionAuthorizeRequest'
+      responses:
+        '200':
+          description: Session authorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionAuthorizeResponse'
+        '403':
+          description: Device revoked or unauthorized permissions
 
   /api/v1/workspaces:
     get:
@@ -265,6 +343,50 @@ components:
         pairing_code:
           type: string
 
+    PairingChallengeResponse:
+      type: object
+      required:
+        - challenge_id
+        - host_id
+        - host_public_key
+        - host_name
+        - pairing_payload
+        - expires_at
+      properties:
+        challenge_id:
+          type: string
+        host_id:
+          type: string
+        host_public_key:
+          type: string
+        host_name:
+          type: string
+        pairing_payload:
+          type: string
+        expires_at:
+          type: string
+          format: date-time
+
+    PairingConfirmRequest:
+      type: object
+      required:
+        - challenge_id
+        - device_id
+        - device_name
+        - device_public_key
+        - proof_signature
+      properties:
+        challenge_id:
+          type: string
+        device_id:
+          type: string
+        device_name:
+          type: string
+        device_public_key:
+          type: string
+        proof_signature:
+          type: string
+
     PairingResponse:
       type: object
       required:
@@ -276,6 +398,66 @@ components:
         expires_at:
           type: string
           format: date-time
+
+    RegisterDeviceRequest:
+      type: object
+      required:
+        - machine_id
+        - device_id
+        - device_name
+        - device_public_key
+      properties:
+        machine_id:
+          type: string
+        device_id:
+          type: string
+        device_name:
+          type: string
+        device_public_key:
+          type: string
+
+    RevokeDeviceRequest:
+      type: object
+      required:
+        - machine_id
+        - device_id
+      properties:
+        machine_id:
+          type: string
+        device_id:
+          type: string
+
+    SessionAuthorizeRequest:
+      type: object
+      required:
+        - machine_id
+        - device_id
+        - connection_mode
+      properties:
+        machine_id:
+          type: string
+        device_id:
+          type: string
+        connection_mode:
+          type: string # "lan" or "internet"
+
+    SessionAuthorizeResponse:
+      type: object
+      required:
+        - session_id
+        - session_token
+        - expires_at
+        - e2e_session_key
+      properties:
+        session_id:
+          type: string
+        session_token:
+          type: string
+        expires_at:
+          type: string
+          format: date-time
+        e2e_session_key:
+          type: string
 
     Workspace:
       type: object
@@ -297,8 +479,6 @@ components:
           type: boolean
         has_git:
           type: boolean
-        gradle_version:
-          type: string
 
     DiscoverWorkspacesRequest:
       type: object
@@ -494,7 +674,7 @@ components:
         command:
           type: string
         status:
-          type: string # "running", "completed", "failed", "cancelled"
+          type: string
         exit_code:
           type: integer
         stdout:
@@ -511,7 +691,7 @@ components:
         serial:
           type: string
         state:
-          type: string # "device", "unauthorized", "offline"
+          type: string
         model:
           type: string
         product:

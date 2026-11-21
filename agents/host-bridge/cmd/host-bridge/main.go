@@ -26,6 +26,7 @@ func main() {
 	// 1. Security Layer
 	jail := security.NewWorkspaceJail(cfg.AllowedRoots)
 	policy := security.NewDefaultCommandPolicy()
+	pairingEngine := security.NewPairingEngine("host-windows-01", "Desktop Workstation", "master-host-secret-key-32-bytes")
 
 	// 2. Infrastructure Layer
 	storage := filesystem.NewStorageEngine(jail, cfg.MaxFileSizeMB*1024*1024)
@@ -42,6 +43,8 @@ func main() {
 
 	// 4. Transport Layer
 	serverEngine := transport.NewServer(wsSvc, fsSvc, psSvc, gsSvc, dsSvc)
+	serverEngine.SetPairingEngine(pairingEngine)
+
 	mux := http.NewServeMux()
 	serverEngine.RegisterRoutes(mux)
 
@@ -52,7 +55,7 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("DevOrbit Host Bridge v1.1.0 listening on %s (Allowed Roots: %d)", addr, len(cfg.AllowedRoots))
+		log.Printf("DevOrbit Host Bridge v1.2.0 listening on %s (Allowed Roots: %d)", addr, len(cfg.AllowedRoots))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Host Bridge server failed: %v", err)
 		}
