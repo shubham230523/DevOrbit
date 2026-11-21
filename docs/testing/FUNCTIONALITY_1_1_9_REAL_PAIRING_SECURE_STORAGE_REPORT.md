@@ -215,6 +215,23 @@ In `agents/host-bridge/cmd/host-bridge/main.go` and `agents/host-bridge/internal
 
 ---
 
-### 9. Verdict
+### 9. Commit & Build Record
+
+| Artifact | Value |
+| :--- | :--- |
+| Baseline commit | `27a5e9987dfc7a5bfe83c5ed6726021e22c2d160` |
+| Feature branch commit | `a7c7d53d5fd0c1d292310946ff71ff39674b9a97` |
+| Feature branch URL | https://github.com/shubham230523/DevOrbit/tree/feature/functionality-1-1-9-real-pairing-secure-storage |
+| Merge commit (main) | `ec183d9b192f51f1dcdca3e9ac52438cf09244ed` |
+| Main branch URL | https://github.com/shubham230523/DevOrbit/commit/ec183d9b192f51f1dcdca3e9ac52438cf09244ed |
+| Android debug APK | `flutter build apk --debug --target-platform android-arm64` → **SUCCEEDED** (`app-debug.apk`, ~77 MB) |
+| iOS build | **Not performed** — Windows environment, no Xcode available (documented limitation; platform configuration is complete) |
+| `mobile_scanner` KGP warning | Deprecation warning from `mobile_scanner 5.2.3` legacy KGP API — **not a build failure**, no functional impact |
+| Go tests | 39 PASS (all modules) |
+| Flutter tests | 26 PASS, 0 failures, `flutter analyze` 0 issues |
+
+---
+
+### 10. Verdict
 
 **ACCEPTED — REAL PAIRING AND SECURE STORAGE VERIFIED**
