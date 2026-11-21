@@ -41,6 +41,16 @@ func TestTransport_HTTPAPIEndpointsAndPairing(t *testing.T) {
 	server := NewServer(wsSvc, fsSvc, psSvc, gsSvc, dsSvc)
 	server.SetPairingEngine(pairingEngine)
 
+	provisionedSession := ""
+	provisionedDevice := ""
+	provisionedSecret := ""
+	server.SetSessionProvisioner(func(sessionID, deviceID, sessionSecret string) error {
+		provisionedSession = sessionID
+		provisionedDevice = deviceID
+		provisionedSecret = sessionSecret
+		return nil
+	})
+
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 
@@ -62,11 +72,12 @@ func TestTransport_HTTPAPIEndpointsAndPairing(t *testing.T) {
 	var ch struct {
 		ChallengeID    string `json:"challenge_id"`
 		PairingPayload string `json:"pairing_payload"`
+		PairingSecret  string `json:"pairing_secret"`
 	}
 	_ = json.NewDecoder(resCh.Body).Decode(&ch)
 
-	if ch.ChallengeID == "" || ch.PairingPayload == "" {
-		t.Errorf("Invalid challenge response payload")
+	if ch.ChallengeID == "" || ch.PairingPayload == "" || ch.PairingSecret == "" {
+		t.Errorf("Invalid challenge response payload: %+v", ch)
 	}
 
 	// 3. Test Confirm Pairing Endpoint
@@ -83,5 +94,31 @@ func TestTransport_HTTPAPIEndpointsAndPairing(t *testing.T) {
 	resConf, err := http.Post(ts.URL+"/api/v1/pairing/confirm", "application/json", bytes.NewBuffer(confirmBody))
 	if err != nil || resConf.StatusCode != http.StatusOK {
 		t.Fatalf("Pairing confirm API failed: %v", err)
+	}
+
+	var confResp struct {
+		Status        string `json:"status"`
+		SessionToken  string `json:"session_token"`
+		SessionID     string `json:"session_id"`
+		SessionSecret string `json:"session_secret"`
+		MachineID     string `json:"machine_id"`
+		DeviceID      string `json:"device_id"`
+	}
+	_ = json.NewDecoder(resConf.Body).Decode(&confResp)
+
+	if confResp.Status != "success" || confResp.SessionToken == "" || confResp.SessionID == "" || confResp.SessionSecret == "" {
+		t.Fatalf("Incomplete pairing confirm response: %+v", confResp)
+	}
+
+	// 4. Verify Session Provisioning was triggered on Server
+	if provisionedSession != confResp.SessionID || provisionedDevice != "phone-test-01" || provisionedSecret != confResp.SessionSecret {
+		t.Fatalf("Session provisioner mismatch! Expected (%s, phone-test-01, %s), got (%s, %s, %s)",
+			confResp.SessionID, confResp.SessionSecret, provisionedSession, provisionedDevice, provisionedSecret)
+	}
+
+	// 5. Test Replaying Consumed Challenge Fails
+	resReplay, err := http.Post(ts.URL+"/api/v1/pairing/confirm", "application/json", bytes.NewBuffer(confirmBody))
+	if err != nil || resReplay.StatusCode != http.StatusBadRequest {
+		t.Fatalf("Expected replayed challenge to be rejected with 400 Bad Request, got: %v", resReplay)
 	}
 }

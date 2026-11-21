@@ -65,26 +65,31 @@ func main() {
 	// 5. Outbound Connection Broker Client
 	// Established sessions must come from authenticated pairing lifecycle or explicit session provisioning.
 	// Host Bridge starts disconnected when no valid device session is provisioned.
+	brokerClient := transport.NewBrokerClient(cfg.BrokerURL, cfg.HostID, "", cfg.HostSecret, serverEngine)
+
+	// Connect authenticated QR pairing directly to Host Bridge session provisioning
+	serverEngine.SetSessionProvisioner(func(sessionID, deviceID, sessionSecret string) error {
+		return brokerClient.ProvisionSession(sessionID, deviceID, sessionSecret, 24*time.Hour)
+	})
+
+	// Optional initial session provisioning for automated deployments
 	sessionID := os.Getenv("DEVORBIT_SESSION_ID")
 	deviceID := os.Getenv("DEVORBIT_DEVICE_ID")
 	sessionSecret := os.Getenv("DEVORBIT_SESSION_SECRET")
-
-	brokerClient := transport.NewBrokerClient(cfg.BrokerURL, cfg.HostID, sessionID, cfg.HostSecret, serverEngine)
 
 	if sessionID != "" && deviceID != "" && sessionSecret != "" {
 		if sessionSecret == cfg.HostSecret {
 			log.Fatalf("Host Bridge security error: per-device session secret cannot be identical to host-wide secret")
 		}
-		e2eSess, err := security.NewE2ESession(sessionID, deviceID, sessionSecret, 24*time.Hour)
-		if err != nil {
+		if err := brokerClient.ProvisionSession(sessionID, deviceID, sessionSecret, 24*time.Hour); err != nil {
 			log.Fatalf("Host Bridge E2E session initialization failed: %v", err)
 		}
-		brokerClient.SetE2ESession(e2eSess)
-		brokerClient.Start(context.Background())
-		defer brokerClient.Stop()
 	} else {
-		log.Printf("Host Bridge: No active device session provisioned at startup. Outbound broker client remaining disconnected until session established.")
+		log.Printf("Host Bridge: No active device session provisioned at startup. Outbound broker client remaining disconnected until session established via pairing.")
 	}
+
+	brokerClient.Start(context.Background())
+	defer brokerClient.Stop()
 
 	go func() {
 		log.Printf("DevOrbit Host Bridge v1.2.1 listening on %s (HostID: %s, Allowed Roots: %d)", addr, cfg.HostID, len(cfg.AllowedRoots))

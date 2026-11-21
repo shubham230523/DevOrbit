@@ -20,10 +20,11 @@ type Server struct {
 	processSvc    *application.ProcessService
 	gitSvc        *application.GitService
 	deviceSvc     *application.DeviceService
-	pairingEngine *security.PairingEngine
-	rateLimiter   *security.RateLimiter
-	idempotency   *security.IdempotencyManager
-	muxOnce       sync.Once
+	pairingEngine      *security.PairingEngine
+	rateLimiter        *security.RateLimiter
+	idempotency        *security.IdempotencyManager
+	sessionProvisioner func(sessionID, deviceID, sessionSecret string) error
+	muxOnce            sync.Once
 	cachedMux     *http.ServeMux
 }
 

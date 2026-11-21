@@ -121,20 +121,6 @@ func extractToken(r *http.Request) (string, error) {
 		}
 	}
 
-	// 3. Check Sec-WebSocket-Protocol Header: devorbit-token.<token>
-	if subprotocol := r.Header.Get("Sec-WebSocket-Protocol"); subprotocol != "" {
-		protocols := strings.Split(subprotocol, ",")
-		for _, p := range protocols {
-			p = strings.TrimSpace(p)
-			if strings.HasPrefix(p, "devorbit-token.") {
-				token := strings.TrimPrefix(p, "devorbit-token.")
-				if token != "" {
-					return token, nil
-				}
-			}
-		}
-	}
-
 	return "", ErrMissingCredentials
 }
 
@@ -313,25 +299,13 @@ func (b *Broker) HandleHostWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 5. Complete WebSocket upgrade only after credentials validated
-	var respHeader http.Header
-	if subproto := r.Header.Get("Sec-WebSocket-Protocol"); subproto != "" {
-		respHeader = make(http.Header)
-		for _, p := range strings.Split(subproto, ",") {
-			p = strings.TrimSpace(p)
-			if strings.HasPrefix(p, "devorbit-token.") {
-				respHeader.Set("Sec-WebSocket-Protocol", p)
-				break
-			}
-		}
-	}
-
 	upgrader := websocket.Upgrader{
 		ReadBufferSize:  1024 * 1024,
 		WriteBufferSize: 1024 * 1024,
 		CheckOrigin:     b.checkOrigin,
 	}
 
-	conn, err := upgrader.Upgrade(w, r, respHeader)
+	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("Failed to upgrade host WebSocket: %v", err)
 		return
@@ -409,25 +383,13 @@ func (b *Broker) HandleClientWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 5. Complete WebSocket upgrade only after credentials validated
-	var respHeader http.Header
-	if subproto := r.Header.Get("Sec-WebSocket-Protocol"); subproto != "" {
-		respHeader = make(http.Header)
-		for _, p := range strings.Split(subproto, ",") {
-			p = strings.TrimSpace(p)
-			if strings.HasPrefix(p, "devorbit-token.") {
-				respHeader.Set("Sec-WebSocket-Protocol", p)
-				break
-			}
-		}
-	}
-
 	upgrader := websocket.Upgrader{
 		ReadBufferSize:  1024 * 1024,
 		WriteBufferSize: 1024 * 1024,
 		CheckOrigin:     b.checkOrigin,
 	}
 
-	conn, err := upgrader.Upgrade(w, r, respHeader)
+	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("Failed to upgrade client WebSocket: %v", err)
 		return
