@@ -1,140 +1,85 @@
 # DevOrbit — Local Development Setup & Run Guide
 
-This guide provides exact, copy-paste-ready instructions to spin up all DevOrbit services locally and connect an Android emulator or physical device.
+This guide provides exact instructions to run DevOrbit locally.
 
 ---
 
-## 1. System Components & Deployment Boundary Matrix
+## Quick Diagnosis: Docker Desktop Error
 
-DevOrbit separates cloud control services from local workstation host daemons:
+If you see:
+`open //./pipe/dockerDesktopLinuxEngine: The system cannot find the file specified`
 
-| Component | Port | Execution Model | Description |
-|---|---|---|---|
-| **PostgreSQL 16** | `5432` | Docker | Database for users, machines, and audit logs. |
-| **Control Plane** | `8080` | Docker | Device registration & pairing token issuer. |
-| **Connection Broker** | `8081` | Docker | Opaque WebSocket relay server for remote internet tunnel mode. |
-| **Host Bridge Daemon** | `8082` | **Native Windows Host** | **MUST run natively on Windows host** to access the actual filesystem, Git CLI, Gradle Wrapper, and ADB devices. |
-| **Flutter Mobile App** | N/A | Android / iOS / Emulator | Flutter client user interface. |
+This means **Docker Desktop is not running** on your Windows host. You have two options:
+1. **Option 1 (Recommended & Easiest)**: Run all services **natively on Windows using Go** (no Docker required!).
+2. **Option 2**: Start Docker Desktop from the Windows Start Menu and wait for the engine to initialize before running `docker compose`.
 
 ---
 
-## 2. Environment Variables & Configuration Baseline
+## Option 1: Pure Native Go Launch (No Docker Required!)
 
-### A. Infrastructure (Docker Compose)
-- `POSTGRES_USER`: `devorbit`
-- `POSTGRES_PASSWORD`: `devorbit_password`
-- `POSTGRES_DB`: `devorbit_db`
-- `DATABASE_URL`: `postgres://devorbit:devorbit_password@postgres:5432/devorbit_db?sslmode=disable`
-- `JWT_SECRET`: `devorbit_development_jwt_secret_key`
+You can run all three Go services natively in separate PowerShell windows.
 
-### B. Host Bridge Daemon (Windows Native Environment)
-- `DEVORBIT_PORT`: `8082` (default)
-- `DEVORBIT_MAX_FILE_SIZE_MB`: `10` (default)
-
----
-
-## 3. Step-by-Step Local Launch Sequence
-
-### STEP 1: Launch Infrastructure Services (Docker)
-In PowerShell, navigate to the project root and launch PostgreSQL, Control Plane, and Connection Broker:
-
+### Terminal 1: Launch Host Bridge Daemon (Port 8082)
 ```powershell
-docker compose -f infrastructure/docker/docker-compose.yml up -d
+cd C:\Users\shubham\Documents\PersonalProjects\DevOrbit\agents\host-bridge
+go run ./cmd/host-bridge
 ```
+*Listening on `:8082`*
 
-Verify container health:
+### Terminal 2: Launch Control Plane Service (Port 8080)
 ```powershell
-docker compose -f infrastructure/docker/docker-compose.yml ps
+cd C:\Users\shubham\Documents\PersonalProjects\DevOrbit\services\control-plane
+go run ./cmd/control-plane
 ```
+*Listening on `:8080`*
+
+### Terminal 3: Launch Connection Broker Service (Port 8081)
+```powershell
+cd C:\Users\shubham\Documents\PersonalProjects\DevOrbit\services\connection-broker
+go run ./cmd/connection-broker
+```
+*Listening on `:8081`*
 
 ---
 
-### STEP 2: Build & Launch Native Windows Host Bridge Daemon
-The Host Bridge daemon **must run natively** on your Windows workstation so it has direct access to your local projects, Git, Gradle, and ADB:
+## Option 2: Launching with Docker Desktop
 
-```powershell
-# Navigate to Host Bridge directory
-cd agents/host-bridge
-
-# Build native Windows executable
-go build -o bin/host-bridge.exe ./cmd/host-bridge
-
-# Run Host Bridge Daemon
-.\bin\host-bridge.exe
-```
-
-*Terminal Output:*
-```
-2026/11/21 12:45:00 DevOrbit Host Bridge v1.2.1 listening on :8082 (Allowed Roots: 1)
-```
+If you prefer using Docker:
+1. Open **Docker Desktop** from your Windows Start Menu.
+2. Wait until the status in the bottom-left corner of Docker Desktop turns **green ("Engine running")**.
+3. Run:
+   ```powershell
+   docker compose -f infrastructure/docker/docker-compose.yml up -d
+   ```
 
 ---
 
-### STEP 3: Verify Service Health
-Open a new PowerShell window and run health checks:
+## Launching Mobile App on Android Emulator
 
+1. Launch Android Emulator (Pixel 8):
+   ```powershell
+   flutter emulators --launch Pixel_8
+   ```
+
+2. Run Flutter App:
+   ```powershell
+   cd C:\Users\shubham\Documents\PersonalProjects\DevOrbit\apps/mobile
+   flutter run -d Pixel_8
+   ```
+
+3. **Networking Endpoint**:
+   - In Android Emulator, enter **`10.0.2.2:8082`** as the Host Bridge address.
+   - For a physical Android phone on the same Wi-Fi, enter your PC's local LAN IP (e.g. **`192.168.x.x:8082`**).
+
+---
+
+## Health Check Commands
+
+In PowerShell:
 ```powershell
 # Host Bridge Health Check
 Invoke-RestMethod -Uri "http://localhost:8082/api/v1/health"
 
 # Control Plane Health Check
 Invoke-RestMethod -Uri "http://localhost:8080/api/v1/auth/pair" -Method Post
-```
-
----
-
-### STEP 4: Launch Android Emulator & Connect App
-
-#### Option A: Android Emulator (AVD)
-1. Start the Pixel 8 emulator:
-   ```powershell
-   flutter emulators --launch Pixel_8
-   ```
-
-2. Run the Flutter mobile app targeting the emulator:
-   ```powershell
-   cd apps/mobile
-   flutter run -d Pixel_8
-   ```
-
-3. **Networking Endpoint in Emulator**:
-   - In Android Emulator, `127.0.0.1` refers to the emulator itself.
-   - Use **`10.0.2.2:8082`** as the Host Bridge LAN address inside the emulator settings.
-
-#### Option B: Physical Android Device (Over Local Wi-Fi)
-1. Ensure your physical Android phone and Windows host are connected to the same Wi-Fi network.
-2. Find your Windows host IP address:
-   ```powershell
-   (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias "Wi-Fi*").IPAddress
-   ```
-   *(Example output: `192.168.1.100`)*
-
-3. Enable USB Debugging on your phone, connect via USB, and launch:
-   ```powershell
-   cd apps/mobile
-   flutter run -d <your-device-id>
-   ```
-
-4. **Networking Endpoint**: Enter **`192.168.1.100:8082`** in the DevOrbit Machine Settings screen.
-
----
-
-### STEP 5: QR Device Pairing & Host Approval Procedure
-
-1. In the mobile app, navigate to **Host Machines** -> tap **Pair New Host Machine (Scan QR)**.
-2. The mobile app requests a single-use pairing challenge from `http://<host-ip>:8082/api/v1/pairing/challenge`.
-3. The mobile app generates an HMAC-SHA256 proof-of-possession signature and submits it to `/api/v1/pairing/confirm`.
-4. Upon successful verification, the Host Bridge issues a session token, and the machine card displays **Active / Connected**.
-
----
-
-## 4. Shutdown & Cleanup Commands
-
-To stop services safely:
-
-```powershell
-# Stop Docker containers
-docker compose -f infrastructure/docker/docker-compose.yml down
-
-# Stop Host Bridge in PowerShell: press Ctrl + C
 ```
