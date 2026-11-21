@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/http/httptest"
+	"net/http"
 	"strings"
 	"time"
 
@@ -135,7 +135,6 @@ func (bc *BrokerClient) Start(ctx context.Context) {
 						continue
 					}
 
-					// Route request directly using Server's thread-safe Mux
 					method := appReq.Method
 					if method == "" {
 						method = "GET"
@@ -145,12 +144,17 @@ func (bc *BrokerClient) Start(ctx context.Context) {
 						path = "/api/v1/health"
 					}
 
-					req := httptest.NewRequest(method, path, strings.NewReader(appReq.Body))
+					req, err := http.NewRequest(method, path, strings.NewReader(appReq.Body))
+					if err != nil {
+						log.Printf("HostBridge BrokerClient: Invalid request (%s %s): %v", method, path, err)
+						continue
+					}
+
 					for k, v := range appReq.Headers {
 						req.Header.Set(k, v)
 					}
 
-					rec := httptest.NewRecorder()
+					rec := NewResponseWriterBuffer()
 					bc.Server.Mux().ServeHTTP(rec, req)
 
 					appResp := ApplicationResponseEnvelope{
