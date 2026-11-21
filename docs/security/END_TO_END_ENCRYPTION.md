@@ -1,16 +1,32 @@
-# DevOrbit — End-to-End Encryption (E2E) Specification
+# DevOrbit — End-to-End Encryption (E2E) & Key Lifecycle Specification
 
-## 1. Cryptographic Baseline
+## 1. Cryptographic Key Derivation (HKDF SHA-256)
 
-DevOrbit implements End-to-End Encryption (E2E) for all workspace data, source code files, diffs, Logcat output, and shell commands transmitted over untrusted networks and relays.
+Session master secrets derived during pairing are expanded into direction-specific 256-bit subkeys using HKDF (HMAC-SHA256):
 
-- **Algorithm**: AES-256-GCM (Galois/Counter Mode) with 96-bit random nonces.
-- **Key Derivation**: SHA-256 HKDF from mutually verified session secrets exchanged during paired authentication.
-- **Nonce Generation**: `crypto/rand` cryptographically secure pseudorandom numbers per frame.
+```
+                       Master Session Secret
+                                 |
+                               HKDF
+                                 |
+           +---------------------+---------------------+
+           |                                           |
+    Client-to-Host Key                          Host-to-Client Key
+ (AES-256-GCM Encryption)                   (AES-256-GCM Encryption)
+```
 
-## 2. Connection Broker Inaccessibility
+- **Salt**: `devorbit-e2e-salt-<session_id>`
+- **Info (Client -> Host)**: `devorbit-client-to-host-<session_id>-<device_id>`
+- **Info (Host -> Client)**: `devorbit-host-to-client-<session_id>-<device_id>`
 
-The Connection Broker acts solely as a Layer 4 framing relay.
-- The broker receives `encrypted_payload` hex string.
-- The broker DOES NOT possess the session's AES-256-GCM symmetric key.
-- Attempting to inspect or modify `encrypted_payload` at the broker results in AES-GCM authentication tag mismatch upon decryption at the Host Bridge, rejecting the tampered payload.
+## 2. Authenticated Associated Data (AAD) Binding
+
+To prevent packet substitution or metadata tampering by intermediary relays (Connection Broker), every AES-256-GCM encryption binds an AAD context byte array:
+
+$$\text{AAD} = \text{SessionID} \parallel ":" \parallel \text{DeviceID} \parallel ":" \parallel \text{BigEndian}(\text{SeqNum}) \parallel \text{BigEndian}(\text{Timestamp})$$
+
+If the Connection Broker or an attacker alters the `session_id`, `device_id`, or sequence number in transit, the AES-256-GCM tag verification fails at the receiving host, rejecting the tampered frame.
+
+## 3. Key Rotation & Zeroization
+
+When a session expires or a device is revoked, keys are destroyed in memory (`b[i] = 0`) to prevent post-session memory inspection vulnerabilities.

@@ -1,6 +1,6 @@
-# DevOrbit — Secure Connectivity Architecture Specification
+# DevOrbit — Secure Connectivity Architecture Specification (v1.2.1)
 
-## 1. Dual-Mode Connectivity Model
+## 1. Dual-Mode Connectivity Architecture
 
 DevOrbit supports two secure communication modes between mobile clients (Android & iOS) and workstation development hosts (Windows & Linux):
 
@@ -14,7 +14,7 @@ DevOrbit supports two secure communication modes between mobile clients (Android
                Direct mTLS        TLS WSS Relay
                    |                   |
                    |           Connection Broker
-                   |           (Opaque Frame Router)
+                   |      (Opaque AES-GCM Frame Router)
                    |                   |
                    +---------+---------+
                              |
@@ -23,19 +23,9 @@ DevOrbit supports two secure communication modes between mobile clients (Android
                  Workspace Security Jail
 ```
 
-### Mode A — Direct LAN Mode (mTLS)
-- **Transport**: Direct TCP/HTTPS with Mutual TLS (mTLS) over local Wi-Fi.
-- **Identity Verification**: Mobile client verifies Host Certificate fingerprint pinned during initial QR pairing. Host Bridge verifies client device certificate.
-- **Latency**: Very low (< 5ms local latency).
+## 2. Cryptographic Baseline & Key Lifecycle
 
-### Mode B — Internet Relay Mode (Connection Broker)
-- **Transport**: Outbound WebSocket connections (`wss://`) established from Host Bridge and Mobile Client to Connection Broker.
-- **Host Exposure**: ZERO open inbound public ports required on the workstation host.
-- **Opaque Relay**: Connection Broker routes binary frames using session IDs. Payload is End-to-End Encrypted (AES-256-GCM / Noise protocol); broker cannot inspect or decrypt workspace content or shell payloads.
-
-## 2. Pairing & Identity Lifecycle
-
-- **Device States**: `UNREGISTERED` -> `PENDING_PAIRING` -> `ACTIVE` -> `REVOKED` / `EXPIRED`.
-- **Single-Use Challenge**: QR code pairing challenge expires after 5 minutes and is invalidated immediately upon consumption.
-- **Proof of Possession**: Mobile client submits HMAC-SHA256 signature proving key ownership.
-- **Immediate Revocation**: Revoking a device on Control Plane or Host Bridge immediately terminates all active LAN and Broker sessions.
+- **HKDF SHA-256 Key Derivation**: Directional subkeys (`client_to_host_key` vs `host_to_client_key`) derived from session secrets using HKDF with unique session ID salt and context info.
+- **Authenticated Associated Data (AAD)**: Every encrypted payload binds `session_id`, `device_id`, `seq_num`, and `timestamp` as AAD to prevent cross-session / cross-device / reordering payload substitution.
+- **Replay Protection**: Monotonically verified sequence numbers and per-session replay cache reject duplicate or reordered frame ciphertexts.
+- **Single-Use QR Pairing**: Short-lived pairing challenges (5 minutes) invalidated immediately upon first consumption with host-side rate limiting (max 5 failed attempts per client).

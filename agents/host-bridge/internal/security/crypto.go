@@ -5,22 +5,128 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
+	"sync"
+	"time"
+
+	"golang.org/x/crypto/hkdf"
 )
 
-type E2ECipher struct {
-	key []byte
+var (
+	ErrReplayedFrame     = errors.New("security error: replayed or out-of-sequence frame rejected")
+	ErrTamperedPayload   = errors.New("decryption failed: invalid key, AAD mismatch, or tampered ciphertext")
+	ErrExpiredSessionKey = errors.New("session key expired or destroyed")
+)
+
+type Direction string
+
+const (
+	DirClientToHost Direction = "client_to_host"
+	DirHostToClient Direction = "host_to_client"
+)
+
+type E2ESession struct {
+	SessionID       string
+	DeviceID        string
+	ClientToHostKey []byte
+	HostToClientKey []byte
+	CreatedAt       time.Time
+	ExpiresAt       time.Time
+	mu              sync.Mutex
+	lastSeqNum      int64
+	seenSeqNums     map[int64]bool
 }
 
-func NewE2ECipher(secret string) *E2ECipher {
-	hash := sha256.Sum256([]byte(secret))
-	return &E2ECipher{key: hash[:]}
+func DeriveDirectionalKeys(masterSecret string, sessionID, deviceID string) ([]byte, []byte, error) {
+	secretBytes := []byte(masterSecret)
+	salt := []byte(fmt.Sprintf("devorbit-e2e-salt-%s", sessionID))
+	infoClient := []byte(fmt.Sprintf("devorbit-client-to-host-%s-%s", sessionID, deviceID))
+	infoHost := []byte(fmt.Sprintf("devorbit-host-to-client-%s-%s", sessionID, deviceID))
+
+	hkdfClient := hkdf.New(sha256.New, secretBytes, salt, infoClient)
+	clientKey := make([]byte, 32) // AES-256
+	if _, err := io.ReadFull(hkdfClient, clientKey); err != nil {
+		return nil, nil, err
+	}
+
+	hkdfHost := hkdf.New(sha256.New, secretBytes, salt, infoHost)
+	hostKey := make([]byte, 32) // AES-256
+	if _, err := io.ReadFull(hkdfHost, hostKey); err != nil {
+		return nil, nil, err
+	}
+
+	return clientKey, hostKey, nil
 }
 
-func (c *E2ECipher) EncryptPayload(plainText []byte) (string, error) {
-	block, err := aes.NewCipher(c.key)
+func NewE2ESession(sessionID, deviceID, masterSecret string, ttl time.Duration) (*E2ESession, error) {
+	cKey, hKey, err := DeriveDirectionalKeys(masterSecret, sessionID, deviceID)
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now()
+	return &E2ESession{
+		SessionID:       sessionID,
+		DeviceID:        deviceID,
+		ClientToHostKey: cKey,
+		HostToClientKey: hKey,
+		CreatedAt:       now,
+		ExpiresAt:       now.Add(ttl),
+		seenSeqNums:     make(map[int64]bool),
+	}, nil
+}
+
+func (s *E2ESession) IsExpired() bool {
+	return time.Now().After(s.ExpiresAt)
+}
+
+func (s *E2ESession) Destroy() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.ClientToHostKey {
+		s.ClientToHostKey[i] = 0
+	}
+	for i := range s.HostToClientKey {
+		s.HostToClientKey[i] = 0
+	}
+	s.seenSeqNums = make(map[int64]bool)
+}
+
+func (s *E2ESession) ConstructAAD(seqNum int64, timestamp int64) []byte {
+	aad := make([]byte, 0, 64)
+	aad = append(aad, []byte(s.SessionID)...)
+	aad = append(aad, ':')
+	aad = append(aad, []byte(s.DeviceID)...)
+	aad = append(aad, ':')
+
+	seqBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(seqBytes, uint64(seqNum))
+	aad = append(aad, seqBytes...)
+
+	tsBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(tsBytes, uint64(timestamp))
+	aad = append(aad, tsBytes...)
+
+	return aad
+}
+
+func (s *E2ESession) Encrypt(dir Direction, plainText []byte, seqNum int64, timestamp int64) (string, error) {
+	if s.IsExpired() {
+		return "", ErrExpiredSessionKey
+	}
+
+	var key []byte
+	if dir == DirHostToClient {
+		key = s.HostToClientKey
+	} else {
+		key = s.ClientToHostKey
+	}
+
+	block, err := aes.NewCipher(key)
 	if err != nil {
 		return "", err
 	}
@@ -35,17 +141,38 @@ func (c *E2ECipher) EncryptPayload(plainText []byte) (string, error) {
 		return "", err
 	}
 
-	cipherText := aesGCM.Seal(nonce, nonce, plainText, nil)
+	aad := s.ConstructAAD(seqNum, timestamp)
+	cipherText := aesGCM.Seal(nonce, nonce, plainText, aad)
 	return hex.EncodeToString(cipherText), nil
 }
 
-func (c *E2ECipher) DecryptPayload(cipherTextHex string) ([]byte, error) {
+func (s *E2ESession) Decrypt(dir Direction, cipherTextHex string, seqNum int64, timestamp int64) ([]byte, error) {
+	if s.IsExpired() {
+		return nil, ErrExpiredSessionKey
+	}
+
+	s.mu.Lock()
+	if s.seenSeqNums[seqNum] || seqNum <= 0 {
+		s.mu.Unlock()
+		return nil, ErrReplayedFrame
+	}
+	s.seenSeqNums[seqNum] = true
+	s.lastSeqNum = seqNum
+	s.mu.Unlock()
+
 	cipherText, err := hex.DecodeString(cipherTextHex)
 	if err != nil {
 		return nil, err
 	}
 
-	block, err := aes.NewCipher(c.key)
+	var key []byte
+	if dir == DirClientToHost {
+		key = s.ClientToHostKey
+	} else {
+		key = s.HostToClientKey
+	}
+
+	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
 	}
@@ -61,9 +188,11 @@ func (c *E2ECipher) DecryptPayload(cipherTextHex string) ([]byte, error) {
 	}
 
 	nonce, actualCipherText := cipherText[:nonceSize], cipherText[nonceSize:]
-	plainText, err := aesGCM.Open(nil, nonce, actualCipherText, nil)
+	aad := s.ConstructAAD(seqNum, timestamp)
+
+	plainText, err := aesGCM.Open(nil, nonce, actualCipherText, aad)
 	if err != nil {
-		return nil, errors.New("decryption failed: invalid key or tampered ciphertext")
+		return nil, ErrTamperedPayload
 	}
 
 	return plainText, nil

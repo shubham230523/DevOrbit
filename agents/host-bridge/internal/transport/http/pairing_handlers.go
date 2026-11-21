@@ -13,10 +13,22 @@ func (s *Server) SetPairingEngine(engine *security.PairingEngine) {
 	s.pairingEngine = engine
 }
 
+func (s *Server) SetRateLimiter(limiter *security.RateLimiter) {
+	s.rateLimiter = limiter
+}
+
 func (s *Server) HandleCreatePairingChallenge(w http.ResponseWriter, r *http.Request) {
 	if s.pairingEngine == nil {
 		writeError(w, http.StatusInternalServerError, "pairing engine not initialized")
 		return
+	}
+
+	clientIP := r.RemoteAddr
+	if s.rateLimiter != nil {
+		if err := s.rateLimiter.Allow(clientIP); err != nil {
+			writeError(w, http.StatusTooManyRequests, err.Error())
+			return
+		}
 	}
 
 	ch, err := s.pairingEngine.CreateChallenge(5 * time.Minute)
@@ -40,6 +52,14 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	clientIP := r.RemoteAddr
+	if s.rateLimiter != nil {
+		if err := s.rateLimiter.Allow(clientIP); err != nil {
+			writeError(w, http.StatusTooManyRequests, err.Error())
+			return
+		}
+	}
+
 	var req struct {
 		ChallengeID     string `json:"challenge_id"`
 		DeviceID        string `json:"device_id"`
@@ -49,6 +69,9 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if s.rateLimiter != nil {
+			s.rateLimiter.RecordFailure(clientIP)
+		}
 		writeError(w, http.StatusBadRequest, "invalid pairing confirm request JSON")
 		return
 	}
@@ -62,12 +85,19 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if err != nil {
+		if s.rateLimiter != nil {
+			s.rateLimiter.RecordFailure(clientIP)
+		}
 		if errors.Is(err, security.ErrPairingExpired) || errors.Is(err, security.ErrPairingUsed) || errors.Is(err, security.ErrInvalidProof) {
 			writeError(w, http.StatusBadRequest, err.Error())
 		} else {
 			writeError(w, http.StatusInternalServerError, err.Error())
 		}
 		return
+	}
+
+	if s.rateLimiter != nil {
+		s.rateLimiter.RecordSuccess(clientIP)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{

@@ -19,6 +19,8 @@ type Server struct {
 	gitSvc        *application.GitService
 	deviceSvc     *application.DeviceService
 	pairingEngine *security.PairingEngine
+	rateLimiter   *security.RateLimiter
+	idempotency   *security.IdempotencyManager
 }
 
 func NewServer(
@@ -37,12 +39,16 @@ func NewServer(
 	}
 }
 
+func (s *Server) SetIdempotencyManager(mgr *security.IdempotencyManager) {
+	s.idempotency = mgr
+}
+
 func (s *Server) HandleHealth(w http.ResponseWriter, r *http.Request) {
 	wsList, _ := s.workspaceSvc.ListWorkspaces()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":                   "ok",
 		"os":                       runtime.GOOS,
-		"host_bridge_version":      "1.2.0",
+		"host_bridge_version":      "1.2.1",
 		"allowed_workspaces_count": len(wsList),
 	})
 }
@@ -119,13 +125,23 @@ func (s *Server) HandleReadFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) HandleWriteFile(w http.ResponseWriter, r *http.Request) {
-	var req domain.WriteFileRequest
+	var req struct {
+		domain.WriteFileRequest
+		RequestID string `json:"request_id,omitempty"`
+	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid write file JSON")
 		return
 	}
 
-	res, err := s.filesystemSvc.WriteFile(&req)
+	if s.idempotency != nil && req.RequestID != "" {
+		if cached, found := s.idempotency.Get(req.RequestID); found {
+			writeJSON(w, http.StatusOK, cached)
+			return
+		}
+	}
+
+	res, err := s.filesystemSvc.WriteFile(&req.WriteFileRequest)
 	if err != nil {
 		var conflictErr *domain.ConflictError
 		if errors.As(err, &conflictErr) {
@@ -139,6 +155,11 @@ func (s *Server) HandleWriteFile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+
+	if s.idempotency != nil && req.RequestID != "" {
+		s.idempotency.Store(req.RequestID, res)
+	}
+
 	writeJSON(w, http.StatusOK, res)
 }
 
@@ -185,13 +206,23 @@ func (s *Server) HandleGitDiff(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) HandleExecuteProcess(w http.ResponseWriter, r *http.Request) {
-	var spec domain.ProcessSpec
-	if err := json.NewDecoder(r.Body).Decode(&spec); err != nil {
+	var req struct {
+		domain.ProcessSpec
+		RequestID string `json:"request_id,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid process spec JSON")
 		return
 	}
 
-	info, err := s.processSvc.ExecuteProcess(r.Context(), &spec)
+	if s.idempotency != nil && req.RequestID != "" {
+		if cached, found := s.idempotency.Get(req.RequestID); found {
+			writeJSON(w, http.StatusOK, cached)
+			return
+		}
+	}
+
+	info, err := s.processSvc.ExecuteProcess(r.Context(), &req.ProcessSpec)
 	if err != nil {
 		if errors.Is(err, domain.ErrCommandNotAllowed) {
 			writeError(w, http.StatusForbidden, err.Error())
@@ -202,6 +233,11 @@ func (s *Server) HandleExecuteProcess(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+
+	if s.idempotency != nil && req.RequestID != "" {
+		s.idempotency.Store(req.RequestID, info)
+	}
+
 	writeJSON(w, http.StatusOK, info)
 }
 
