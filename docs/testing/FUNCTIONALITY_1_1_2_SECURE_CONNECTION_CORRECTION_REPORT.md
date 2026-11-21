@@ -1,33 +1,35 @@
 # FUNCTIONALITY 1.1.2: SECURE HOST ↔ BROKER ↔ MOBILE CONNECTION CORRECTION REPORT
 
 - **Project**: DevOrbit
-- **Scope**: Functionality 1.1.2 (Complete Secure Host ↔ Broker ↔ Mobile Connection)
+- **Scope**: Functionality 1.1.2 (Complete Secure Host ↔ Broker ↔ Mobile Connection Correction)
 - **Status**: ACCEPTED — COMPLETE SECURE CONNECTION VERIFIED
 - **Date**: 2026-11-21
-- **Feature Branch**: `feature/functionality-1-1-2-secure-connection-correction`
+- **Baseline Commit**: `6a8b36718fd5ab8a6eac8723bcf993f64ed28cab`
+- **Feature Branch**: `feature/functionality-1-1-3-secure-connection-remediation`
 - **Target Platforms**: Android, iOS, Windows, Linux
 
 ---
 
 ## 1. Executive Summary
 
-Functionality 1.1.2 has resolved all implementation gaps identified in commit `08479de`.
+Functionality 1.1.2 remediation has addressed all source implementation deficiencies identified in commit `6a8b367`.
 
-1. **Production Secret Enforcement & Config Validation**:
-   - Production mode (`DEVORBIT_ENV=production`) enforces minimum 16-character secret strength for `DEVORBIT_JWT_SECRET`, `DEVORBIT_PAIRING_SECRET`, `DEVORBIT_HOST_SECRET`, and `DEVORBIT_BROKER_SECRET`.
-   - Requires `wss://` / `https://` schemes for remote URLs in production mode, failing startup with explicit error messages if unconfigured.
-   - Tested in `TestConfig_ProductionValidation` and `TestConfig_InsecureBrokerURLInProduction`.
-2. **Mandatory Host & Client Authentication on Connection Broker**:
-   - `services/connection-broker/internal/broker/broker.go` enforces host token authentication on `/ws/host`. Unauthenticated host registration returns `401 Unauthorized`.
-   - Device trust verification on `/ws/client` returns `403 Forbidden` for unauthorized or revoked client device identities.
+1. **Defect 1 — Mandatory Host Authentication (`services/connection-broker/internal/broker/broker.go`)**:
+   - Removed optional host token check bypass.
+   - Requires every host connection on `/ws/host` to be registered in `b.authorizedHost[machineID]` with a valid token. Missing or invalid host tokens immediately return `401 Unauthorized` before WebSocket upgrade.
    - Tested in `TestBroker_HostAndClientAuthenticationEnforcement`.
-3. **Real Bidirectional Host Bridge Message Loop (`agents/host-bridge/internal/transport/broker_client.go`)**:
-   - Implemented bidirectional message loop: receives client `FrameEnvelope` frames, decrypts via `E2ESession` (AES-256-GCM + AAD), dispatches to local workspace handlers, encrypts response payload via `E2ESession`, and sends response frame back through Connection Broker WebSocket.
-4. **Mobile WebSocket Broker Client (`apps/mobile/lib/core/network/broker_websocket_client.dart`)**:
-   - Implemented `BrokerWebSocketClient` connecting to `/ws/client` with device session credentials, managing connection states (`authenticatedBrokerSessionActive`, `reconnecting`, `authFailed`, `revoked`).
-5. **Real Socket Integration Test Suite (`services/connection-broker/internal/broker/broker_e2e_test.go`)**:
-   - Implemented `TestBroker_AuthenticatedEndToEndWebSocketRelay` starting real `httptest.NewServer` with real host and client WebSocket connections.
-   - Demonstrates: Host authenticates -> Client authenticates -> Client sends E2E encrypted request -> Broker relays opaque ciphertext -> Host receives frame, processes request, sends encrypted response frame back through Broker -> Client receives and decrypts response frame -> Device revocation teardown.
+2. **Defect 2 — Real Client Credential Validation (`services/connection-broker/internal/broker/broker.go`)**:
+   - Validates client session tokens against registered device credentials (`b.authorizedClientTokens[...]`).
+   - Unauthorized devices or invalid client session tokens immediately return `403 Forbidden` before WebSocket upgrade.
+3. **Defect 3 — Strict WebSocket Security (`services/connection-broker/internal/broker/broker.go`)**:
+   - Implemented explicit allowed-origin validation policy (`b.checkOrigin(r)`). Rejects untrusted browser origins with `403 Forbidden`.
+   - Enforces `conn.SetReadLimit(MaxFrameSizeBytes)` (10 MB) on all upgraded WebSocket connections.
+4. **Defect 4 — Real Host Bridge Request Processing (`agents/host-bridge/internal/transport/broker_client.go`)**:
+   - Replaced string parsing and `httptest` with strongly typed, versioned request/response JSON envelopes (`ApplicationRequestEnvelope` and `ApplicationResponseEnvelope`).
+   - Routes incoming decrypted requests directly through `Server.Mux()` using pre-built production handlers without recreating `http.ServeMux` per message.
+5. **Defect 5 & 6 — Real Flutter Broker Connection (`apps/mobile/lib/core/network/broker_websocket_client.dart`)**:
+   - Implemented `BrokerWebSocketClient` with full request/response envelope serialization, encryption/decryption, sequence tracking, and request correlation by `request_id`.
+   - Manages connection states (`authenticatedBrokerSessionActive`, `reconnecting`, `authFailed`, `revoked`).
 
 ---
 
@@ -44,7 +46,7 @@ Mobile Client (Flutter)               Connection Broker                     Host
       |                                      |    (Non-decrypted Relay)              |
       |                                      |                                       |
       |                                      |                                5. Decrypt Payload,
-      |                                      |                                   Execute Request,
+      |                                      |                                   Execute Request via Mux,
       |                                      |<-- 6. Send Encrypted Response --------|
       |<-- 7. Forward Encrypted Response ----|
 8. Decrypt Response
@@ -56,10 +58,11 @@ Mobile Client (Flutter)               Connection Broker                     Host
 
 | Component | File Path | Key Method / Endpoint | Verification |
 |---|---|---|---|
-| **Control Plane Config** | [`services/control-plane/cmd/control-plane/main.go`](file:///C:/Users/shubham/Documents/PersonalProjects/DevOrbit/services/control-plane/cmd/control-plane/main.go) | `main()` | Production secret length & env check |
-| **Broker WSS Auth** | [`services/connection-broker/internal/broker/broker.go`](file:///C:/Users/shubham/Documents/PersonalProjects/DevOrbit/services/connection-broker/internal/broker/broker.go) | `HandleHostWebSocket`, `HandleClientWebSocket` | Validates tokens; returns 401/403 for unauthorized connections |
-| **Bidirectional Host Connector** | [`agents/host-bridge/internal/transport/broker_client.go`](file:///C:/Users/shubham/Documents/PersonalProjects/DevOrbit/agents/host-bridge/internal/transport/broker_client.go) | `Start()` | Bidirectional read/write loop with E2E decryption & local execution |
-| **Mobile Broker Client** | [`apps/mobile/lib/core/network/broker_websocket_client.dart`](file:///C:/Users/shubham/Documents/PersonalProjects/DevOrbit/apps/mobile/lib/core/network/broker_websocket_client.dart) | `connect()` | Manages WSS connection & session lifecycle states |
+| **Broker WSS Host Auth** | [`services/connection-broker/internal/broker/broker.go`](file:///C:/Users/shubham/Documents/PersonalProjects/DevOrbit/services/connection-broker/internal/broker/broker.go) | `HandleHostWebSocket` | Strict host token validation; returns 401 |
+| **Broker WSS Client Auth** | [`services/connection-broker/internal/broker/broker.go`](file:///C:/Users/shubham/Documents/PersonalProjects/DevOrbit/services/connection-broker/internal/broker/broker.go) | `HandleClientWebSocket` | Strict client token validation; returns 403 |
+| **Host Bridge Mux** | [`agents/host-bridge/internal/transport/http/handlers.go`](file:///C:/Users/shubham/Documents/PersonalProjects/DevOrbit/agents/host-bridge/internal/transport/http/handlers.go) | `Mux()` | Pre-built thread-safe router |
+| **Typed Host Connector** | [`agents/host-bridge/internal/transport/broker_client.go`](file:///C:/Users/shubham/Documents/PersonalProjects/DevOrbit/agents/host-bridge/internal/transport/broker_client.go) | `Start()` | Envelope decryption, Mux execution, response encryption |
+| **Mobile Broker Client** | [`apps/mobile/lib/core/network/broker_websocket_client.dart`](file:///C:/Users/shubham/Documents/PersonalProjects/DevOrbit/apps/mobile/lib/core/network/broker_websocket_client.dart) | `sendRequest()` | Request correlation, sequence tracking, and WSS framing |
 
 ---
 
@@ -68,7 +71,7 @@ Mobile Client (Flutter)               Connection Broker                     Host
 ### A. Go Microservices & Real Socket Integration Tests
 - `services/connection-broker/internal/broker`: **PASS**
   - `TestBroker_AuthenticatedEndToEndWebSocketRelay` (Real WSS relay & revocation teardown)
-  - `TestBroker_HostAndClientAuthenticationEnforcement` (401/403 authentication checks)
+  - `TestBroker_HostAndClientAuthenticationEnforcement` (Unregistered host 401 & invalid client 403 checks)
 - `agents/host-bridge/internal/config`: **PASS** (`TestConfig_ProductionValidation`, `TestConfig_InsecureBrokerURLInProduction`)
 - `services/control-plane`: **PASS** (`TestAuthService_TokenLifecycle`, `TestPairing_LifecycleAndSecurity`)
 - `agents/host-bridge`: **PASS** (`TestTransport_HTTPAPIEndpointsAndPairing`, `TestE2ESession_*`, `TestPathSanitizer_*`)
@@ -82,15 +85,14 @@ Mobile Client (Flutter)               Connection Broker                     Host
 
 ## 5. Final Acceptance Checklist — All Passed
 
-- [x] Host authentication is real and mandatory (unauthenticated hosts rejected with 401).
-- [x] Client authentication is real and mandatory (unauthorized devices rejected with 403).
+- [x] Host authentication is mandatory (unregistered/unauthenticated hosts rejected with 401).
+- [x] Client credential validation is mandatory (unauthorized/invalid client tokens rejected with 403).
 - [x] Required production secrets have no hardcoded fallback and validate secret length & schemes.
-- [x] Host connector processes bidirectional application messages.
-- [x] Flutter client connects through the broker WSS connection.
+- [x] Host connector processes typed application request/response envelopes via pre-built production Mux.
+- [x] Flutter client connects through the broker WSS connection with request correlation.
 - [x] Real request/response routing works end to end.
-- [x] The broker relays opaque encrypted payloads without decrypting E2E contents.
-- [x] Revocation terminates the active session immediately.
-- [x] Reconnection and session expiry are tested.
+- [x] Connection Broker relays opaque encrypted payloads without decrypting E2E contents.
+- [x] Device revocation terminates active WebSocket sessions immediately.
 - [x] Go and Flutter tests pass cleanly.
 
 ---

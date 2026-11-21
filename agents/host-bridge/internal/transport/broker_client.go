@@ -2,9 +2,9 @@ package transport
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
 	"net/http/httptest"
 	"strings"
 	"time"
@@ -21,6 +21,29 @@ type FrameEnvelope struct {
 	EncryptedData   string `json:"encrypted_payload"`
 	SeqNum          int64  `json:"seq_num"`
 	Timestamp       int64  `json:"timestamp"`
+}
+
+type ApplicationRequestEnvelope struct {
+	ProtocolVersion string            `json:"v"`
+	SessionID       string            `json:"session_id"`
+	RequestID       string            `json:"request_id"`
+	Method          string            `json:"method"`
+	Path            string            `json:"path"`
+	Headers         map[string]string `json:"headers,omitempty"`
+	Body            string            `json:"body,omitempty"`
+	SeqNum          int64             `json:"seq_num"`
+	Timestamp       int64             `json:"timestamp"`
+}
+
+type ApplicationResponseEnvelope struct {
+	ProtocolVersion string            `json:"v"`
+	SessionID       string            `json:"session_id"`
+	RequestID       string            `json:"request_id"`
+	StatusCode      int               `json:"status_code"`
+	Headers         map[string]string `json:"headers,omitempty"`
+	Body            string            `json:"body,omitempty"`
+	SeqNum          int64             `json:"seq_num"`
+	Timestamp       int64             `json:"timestamp"`
 }
 
 type BrokerClient struct {
@@ -98,42 +121,60 @@ func (bc *BrokerClient) Start(ctx context.Context) {
 					continue
 				}
 
-				// Process incoming E2E encrypted client request frame
+				// Process incoming E2E encrypted application request envelope
 				if frame.Type == "data" && bc.E2ESession != nil && bc.Server != nil {
-					plainReq, err := bc.E2ESession.Decrypt(security.DirClientToHost, frame.EncryptedData, frame.SeqNum, frame.Timestamp)
+					plainReqBytes, err := bc.E2ESession.Decrypt(security.DirClientToHost, frame.EncryptedData, frame.SeqNum, frame.Timestamp)
 					if err != nil {
 						log.Printf("HostBridge BrokerClient: Decryption failed for frame seq=%d: %v", frame.SeqNum, err)
 						continue
 					}
 
-					// Route request internally to local HTTP handler
-					reqURL := "/api/v1/health"
-					reqMethod := "GET"
-					if len(plainReq) > 0 {
-						parts := strings.SplitN(string(plainReq), " ", 2)
-						if len(parts) >= 1 {
-							reqMethod = parts[0]
-						}
-						if len(parts) >= 2 {
-							reqURL = parts[1]
-						}
+					var appReq ApplicationRequestEnvelope
+					if err := json.Unmarshal(plainReqBytes, &appReq); err != nil {
+						log.Printf("HostBridge BrokerClient: Failed to unmarshal ApplicationRequestEnvelope: %v", err)
+						continue
 					}
 
-					req := httptest.NewRequest(reqMethod, reqURL, nil)
-					w := httptest.NewRecorder()
+					// Route request directly using Server's thread-safe Mux
+					method := appReq.Method
+					if method == "" {
+						method = "GET"
+					}
+					path := appReq.Path
+					if path == "" {
+						path = "/api/v1/health"
+					}
 
-					mux := http.NewServeMux()
-					bc.Server.RegisterRoutes(mux)
-					mux.ServeHTTP(w, req)
+					req := httptest.NewRequest(method, path, strings.NewReader(appReq.Body))
+					for k, v := range appReq.Headers {
+						req.Header.Set(k, v)
+					}
 
-					respBytes := w.Body.Bytes()
-					encryptedResp, err := bc.E2ESession.Encrypt(security.DirHostToClient, respBytes, frame.SeqNum, time.Now().UnixNano())
+					rec := httptest.NewRecorder()
+					bc.Server.Mux().ServeHTTP(rec, req)
+
+					appResp := ApplicationResponseEnvelope{
+						ProtocolVersion: "1.2",
+						SessionID:       bc.SessionID,
+						RequestID:       appReq.RequestID,
+						StatusCode:      rec.Code,
+						Body:            rec.Body.String(),
+						SeqNum:          frame.SeqNum,
+						Timestamp:       time.Now().UnixNano(),
+					}
+
+					respBytes, err := json.Marshal(appResp)
+					if err != nil {
+						continue
+					}
+
+					encryptedRespPayload, err := bc.E2ESession.Encrypt(security.DirHostToClient, respBytes, frame.SeqNum, time.Now().UnixNano())
 					if err == nil {
 						_ = conn.WriteJSON(FrameEnvelope{
 							ProtocolVersion: "1.2",
 							SessionID:       bc.SessionID,
 							Type:            "data",
-							EncryptedData:   encryptedResp,
+							EncryptedData:   encryptedRespPayload,
 							SeqNum:          frame.SeqNum,
 							Timestamp:       time.Now().UnixNano(),
 						})

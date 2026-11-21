@@ -17,9 +17,10 @@ func TestBroker_AuthenticatedEndToEndWebSocketRelay(t *testing.T) {
 	deviceID := "dev-phone-01"
 	sessionID := "sess-e2e-100"
 	hostToken := "host-auth-token-secret-32b"
+	clientToken := "client-auth-token-secret-32b"
 
 	b.AuthorizeHost(machineID, hostToken)
-	b.AuthorizeDevice(machineID, deviceID)
+	b.AuthorizeDevice(machineID, deviceID, sessionID, clientToken)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws/host", b.HandleHostWebSocket)
@@ -39,7 +40,7 @@ func TestBroker_AuthenticatedEndToEndWebSocketRelay(t *testing.T) {
 	defer hostConn.Close()
 
 	// 2. Client dials /ws/client
-	clientDialURL := fmt.Sprintf("%s/ws/client?machine_id=%s&device_id=%s&session_id=%s", wsURL, machineID, deviceID, sessionID)
+	clientDialURL := fmt.Sprintf("%s/ws/client?machine_id=%s&device_id=%s&session_id=%s&token=%s", wsURL, machineID, deviceID, sessionID, clientToken)
 	clientConn, _, err := websocket.DefaultDialer.Dial(clientDialURL, nil)
 	if err != nil {
 		t.Fatalf("Failed client WSS connection: %v", err)

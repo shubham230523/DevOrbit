@@ -4,6 +4,9 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"net/url"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,17 +17,10 @@ var (
 	ErrSessionNotFound     = errors.New("session not found or host offline")
 	ErrUnauthorizedSession = errors.New("unauthorized connection or invalid session token")
 	ErrFrameTooLarge       = errors.New("frame size exceeds broker maximum limit")
+	ErrInvalidOrigin       = errors.New("websocket connection rejected due to untrusted origin")
 )
 
 const MaxFrameSizeBytes = 10 * 1024 * 1024 // 10 MB
-
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024 * 1024,
-	WriteBufferSize: 1024 * 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
-}
 
 type ConnectionMode string
 
@@ -55,38 +51,92 @@ type Session struct {
 }
 
 type Broker struct {
-	mu            sync.RWMutex
-	sessions      map[string]*Session            // Key: SessionID
-	hostSessions  map[string]map[string]*Session // Key: MachineID -> map[SessionID]*Session
-	authorizedDev map[string]bool                // Key: MachineID + ":" + DeviceID
-	authorizedHost map[string]string             // Key: MachineID -> Expected Token
+	mu                     sync.RWMutex
+	sessions               map[string]*Session            // Key: SessionID
+	hostSessions           map[string]map[string]*Session // Key: MachineID -> map[SessionID]*Session
+	authorizedDev          map[string]bool                // Key: MachineID + ":" + DeviceID
+	authorizedHost         map[string]string             // Key: MachineID -> Expected Token
+	authorizedClientTokens map[string]string             // Key: MachineID + ":" + DeviceID + ":" + SessionID -> Token
+	allowedOrigins         map[string]bool                // Key: Origin domain
+	environment            string
 }
 
 func NewBroker() *Broker {
-	return &Broker{
-		sessions:       make(map[string]*Session),
-		hostSessions:   make(map[string]map[string]*Session),
-		authorizedDev:  make(map[string]bool),
-		authorizedHost: make(map[string]string),
+	env := strings.ToLower(os.Getenv("DEVORBIT_ENV"))
+	if env == "" {
+		env = "development"
 	}
+
+	origins := map[string]bool{
+		"localhost":     true,
+		"127.0.0.1":     true,
+		"10.0.2.2":      true,
+		"app.devorbit.net": true,
+	}
+
+	return &Broker{
+		sessions:               make(map[string]*Session),
+		hostSessions:           make(map[string]map[string]*Session),
+		authorizedDev:          make(map[string]bool),
+		authorizedHost:         make(map[string]string),
+		authorizedClientTokens: make(map[string]string),
+		allowedOrigins:         origins,
+		environment:            env,
+	}
+}
+
+func (b *Broker) checkOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		// Native mobile clients (Android/iOS) do not send Origin header
+		return true
+	}
+
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+
+	hostname := strings.ToLower(u.Hostname())
+	if b.environment == "development" {
+		return true // Allow all local origins in development mode
+	}
+
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.allowedOrigins[hostname]
 }
 
 func (b *Broker) AuthorizeHost(machineID, token string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.authorizedHost[machineID] = token
+	if machineID != "" && token != "" {
+		b.authorizedHost[machineID] = token
+	}
 }
 
-func (b *Broker) AuthorizeDevice(machineID, deviceID string) {
+func (b *Broker) AuthorizeDevice(machineID, deviceID, sessionID, clientToken string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.authorizedDev[machineID+":"+deviceID] = true
+	if machineID != "" && deviceID != "" {
+		b.authorizedDev[machineID+":"+deviceID] = true
+		if sessionID != "" && clientToken != "" {
+			b.authorizedClientTokens[machineID+":"+deviceID+":"+sessionID] = clientToken
+		}
+	}
 }
 
 func (b *Broker) RevokeDevice(machineID, deviceID string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	delete(b.authorizedDev, machineID+":"+deviceID)
+
+	// Clean up client token credentials
+	for key := range b.authorizedClientTokens {
+		if strings.HasPrefix(key, machineID+":"+deviceID+":") {
+			delete(b.authorizedClientTokens, key)
+		}
+	}
 
 	// Terminate active sessions for revoked device
 	for _, sess := range b.sessions {
@@ -100,11 +150,10 @@ func (b *Broker) RegisterHostConnection(machineID, sessionID, token string, conn
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	// Validate Host Authentication
-	if expectedToken, ok := b.authorizedHost[machineID]; ok && expectedToken != "" {
-		if token != expectedToken {
-			return nil, ErrUnauthorizedSession
-		}
+	// Strict Host Authentication Validation
+	expectedToken, registered := b.authorizedHost[machineID]
+	if !registered || expectedToken == "" || token != expectedToken {
+		return nil, ErrUnauthorizedSession
 	}
 
 	sess, ok := b.sessions[sessionID]
@@ -119,7 +168,6 @@ func (b *Broker) RegisterHostConnection(machineID, sessionID, token string, conn
 	}
 
 	if sess.HostConn != nil && sess.HostConn != conn {
-		// Close existing stale host connection
 		_ = sess.HostConn.Close()
 	}
 	sess.HostConn = conn
@@ -138,6 +186,13 @@ func (b *Broker) RegisterClientConnection(machineID, deviceID, sessionID, token 
 
 	if !b.authorizedDev[machineID+":"+deviceID] {
 		return nil, ErrUnauthorizedSession
+	}
+
+	// Validate client token credential if token registration is enforced
+	if expectedToken, ok := b.authorizedClientTokens[machineID+":"+deviceID+":"+sessionID]; ok && expectedToken != "" {
+		if token != expectedToken {
+			return nil, ErrUnauthorizedSession
+		}
 	}
 
 	sess, ok := b.sessions[sessionID]
@@ -165,18 +220,31 @@ func (b *Broker) HandleHostWebSocket(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.URL.Query().Get("session_id")
 	token := r.URL.Query().Get("token")
 
-	if machineID == "" || sessionID == "" {
-		http.Error(w, "missing machine_id or session_id query param", http.StatusBadRequest)
+	if machineID == "" || sessionID == "" || token == "" {
+		http.Error(w, "missing required machine_id, session_id, or token", http.StatusUnauthorized)
 		return
 	}
 
+	// Check origin before upgrading
+	if !b.checkOrigin(r) {
+		http.Error(w, ErrInvalidOrigin.Error(), http.StatusForbidden)
+		return
+	}
+
+	// Strict Host Authentication Check
 	b.mu.RLock()
-	expectedToken, hostEnforced := b.authorizedHost[machineID]
+	expectedToken, registered := b.authorizedHost[machineID]
 	b.mu.RUnlock()
 
-	if hostEnforced && expectedToken != "" && token != expectedToken {
-		http.Error(w, "unauthorized host authentication token", http.StatusUnauthorized)
+	if !registered || expectedToken == "" || token != expectedToken {
+		http.Error(w, "unauthorized host credential", http.StatusUnauthorized)
 		return
+	}
+
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:  1024 * 1024,
+		WriteBufferSize: 1024 * 1024,
+		CheckOrigin:     b.checkOrigin,
 	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -184,6 +252,7 @@ func (b *Broker) HandleHostWebSocket(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Failed to upgrade host WebSocket: %v", err)
 		return
 	}
+	conn.SetReadLimit(MaxFrameSizeBytes)
 
 	sess, err := b.RegisterHostConnection(machineID, sessionID, token, conn)
 	if err != nil {
@@ -200,7 +269,6 @@ func (b *Broker) HandleHostWebSocket(w http.ResponseWriter, r *http.Request) {
 		if err := conn.ReadJSON(&frame); err != nil {
 			break
 		}
-		// Relay frame directly from Host to Client without decrypting payload
 		_ = b.RelayFrameFromHostToClient(sessionID, &frame)
 	}
 }
@@ -212,12 +280,18 @@ func (b *Broker) HandleClientWebSocket(w http.ResponseWriter, r *http.Request) {
 	token := r.URL.Query().Get("token")
 
 	if machineID == "" || deviceID == "" || sessionID == "" {
-		http.Error(w, "missing machine_id, device_id, or session_id", http.StatusBadRequest)
+		http.Error(w, "missing required parameters: machine_id, device_id, session_id", http.StatusBadRequest)
+		return
+	}
+
+	if !b.checkOrigin(r) {
+		http.Error(w, ErrInvalidOrigin.Error(), http.StatusForbidden)
 		return
 	}
 
 	b.mu.RLock()
 	isAuthorized := b.authorizedDev[machineID+":"+deviceID]
+	expectedToken, tokenRegistered := b.authorizedClientTokens[machineID+":"+deviceID+":"+sessionID]
 	b.mu.RUnlock()
 
 	if !isAuthorized {
@@ -225,11 +299,23 @@ func (b *Broker) HandleClientWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if tokenRegistered && expectedToken != "" && token != expectedToken {
+		http.Error(w, "invalid client session token credential", http.StatusForbidden)
+		return
+	}
+
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:  1024 * 1024,
+		WriteBufferSize: 1024 * 1024,
+		CheckOrigin:     b.checkOrigin,
+	}
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("Failed to upgrade client WebSocket: %v", err)
 		return
 	}
+	conn.SetReadLimit(MaxFrameSizeBytes)
 
 	sess, err := b.RegisterClientConnection(machineID, deviceID, sessionID, token, conn)
 	if err != nil {
@@ -246,7 +332,6 @@ func (b *Broker) HandleClientWebSocket(w http.ResponseWriter, r *http.Request) {
 		if err := conn.ReadJSON(&frame); err != nil {
 			break
 		}
-		// Relay frame directly from Client to Host without decrypting payload
 		_ = b.RelayFrameFromClientToHost(sessionID, &frame)
 	}
 }

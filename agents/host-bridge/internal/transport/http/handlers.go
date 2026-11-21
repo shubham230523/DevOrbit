@@ -7,6 +7,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 
 	"devorbit.net/agents/host-bridge/internal/application"
 	"devorbit.net/agents/host-bridge/internal/domain"
@@ -22,6 +23,8 @@ type Server struct {
 	pairingEngine *security.PairingEngine
 	rateLimiter   *security.RateLimiter
 	idempotency   *security.IdempotencyManager
+	muxOnce       sync.Once
+	cachedMux     *http.ServeMux
 }
 
 func NewServer(
@@ -38,6 +41,14 @@ func NewServer(
 		gitSvc:        gs,
 		deviceSvc:     ds,
 	}
+}
+
+func (s *Server) Mux() *http.ServeMux {
+	s.muxOnce.Do(func() {
+		s.cachedMux = http.NewServeMux()
+		s.RegisterRoutes(s.cachedMux)
+	})
+	return s.cachedMux
 }
 
 func (s *Server) SetIdempotencyManager(mgr *security.IdempotencyManager) {
