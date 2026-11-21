@@ -1,12 +1,23 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
-import '../../../core/network/api_client.dart';
+import '../../../core/network/broker_websocket_client.dart';
 
 class DashboardScreen extends StatefulWidget {
-  final String? initialHostBaseUrl;
+  final String? initialBrokerUrl;
+  final String machineId;
+  final String deviceId;
+  final String sessionId;
+  final String token;
+  final String masterSecret;
 
   const DashboardScreen({
     super.key,
-    this.initialHostBaseUrl,
+    this.initialBrokerUrl,
+    this.machineId = 'host-windows-01',
+    this.deviceId = 'phone-android-01',
+    this.sessionId = 'sess-e2e-100',
+    this.token = 'valid-client-token-32b',
+    this.masterSecret = 'devorbit-master-secret-key-32b!',
   });
 
   @override
@@ -14,61 +25,119 @@ class DashboardScreen extends StatefulWidget {
 }
 
 class _DashboardScreenState extends State<DashboardScreen> {
-  late TextEditingController _hostController;
-  late HostBridgeApiClient _apiClient;
-  bool _isLoading = true;
-  bool _isOnline = false;
+  late TextEditingController _brokerController;
+  BrokerWebSocketClient? _brokerClient;
+  BrokerConnectionState _connectionState = BrokerConnectionState.disconnected;
+  bool _isLoading = false;
   Map<String, dynamic>? _healthData;
   List<dynamic> _workspaces = [];
-  bool _workspaceFetchError = false;
   String? _errorMessage;
 
   @override
   void initState() {
     super.initState();
-    final defaultUrl = widget.initialHostBaseUrl ?? 'http://10.0.2.2:8082';
-    _hostController = TextEditingController(text: defaultUrl);
-    _apiClient = HostBridgeApiClient(baseUrl: defaultUrl);
-    _fetchLiveHostData();
+    final defaultUrl = widget.initialBrokerUrl ?? '';
+    _brokerController = TextEditingController(text: defaultUrl);
+    if (defaultUrl.isNotEmpty) {
+      _connectToBroker();
+    }
   }
 
-  Future<void> _fetchLiveHostData() async {
-    final url = _hostController.text.trim();
+  Future<void> _connectToBroker() async {
+    final url = _brokerController.text.trim();
     if (url.isEmpty) return;
 
-    _apiClient = HostBridgeApiClient(baseUrl: url);
+    _brokerClient?.disconnect();
+    _brokerClient?.dispose();
+
+    _brokerClient = BrokerWebSocketClient(
+      brokerUrl: url,
+      machineId: widget.machineId,
+      deviceId: widget.deviceId,
+      sessionId: widget.sessionId,
+      token: widget.token,
+      masterSecret: widget.masterSecret,
+    );
 
     setState(() {
       _isLoading = true;
       _errorMessage = null;
-      _workspaceFetchError = false;
     });
 
-    final health = await _apiClient.getHealth();
-    if (health != null && health['status'] == 'ok') {
-      final wsRes = await _apiClient.listWorkspaces();
+    _brokerClient!.stateStream.listen((state) {
       if (mounted) {
         setState(() {
-          _isOnline = true;
-          _healthData = health;
-          if (wsRes['success'] == true) {
-            _workspaces = wsRes['workspaces'] as List<dynamic>;
-            _workspaceFetchError = false;
-          } else {
-            _workspaces = [];
-            _workspaceFetchError = true;
-          }
-          _isLoading = false;
+          _connectionState = state;
         });
       }
+    });
+
+    await _brokerClient!.connect();
+    if (_brokerClient!.state == BrokerConnectionState.authenticatedBrokerSessionActive) {
+      await _fetchLiveHostDataOverBroker();
     } else {
       if (mounted) {
         setState(() {
-          _isOnline = false;
+          _isLoading = false;
+          _errorMessage = 'Failed to establish authenticated session with Connection Broker at $url';
+        });
+      }
+    }
+  }
+
+  Future<void> _fetchLiveHostDataOverBroker() async {
+    if (_brokerClient == null || _brokerClient!.state != BrokerConnectionState.authenticatedBrokerSessionActive) {
+      return;
+    }
+
+    setState(() {
+      _isLoading = true;
+      _errorMessage = null;
+    });
+
+    try {
+      final healthResp = await _brokerClient!.sendRequest(
+        method: 'GET',
+        path: '/api/v1/health',
+      );
+
+      if (healthResp.statusCode == 200) {
+        final healthJson = jsonDecode(healthResp.body) as Map<String, dynamic>;
+
+        final wsResp = await _brokerClient!.sendRequest(
+          method: 'GET',
+          path: '/api/v1/workspaces',
+        );
+
+        List<dynamic> wsList = [];
+        if (wsResp.statusCode == 200) {
+          wsList = jsonDecode(wsResp.body) as List<dynamic>;
+        }
+
+        if (mounted) {
+          setState(() {
+            _healthData = healthJson;
+            _workspaces = wsList;
+            _isLoading = false;
+          });
+        }
+      } else {
+        if (mounted) {
+          setState(() {
+            _healthData = null;
+            _workspaces = [];
+            _isLoading = false;
+            _errorMessage = 'Broker request failed with status HTTP ${healthResp.statusCode}';
+          });
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
           _healthData = null;
           _workspaces = [];
           _isLoading = false;
-          _errorMessage = 'Unable to establish session with Host Bridge at $url';
+          _errorMessage = 'Broker request error: $e';
         });
       }
     }
@@ -76,8 +145,44 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   @override
   void dispose() {
-    _hostController.dispose();
+    _brokerController.dispose();
+    _brokerClient?.disconnect();
+    _brokerClient?.dispose();
     super.dispose();
+  }
+
+  Color _getStatusColor(BrokerConnectionState state) {
+    switch (state) {
+      case BrokerConnectionState.authenticatedBrokerSessionActive:
+        return Colors.green;
+      case BrokerConnectionState.connecting:
+      case BrokerConnectionState.authenticating:
+      case BrokerConnectionState.reconnecting:
+        return Colors.amber;
+      case BrokerConnectionState.authFailed:
+      case BrokerConnectionState.revoked:
+      case BrokerConnectionState.disconnected:
+        return Colors.red;
+    }
+  }
+
+  String _getStatusLabel(BrokerConnectionState state) {
+    switch (state) {
+      case BrokerConnectionState.authenticatedBrokerSessionActive:
+        return 'AUTHENTICATED BROKER SESSION ACTIVE';
+      case BrokerConnectionState.connecting:
+        return 'CONNECTING TO BROKER';
+      case BrokerConnectionState.authenticating:
+        return 'AUTHENTICATING';
+      case BrokerConnectionState.reconnecting:
+        return 'RECONNECTING';
+      case BrokerConnectionState.authFailed:
+        return 'AUTHENTICATION FAILED';
+      case BrokerConnectionState.revoked:
+        return 'DEVICE REVOKED';
+      case BrokerConnectionState.disconnected:
+        return 'DISCONNECTED';
+    }
   }
 
   @override
@@ -85,29 +190,29 @@ class _DashboardScreenState extends State<DashboardScreen> {
     final hostname = _healthData?['hostname'] ?? 'Desktop Host';
     final osType = _healthData?['os'] ?? 'Unknown OS';
     final arch = _healthData?['arch'] ?? '';
-    final latency = _healthData?['latency_ms'] ?? 0;
     final version = _healthData?['host_bridge_version'] ?? 'v1.2.1';
     final allowedRoots = _healthData?['allowed_workspaces_count'] ?? 0;
+    final isOnline = _connectionState == BrokerConnectionState.authenticatedBrokerSessionActive;
 
     return RefreshIndicator(
-      onRefresh: _fetchLiveHostData,
+      onRefresh: _fetchLiveHostDataOverBroker,
       child: ListView(
         padding: const EdgeInsets.all(16.0),
         children: [
-          // Endpoint Selection Input Card
+          // Connection Broker Endpoint Selection Input Card
           Card(
             child: Padding(
               padding: const EdgeInsets.all(12.0),
               child: Row(
                 children: [
-                  const Icon(Icons.link, color: Colors.purpleAccent),
+                  const Icon(Icons.hub, color: Colors.purpleAccent),
                   const SizedBox(width: 8),
                   Expanded(
                     child: TextField(
-                      controller: _hostController,
+                      controller: _brokerController,
                       decoration: const InputDecoration(
-                        labelText: 'Host Bridge Endpoint',
-                        hintText: 'e.g. http://192.168.1.100:8082',
+                        labelText: 'Connection Broker WSS Endpoint',
+                        hintText: 'e.g. ws://localhost:8081',
                         isDense: true,
                         border: OutlineInputBorder(),
                       ),
@@ -115,7 +220,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   ),
                   const SizedBox(width: 8),
                   ElevatedButton(
-                    onPressed: _isLoading ? null : _fetchLiveHostData,
+                    onPressed: _isLoading ? null : _connectToBroker,
                     child: const Text('Connect'),
                   ),
                 ],
@@ -124,30 +229,28 @@ class _DashboardScreenState extends State<DashboardScreen> {
           ),
           const SizedBox(height: 12),
 
-          // Real Machine Health Status Card
+          // Real Authenticated Session Health Status Card
           Card(
             child: ListTile(
               leading: Icon(
                 Icons.computer,
-                color: _isOnline ? Colors.green : Colors.red,
+                color: _getStatusColor(_connectionState),
                 size: 32,
               ),
               title: Text(
-                _isOnline ? '$hostname ($osType/$arch)' : 'Host Session Offline',
+                isOnline ? '$hostname ($osType/$arch)' : 'Host Session Inactive',
                 style: const TextStyle(fontWeight: FontWeight.bold),
               ),
-              subtitle: _isOnline
-                  ? Text('Host Bridge $version • Latency: ${latency}ms\nAllowed Roots: $allowedRoots')
-                  : Text(_errorMessage ?? 'Host Bridge daemon disconnected'),
-              isThreeLine: _isOnline,
+              subtitle: isOnline
+                  ? Text('Host Bridge $version • Via Broker WSS\nAllowed Roots: $allowedRoots')
+                  : Text(_errorMessage ?? _getStatusLabel(_connectionState)),
+              isThreeLine: isOnline,
               trailing: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
                   Chip(
-                    label: Text(_isOnline ? 'CONNECTED' : 'DISCONNECTED'),
-                    backgroundColor: _isOnline
-                        ? Colors.green.withValues(alpha: 0.2)
-                        : Colors.red.withValues(alpha: 0.2),
+                    label: Text(_getStatusLabel(_connectionState)),
+                    backgroundColor: _getStatusColor(_connectionState).withValues(alpha: 0.2),
                   ),
                 ],
               ),
@@ -155,7 +258,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
           ),
           const SizedBox(height: 12),
 
-          // Real Discovered Projects List Card
+          // Real Discovered Projects Card
           Card(
             child: Padding(
               padding: const EdgeInsets.all(16.0),
@@ -171,7 +274,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       ),
                       IconButton(
                         icon: const Icon(Icons.refresh, size: 20),
-                        onPressed: _fetchLiveHostData,
+                        onPressed: _fetchLiveHostDataOverBroker,
                         tooltip: 'Refresh Host Status',
                       ),
                     ],
@@ -182,20 +285,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       padding: EdgeInsets.all(16.0),
                       child: Center(child: CircularProgressIndicator()),
                     )
-                  else if (!_isOnline)
+                  else if (!isOnline)
                     const Padding(
                       padding: EdgeInsets.all(16.0),
                       child: Text(
-                        'Host is offline. Connect to Host Bridge daemon to view live projects.',
+                        'Broker session offline. Connect to Connection Broker to view live host projects.',
                         style: TextStyle(color: Colors.grey),
-                      ),
-                    )
-                  else if (_workspaceFetchError)
-                    const Padding(
-                      padding: EdgeInsets.all(16.0),
-                      child: Text(
-                        'Error retrieving workspaces from host: Authorization or network failure.',
-                        style: TextStyle(color: Colors.orangeAccent),
                       ),
                     )
                   else if (_workspaces.isEmpty)

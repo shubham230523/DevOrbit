@@ -38,8 +38,8 @@ func TestBroker_HostAndClientAuthenticationEnforcement(t *testing.T) {
 		t.Errorf("Expected HTTP 401 Unauthorized for invalid host token attempt")
 	}
 
-	// 3. Attempt unauthorized client connection -> Should receive 403
-	badClientURL := fmt.Sprintf("%s/ws/client?machine_id=mach-auth-01&device_id=unauthorized-phone&session_id=sess-1", wsURL)
+	// 3. Attempt unauthorized client device connection -> Should receive 403
+	badClientURL := fmt.Sprintf("%s/ws/client?machine_id=mach-auth-01&device_id=unauthorized-phone&session_id=sess-1&token=unauthorized-token", wsURL)
 	_, res, err = websocket.DefaultDialer.Dial(badClientURL, nil)
 	if err == nil || res == nil || res.StatusCode != http.StatusForbidden {
 		t.Errorf("Expected HTTP 403 Forbidden for unauthorized client device connection attempt")

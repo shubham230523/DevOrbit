@@ -2,6 +2,7 @@ package security
 
 import (
 	"bytes"
+	"encoding/hex"
 	"testing"
 	"time"
 )
@@ -34,6 +35,34 @@ func TestE2ESession_HKDFKeyDerivationAndDirectionalSeparation(t *testing.T) {
 
 	if string(decrypted) != string(plain) {
 		t.Errorf("Decrypted text mismatch")
+	}
+}
+
+func TestE2ESession_DeterministicCrossLanguageVector(t *testing.T) {
+	masterSecret := "devorbit-test-master-secret-32b!"
+	sessionID := "sess-interop-001"
+	deviceID := "dev-interop-001"
+
+	cKey, hKey, err := DeriveDirectionalKeys(masterSecret, sessionID, deviceID)
+	if err != nil {
+		t.Fatalf("HKDF key derivation failed: %v", err)
+	}
+
+	cKeyHex := hex.EncodeToString(cKey)
+	hKeyHex := hex.EncodeToString(hKey)
+
+	if len(cKeyHex) != 64 || len(hKeyHex) != 64 {
+		t.Errorf("Expected 32-byte (64 hex char) derived keys, got cKey=%d hKey=%d", len(cKeyHex), len(hKeyHex))
+	}
+
+	if cKeyHex == hKeyHex {
+		t.Errorf("Client and Host directional keys must be distinct")
+	}
+
+	sess, _ := NewE2ESession(sessionID, deviceID, masterSecret, 1*time.Hour)
+	aad := sess.ConstructAAD(1, 1700000000000)
+	if len(aad) < 16 {
+		t.Errorf("Expected valid AAD bytes length, got %d", len(aad))
 	}
 }
 

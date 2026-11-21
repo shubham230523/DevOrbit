@@ -68,9 +68,9 @@ func NewBroker() *Broker {
 	}
 
 	origins := map[string]bool{
-		"localhost":     true,
-		"127.0.0.1":     true,
-		"10.0.2.2":      true,
+		"localhost":        true,
+		"127.0.0.1":        true,
+		"10.0.2.2":         true,
 		"app.devorbit.net": true,
 	}
 
@@ -87,23 +87,29 @@ func NewBroker() *Broker {
 
 func (b *Broker) checkOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
-	if origin == "" {
-		return true
+
+	if b.environment == "production" {
+		if origin == "" {
+			// In production, require user-agent to indicate native mobile client or reject
+			ua := r.Header.Get("User-Agent")
+			if strings.Contains(ua, "DevOrbitMobile") || strings.Contains(ua, "Dart") {
+				return true
+			}
+			return false
+		}
+
+		u, err := url.Parse(origin)
+		if err != nil {
+			return false
+		}
+		hostname := strings.ToLower(u.Hostname())
+		b.mu.RLock()
+		defer b.mu.RUnlock()
+		return b.allowedOrigins[hostname]
 	}
 
-	u, err := url.Parse(origin)
-	if err != nil {
-		return false
-	}
-
-	hostname := strings.ToLower(u.Hostname())
-	if b.environment == "development" {
-		return true
-	}
-
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	return b.allowedOrigins[hostname]
+	// Development mode allows all local connections
+	return true
 }
 
 func (b *Broker) AuthorizeHost(machineID, token string) {
@@ -184,10 +190,10 @@ func (b *Broker) RegisterClientConnection(machineID, deviceID, sessionID, token 
 		return nil, ErrUnauthorizedSession
 	}
 
-	if expectedToken, tokenRegistered := b.authorizedClientTokens[machineID+":"+deviceID+":"+sessionID]; tokenRegistered && expectedToken != "" {
-		if token != expectedToken {
-			return nil, ErrUnauthorizedSession
-		}
+	// Mandatory fail-closed client token validation
+	expectedToken, tokenRegistered := b.authorizedClientTokens[machineID+":"+deviceID+":"+sessionID]
+	if !tokenRegistered || expectedToken == "" || token != expectedToken {
+		return nil, ErrUnauthorizedSession
 	}
 
 	sess, ok := b.sessions[sessionID]
@@ -272,8 +278,8 @@ func (b *Broker) HandleClientWebSocket(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.URL.Query().Get("session_id")
 	token := r.URL.Query().Get("token")
 
-	if machineID == "" || deviceID == "" || sessionID == "" {
-		http.Error(w, "missing required parameters: machine_id, device_id, session_id", http.StatusBadRequest)
+	if machineID == "" || deviceID == "" || sessionID == "" || token == "" {
+		http.Error(w, "missing required parameters: machine_id, device_id, session_id, token", http.StatusBadRequest)
 		return
 	}
 
@@ -287,7 +293,7 @@ func (b *Broker) HandleClientWebSocket(w http.ResponseWriter, r *http.Request) {
 	expectedToken, tokenRegistered := b.authorizedClientTokens[machineID+":"+deviceID+":"+sessionID]
 	b.mu.RUnlock()
 
-	if !isAuthorized || (tokenRegistered && expectedToken != "" && token != expectedToken) {
+	if !isAuthorized || !tokenRegistered || expectedToken == "" || token != expectedToken {
 		http.Error(w, "unauthorized client device identity or invalid token credential", http.StatusForbidden)
 		return
 	}
