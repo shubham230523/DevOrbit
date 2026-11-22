@@ -116,3 +116,21 @@ func TestConfig_DevelopmentDefaults(t *testing.T) {
 		t.Errorf("Expected dev BrokerWSURL to be ws://127.0.0.1:8081, got %s", cfg.BrokerWSURL)
 	}
 }
+
+func TestConfig_GeminiConfiguration(t *testing.T) {
+	t.Setenv("DEVORBIT_ENV", "development")
+	t.Setenv("DEVORBIT_GEMINI_API_KEY", "test-secret-gemini-key-12345")
+	t.Setenv("DEVORBIT_GEMINI_MODEL", "gemini-2.5-pro")
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("Unexpected error loading config: %v", err)
+	}
+
+	if cfg.GeminiAPIKey != "test-secret-gemini-key-12345" {
+		t.Errorf("Expected GeminiAPIKey to be loaded, got %s", cfg.GeminiAPIKey)
+	}
+	if cfg.GeminiModel != "gemini-2.5-pro" {
+		t.Errorf("Expected GeminiModel to be gemini-2.5-pro, got %s", cfg.GeminiModel)
+	}
+}

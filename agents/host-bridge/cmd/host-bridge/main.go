@@ -19,6 +19,7 @@ import (
 	"devorbit.net/agents/host-bridge/internal/security"
 	"devorbit.net/agents/host-bridge/internal/transport"
 	httptransport "devorbit.net/agents/host-bridge/internal/transport/http"
+	airouter "devorbit.net/agents/ai-router/pkg/router"
 )
 
 func main() {
@@ -66,6 +67,24 @@ func main() {
 	}
 	brokerAuthorizer := transport.NewHTTPBrokerAuthorizer(cfg.BrokerHTTPURL, brokerAdminSecret, nil)
 	serverEngine.SetBrokerAuthorizer(brokerAuthorizer)
+
+	// AI Router and Gemini Provider
+	aiRouter := airouter.NewAIRouter()
+	if cfg.GeminiAPIKey != "" {
+		geminiProv, err := airouter.NewGeminiProvider(context.Background(), airouter.GeminiConfig{
+			APIKey:       cfg.GeminiAPIKey,
+			DefaultModel: cfg.GeminiModel,
+		})
+		if err != nil {
+			log.Printf("AI Router Warning: Failed to initialize Gemini provider: %v", err)
+		} else {
+			aiRouter.RegisterProvider("Gemini API", geminiProv)
+			log.Printf("AI Router: Registered real Gemini Provider (default model: %s)", cfg.GeminiModel)
+		}
+	} else {
+		log.Println("AI Router Warning: DEVORBIT_GEMINI_API_KEY is not set. Real Gemini API requests will require configuration.")
+	}
+	serverEngine.SetAIRouter(aiRouter)
 
 	mux := http.NewServeMux()
 	serverEngine.RegisterRoutes(mux)

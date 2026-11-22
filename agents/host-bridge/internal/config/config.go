@@ -34,6 +34,8 @@ type Config struct {
 	AdvertisedURL   string
 	TrustedProxies  []string
 	Environment     string
+	GeminiAPIKey    string // Host-only: DEVORBIT_GEMINI_API_KEY
+	GeminiModel     string // Host-only: DEVORBIT_GEMINI_MODEL
 }
 
 func LoadConfig() (*Config, error) {
@@ -227,6 +229,15 @@ func LoadConfig() (*Config, error) {
 		}
 	}
 
+	geminiKey := strings.TrimSpace(os.Getenv("DEVORBIT_GEMINI_API_KEY"))
+	if geminiKey == "" {
+		geminiKey = strings.TrimSpace(os.Getenv("GEMINI_API_KEY"))
+	}
+	geminiModel := strings.TrimSpace(os.Getenv("DEVORBIT_GEMINI_MODEL"))
+	if geminiModel == "" {
+		geminiModel = "gemini-2.5-flash"
+	}
+
 	return &Config{
 		AllowedRoots:    roots,
 		Port:            port,
@@ -242,6 +253,8 @@ func LoadConfig() (*Config, error) {
 		AdvertisedURL:   advertisedURL,
 		TrustedProxies:  trustedProxies,
 		Environment:     env,
+		GeminiAPIKey:    geminiKey,
+		GeminiModel:     geminiModel,
 		AllowedBinaries: []string{
 			"git", "git.exe", "gradlew", "gradlew.bat", "gradle", "gradle.bat", "adb", "adb.exe",
 		},

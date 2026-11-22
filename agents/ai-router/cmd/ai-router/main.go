@@ -3,7 +3,7 @@ package main
 import (
 	"log"
 
-	"devorbit.net/agents/ai-router/internal/router"
+	"devorbit.net/agents/ai-router/pkg/router"
 )
 
 func main() {

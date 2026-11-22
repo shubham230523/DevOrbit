@@ -103,4 +103,12 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 		}
 		s.HandleListADBDevices(w, r)
 	})
+
+	mux.HandleFunc("/api/v1/ai/prompt", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		s.HandleAIPrompt(w, r)
+	})
 }
