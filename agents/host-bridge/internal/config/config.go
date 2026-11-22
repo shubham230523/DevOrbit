@@ -36,7 +36,7 @@ type Config struct {
 	Environment     string
 	GeminiAPIKey    string // Host-only: DEVORBIT_GEMINI_API_KEY
 	GeminiModel     string // Host-only: DEVORBIT_GEMINI_MODEL
-}
+	UseMockProvider bool // Host-only: DEVORBIT_GEMINI_USE_MOCK (true to enable mock provider)}
 
 func LoadConfig() (*Config, error) {
 	env := strings.ToLower(os.Getenv("DEVORBIT_ENV"))
