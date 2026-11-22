@@ -10,7 +10,7 @@ import (
 )
 
 type BrokerAuthorizer interface {
-	AuthorizeSession(ctx context.Context, machineID, deviceID, sessionID, clientToken, hostToken string, ttl time.Duration) error
+	AuthorizeSession(ctx context.Context, machineID, deviceID, sessionID, clientToken, hostToken string, expiresAt time.Time) error
 	RevokeDevice(ctx context.Context, machineID, deviceID string) error
 }
 
@@ -31,7 +31,7 @@ func NewHTTPBrokerAuthorizer(brokerURL, adminSecret string, httpClient *http.Cli
 	}
 }
 
-func (h *HTTPBrokerAuthorizer) AuthorizeSession(ctx context.Context, machineID, deviceID, sessionID, clientToken, hostToken string, ttl time.Duration) error {
+func (h *HTTPBrokerAuthorizer) AuthorizeSession(ctx context.Context, machineID, deviceID, sessionID, clientToken, hostToken string, expiresAt time.Time) error {
 	url := fmt.Sprintf("%s/api/v1/internal/sessions/authorize", h.brokerURL)
 	payload := map[string]any{
 		"machine_id":   machineID,
@@ -39,7 +39,7 @@ func (h *HTTPBrokerAuthorizer) AuthorizeSession(ctx context.Context, machineID, 
 		"session_id":   sessionID,
 		"client_token": clientToken,
 		"host_token":   hostToken,
-		"ttl_seconds":  int64(ttl.Seconds()),
+		"expires_at":   expiresAt.UTC().Format(time.RFC3339),
 	}
 
 	body, err := json.Marshal(payload)

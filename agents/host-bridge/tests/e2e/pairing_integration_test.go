@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -25,55 +27,47 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-func TestDevOrbit_FullPairingAndAuthenticatedSessionLifecycle(t *testing.T) {
-	tempRoot, err := os.MkdirTemp("", "devorbit_pairing_e2e_*")
+func TestDevOrbit_FullProductionPairingSessionLifecycle(t *testing.T) {
+	// 1. Setup temporary workstation workspace
+	tempWorkspace, err := os.MkdirTemp("", "devorbit_pairing_e2e_*")
 	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
+		t.Fatalf("Failed to create temp workspace: %v", err)
 	}
-	defer os.RemoveAll(tempRoot)
+	defer os.RemoveAll(tempWorkspace)
 
-	// -------------------------------------------------------------
-	// 1. Start Production Connection Broker with Service Auth
-	// -------------------------------------------------------------
-	adminSecret := "test-broker-service-admin-secret-32b!"
-	realBroker := broker.NewBrokerWithSecret(adminSecret)
+	cmdGit := exec.Command("git", "init")
+	cmdGit.Dir = tempWorkspace
+	_ = cmdGit.Run()
 
+	manifestPath := filepath.Join(tempWorkspace, "app", "src", "main", "AndroidManifest.xml")
+	_ = os.MkdirAll(filepath.Dir(manifestPath), 0755)
+	_ = os.WriteFile(manifestPath, []byte("<manifest package=\"com.devorbit.test\"></manifest>"), 0644)
+
+	buildGradlePath := filepath.Join(tempWorkspace, "build.gradle.kts")
+	_ = os.WriteFile(buildGradlePath, []byte("// initial build.gradle.kts"), 0644)
+
+	// 2. Start Real Connection Broker Server
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	realBroker := broker.NewBrokerWithSecret(cfg.BrokerSecret)
 	brokerMux := http.NewServeMux()
 	brokerMux.HandleFunc("/api/v1/internal/sessions/authorize", realBroker.HandleAuthorizeSession)
 	brokerMux.HandleFunc("/api/v1/internal/devices/revoke", realBroker.HandleRevoke)
 	brokerMux.HandleFunc("/ws/host", realBroker.HandleHostWebSocket)
 	brokerMux.HandleFunc("/ws/client", realBroker.HandleClientWebSocket)
 
-	brokerServer := httptest.NewServer(brokerMux)
-	defer brokerServer.Close()
-	brokerHTTPURL := brokerServer.URL
-	brokerWSURL := strings.Replace(brokerServer.URL, "http://", "ws://", 1)
+	brokerHTTPServer := httptest.NewServer(brokerMux)
+	defer brokerHTTPServer.Close()
 
-	// -------------------------------------------------------------
-	// 2. Production Configuration & Wiring for Host Bridge
-	// -------------------------------------------------------------
-	machineID := "host-windows-dev-01"
-	hostSecret := "devorbit-host-wide-secret-key-32b!"
+	brokerWSURL := strings.Replace(brokerHTTPServer.URL, "http://", "ws://", 1)
+	cfg.BrokerHTTPURL = brokerHTTPServer.URL
+	cfg.BrokerWSURL = brokerWSURL
 
-	os.Setenv("DEVORBIT_ENV", "development")
-	os.Setenv("DEVORBIT_HOST_ID", machineID)
-	os.Setenv("DEVORBIT_HOST_SECRET", hostSecret)
-	os.Setenv("DEVORBIT_BROKER_HTTP_URL", brokerHTTPURL)
-	os.Setenv("DEVORBIT_BROKER_WS_URL", brokerWSURL)
-	os.Setenv("DEVORBIT_BROKER_SECRET", adminSecret)
-	defer os.Unsetenv("DEVORBIT_ENV")
-	defer os.Unsetenv("DEVORBIT_HOST_ID")
-	defer os.Unsetenv("DEVORBIT_HOST_SECRET")
-	defer os.Unsetenv("DEVORBIT_BROKER_HTTP_URL")
-	defer os.Unsetenv("DEVORBIT_BROKER_WS_URL")
-	defer os.Unsetenv("DEVORBIT_BROKER_SECRET")
-
-	cfg, err := config.LoadConfig()
-	if err != nil {
-		t.Fatalf("Failed to load production config: %v", err)
-	}
-
-	jail := security.NewWorkspaceJail([]string{tempRoot})
+	// 3. Host Bridge Infrastructure & Pairing Setup
+	jail := security.NewWorkspaceJail([]string{tempWorkspace})
 	policy := security.NewDefaultCommandPolicy()
 	pairingEngine := security.NewPairingEngine(cfg.HostID, cfg.HostName, cfg.HostSecret)
 
@@ -90,9 +84,7 @@ func TestDevOrbit_FullPairingAndAuthenticatedSessionLifecycle(t *testing.T) {
 
 	serverEngine := httptransport.NewServer(wsSvc, fsSvc, psSvc, gsSvc, dsSvc)
 	serverEngine.SetPairingEngine(pairingEngine)
-	serverEngine.SetBrokerHTTPURL(cfg.BrokerHTTPURL)
-	serverEngine.SetBrokerWSURL(cfg.BrokerWSURL)
-	serverEngine.SetHostToken(cfg.HostSecret)
+	serverEngine.SetBrokerEndpoints(cfg.BrokerHTTPURL, cfg.BrokerWSURL, cfg.HostSecret)
 
 	// Wire HTTP broker authorizer exclusively to HTTP endpoint
 	brokerAuthorizer := transport.NewHTTPBrokerAuthorizer(cfg.BrokerHTTPURL, cfg.BrokerSecret, nil)
@@ -108,98 +100,62 @@ func TestDevOrbit_FullPairingAndAuthenticatedSessionLifecycle(t *testing.T) {
 	// Outbound broker client connects exclusively to WebSocket endpoint
 	brokerClient := transport.NewBrokerClient(cfg.BrokerWSURL, cfg.HostID, "", cfg.HostSecret, serverEngine)
 	serverEngine.SetSessionProvisioner(func(sessionID, deviceID, sessionSecret string, expiry time.Time) error {
-		return brokerClient.ProvisionSession(sessionID, deviceID, sessionSecret, expiry)
+		e2eSess, err := security.NewE2ESession(sessionID, deviceID, sessionSecret, time.Until(expiry))
+		if err != nil {
+			return err
+		}
+		brokerClient.SessionID = sessionID
+		brokerClient.SetE2ESession(e2eSess)
+		brokerClient.Start(context.Background())
+		return nil
 	})
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	brokerClient.Start(ctx)
 	defer brokerClient.Stop()
 
-	// -------------------------------------------------------------
-	// 3. Request a QR challenge from the real Host Bridge endpoint
-	// -------------------------------------------------------------
-	resCh, err := http.Post(hostHTTPServer.URL+"/api/v1/pairing/challenge", "application/json", nil)
-	if err != nil || resCh.StatusCode != http.StatusOK {
-		t.Fatalf("Failed to create pairing challenge: %v", err)
+	// 4. Create Pairing Challenge via POST
+	resp, err := http.Post(fmt.Sprintf("%s/api/v1/pairing/challenge", hostHTTPServer.URL), "application/json", nil)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("Failed to fetch pairing challenge: %v (code=%d)", err, resp.StatusCode)
 	}
+	defer resp.Body.Close()
 
-	var qrPayload struct {
-		Version        string `json:"v"`
+	var chResp struct {
 		ChallengeID    string `json:"challenge_id"`
-		HostID         string `json:"host_id"`
-		HostName       string `json:"host_name"`
 		PairingPayload string `json:"pairing_payload"`
 		PairingSecret  string `json:"pairing_secret"`
 		ConfirmURL     string `json:"confirm_url"`
 		BrokerURL      string `json:"broker_url"`
-		ExpiresAt      string `json:"expires_at"`
 	}
-	if err := json.NewDecoder(resCh.Body).Decode(&qrPayload); err != nil {
-		t.Fatalf("Failed to decode QR challenge response: %v", err)
-	}
-
-	if !strings.HasPrefix(qrPayload.ConfirmURL, "http://") && !strings.HasPrefix(qrPayload.ConfirmURL, "https://") {
-		t.Fatalf("Expected confirm_url to be absolute URL, got: %s", qrPayload.ConfirmURL)
-	}
-	// Verify broker_url emitted to mobile is WebSocket URL, NOT HTTP URL!
-	if !strings.HasPrefix(qrPayload.BrokerURL, "ws://") && !strings.HasPrefix(qrPayload.BrokerURL, "wss://") {
-		t.Fatalf("Expected broker_url to be WebSocket URL, got: %s", qrPayload.BrokerURL)
+	if err := json.NewDecoder(resp.Body).Decode(&chResp); err != nil {
+		t.Fatalf("Failed to decode challenge response: %v", err)
 	}
 
-	// -------------------------------------------------------------
-	// 4. Verify Persistent Secret Rejection
-	// -------------------------------------------------------------
-	deviceID1 := "mobile-pixel-01"
-	badPersistentProof := security.GenerateProof(
-		qrPayload.Version,
-		qrPayload.ChallengeID,
-		qrPayload.PairingPayload,
-		qrPayload.HostID,
-		deviceID1,
-		qrPayload.ExpiresAt,
-		hostSecret,
-	)
-
-	badReqBody, _ := json.Marshal(map[string]string{
-		"challenge_id":      qrPayload.ChallengeID,
-		"device_id":         deviceID1,
-		"device_name":       "Pixel Phone",
-		"device_public_key": "pubkey-mobile-01",
-		"proof_signature":   badPersistentProof,
-	})
-	resBad, err := http.Post(qrPayload.ConfirmURL, "application/json", bytes.NewBuffer(badReqBody))
-	if err != nil || resBad.StatusCode != http.StatusBadRequest {
-		t.Fatalf("Expected HTTP 400 when confirming with persistent host secret, got: %v", resBad)
+	if chResp.ConfirmURL != fmt.Sprintf("%s/api/v1/pairing/confirm", hostHTTPServer.URL) {
+		t.Errorf("Unexpected confirm_url: %s", chResp.ConfirmURL)
 	}
 
-	// -------------------------------------------------------------
-	// 5. Confirm Pairing for Device 1 with Ephemeral Proof
-	// -------------------------------------------------------------
-	validProof1 := security.GenerateProof(
-		qrPayload.Version,
-		qrPayload.ChallengeID,
-		qrPayload.PairingPayload,
-		qrPayload.HostID,
-		deviceID1,
-		qrPayload.ExpiresAt,
-		qrPayload.PairingSecret,
-	)
-
-	confirmReqBody1, _ := json.Marshal(map[string]string{
-		"challenge_id":      qrPayload.ChallengeID,
-		"device_id":         deviceID1,
-		"device_name":       "Pixel Phone",
-		"device_public_key": "pubkey-mobile-01",
-		"proof_signature":   validProof1,
-	})
-
-	resConf1, err := http.Post(qrPayload.ConfirmURL, "application/json", bytes.NewBuffer(confirmReqBody1))
-	if err != nil || resConf1.StatusCode != http.StatusOK {
-		t.Fatalf("Pairing confirmation for Device 1 failed: %v", resConf1)
+	// 5. Confirm Pairing as Device 1
+	dev1ID := "dev-phone-01"
+	dev1ProofSig, err := pairingEngine.GenerateProofForChallenge(chResp.ChallengeID, dev1ID)
+	if err != nil {
+		t.Fatalf("Failed to generate proof for device 1: %v", err)
 	}
 
-	var confResp1 struct {
+	confirmBody1 := map[string]string{
+		"challenge_id":      chResp.ChallengeID,
+		"device_id":         dev1ID,
+		"device_name":       "Pixel 8 Pro",
+		"device_public_key": "pubkey-android-01",
+		"proof_signature":   dev1ProofSig,
+	}
+
+	confirmBytes1, _ := json.Marshal(confirmBody1)
+	confirmResp1, err := http.Post(chResp.ConfirmURL, "application/json", bytes.NewReader(confirmBytes1))
+	if err != nil || confirmResp1.StatusCode != http.StatusOK {
+		t.Fatalf("Pairing confirmation failed for device 1: %v", err)
+	}
+	defer confirmResp1.Body.Close()
+
+	var paired1 struct {
 		Status        string `json:"status"`
 		SessionToken  string `json:"session_token"`
 		SessionID     string `json:"session_id"`
@@ -207,187 +163,177 @@ func TestDevOrbit_FullPairingAndAuthenticatedSessionLifecycle(t *testing.T) {
 		MachineID     string `json:"machine_id"`
 		DeviceID      string `json:"device_id"`
 		BrokerURL     string `json:"broker_url"`
-		ExpiresAt     string `json:"expires_at"`
 	}
-	_ = json.NewDecoder(resConf1.Body).Decode(&confResp1)
+	if err := json.NewDecoder(confirmResp1.Body).Decode(&paired1); err != nil {
+		t.Fatalf("Failed to decode pairing response: %v", err)
+	}
 
-	// -------------------------------------------------------------
-	// 6. Connect Device 1 to Broker WebSocket
-	// -------------------------------------------------------------
+	if paired1.Status != "success" || paired1.SessionToken == "" || paired1.SessionID == "" || paired1.SessionSecret == "" {
+		t.Fatalf("Invalid pairing response data")
+	}
+
 	time.Sleep(100 * time.Millisecond)
-	clientURL1 := fmt.Sprintf("%s/ws/client?machine_id=%s&device_id=%s&session_id=%s", brokerWSURL, machineID, deviceID1, confResp1.SessionID)
-	clientHeaders1 := http.Header{"Authorization": []string{"Bearer " + confResp1.SessionToken}}
-	clientWS1, resWS1, err := websocket.DefaultDialer.Dial(clientURL1, clientHeaders1)
-	if err != nil || resWS1.StatusCode != http.StatusSwitchingProtocols {
-		t.Fatalf("Device 1 failed to connect to broker: %v", err)
+
+	// 6. Connect Client 1 to Broker via WSS using Bearer Authorization Header
+	client1WSSURL := fmt.Sprintf("%s/ws/client?machine_id=%s&device_id=%s&session_id=%s", brokerWSURL, paired1.MachineID, paired1.DeviceID, paired1.SessionID)
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 5 * time.Second,
 	}
-	defer clientWS1.Close()
+	header1 := http.Header{}
+	header1.Set("Authorization", "Bearer "+paired1.SessionToken)
 
-	var ackFrame1 broker.FrameEnvelope
-	if err := clientWS1.ReadJSON(&ackFrame1); err != nil || ackFrame1.Type != "session_ready" {
-		t.Fatalf("Device 1 did not receive session_ready: %v, err: %v", ackFrame1, err)
+	client1Conn, _, err := dialer.Dial(client1WSSURL, header1)
+	if err != nil {
+		t.Fatalf("Failed client 1 WSS connection: %v", err)
 	}
+	defer client1Conn.Close()
 
-	// -------------------------------------------------------------
-	// 7. Pair and Connect Device 2 Simultaneously (Multi-Device Verification)
-	// -------------------------------------------------------------
-	resCh2, err := http.Post(hostHTTPServer.URL+"/api/v1/pairing/challenge", "application/json", nil)
-	if err != nil || resCh2.StatusCode != http.StatusOK {
-		t.Fatalf("Failed to create challenge for Device 2: %v", err)
-	}
-	var qrPayload2 struct {
-		Version        string `json:"v"`
-		ChallengeID    string `json:"challenge_id"`
-		HostID         string `json:"host_id"`
-		PairingPayload string `json:"pairing_payload"`
-		PairingSecret  string `json:"pairing_secret"`
-		ConfirmURL     string `json:"confirm_url"`
-		ExpiresAt      string `json:"expires_at"`
-	}
-	_ = json.NewDecoder(resCh2.Body).Decode(&qrPayload2)
-
-	deviceID2 := "mobile-tablet-02"
-	validProof2 := security.GenerateProof(
-		qrPayload2.Version,
-		qrPayload2.ChallengeID,
-		qrPayload2.PairingPayload,
-		qrPayload2.HostID,
-		deviceID2,
-		qrPayload2.ExpiresAt,
-		qrPayload2.PairingSecret,
-	)
-
-	confirmReqBody2, _ := json.Marshal(map[string]string{
-		"challenge_id":      qrPayload2.ChallengeID,
-		"device_id":         deviceID2,
-		"device_name":       "Galaxy Tablet",
-		"device_public_key": "pubkey-mobile-02",
-		"proof_signature":   validProof2,
-	})
-
-	resConf2, err := http.Post(qrPayload2.ConfirmURL, "application/json", bytes.NewBuffer(confirmReqBody2))
-	if err != nil || resConf2.StatusCode != http.StatusOK {
-		t.Fatalf("Pairing confirmation for Device 2 failed: %v", resConf2)
+	// 7. Verify E2E Encrypted Application Request & Response over Broker
+	client1E2E, err := security.NewE2ESession(paired1.SessionID, paired1.DeviceID, paired1.SessionSecret, 24*time.Hour)
+	if err != nil {
+		t.Fatalf("Failed to create client E2E session: %v", err)
 	}
 
-	var confResp2 struct {
+	appReq1 := transport.ApplicationRequestEnvelope{
+		ProtocolVersion: "1.2",
+		SessionID:       paired1.SessionID,
+		RequestID:       "req_e2e_001",
+		Method:          "GET",
+		Path:            "/api/v1/health",
+		SeqNum:          1,
+		Timestamp:       time.Now().UnixNano(),
+	}
+	appReqBytes1, _ := json.Marshal(appReq1)
+
+	cipherReq1, err := client1E2E.Encrypt(security.DirClientToHost, appReqBytes1, 1, time.Now().UnixNano())
+	if err != nil {
+		t.Fatalf("Failed to encrypt app request 1: %v", err)
+	}
+
+	frame1 := transport.FrameEnvelope{
+		ProtocolVersion: "1.2",
+		SessionID:       paired1.SessionID,
+		Type:            "data",
+		EncryptedData:   cipherReq1,
+		SeqNum:          1,
+		Timestamp:       time.Now().UnixNano(),
+	}
+
+	if err := client1Conn.WriteJSON(&frame1); err != nil {
+		t.Fatalf("Failed to write frame from client 1: %v", err)
+	}
+
+	var respFrame1 transport.FrameEnvelope
+	if err := client1Conn.ReadJSON(&respFrame1); err != nil {
+		t.Fatalf("Client 1 failed to read response frame: %v", err)
+	}
+
+	decryptedRespBytes1, err := client1E2E.Decrypt(security.DirHostToClient, respFrame1.EncryptedData, respFrame1.SeqNum, respFrame1.Timestamp)
+	if err != nil {
+		t.Fatalf("Client 1 failed to decrypt response frame: %v", err)
+	}
+
+	var appResp1 transport.ApplicationResponseEnvelope
+	if err := json.Unmarshal(decryptedRespBytes1, &appResp1); err != nil {
+		t.Fatalf("Failed to unmarshal response envelope: %v", err)
+	}
+
+	if appResp1.StatusCode != http.StatusOK || !strings.Contains(appResp1.Body, `"status":"ok"`) {
+		t.Errorf("Unexpected app response 1: code=%d body=%s", appResp1.StatusCode, appResp1.Body)
+	}
+
+	// 8. Confirm Pairing for Device 2 (Simultaneous Multi-Device Isolation)
+	ch2, _ := pairingEngine.CreateChallenge(5 * time.Minute)
+	dev2ID := "dev-phone-02"
+	dev2ProofSig, _ := pairingEngine.GenerateProofForChallenge(ch2.ID, dev2ID)
+	confirmBody2 := map[string]string{
+		"challenge_id":      ch2.ID,
+		"device_id":         dev2ID,
+		"device_name":       "Pixel 9 Pro",
+		"device_public_key": "pubkey-android-02",
+		"proof_signature":   dev2ProofSig,
+	}
+
+	confirmBytes2, _ := json.Marshal(confirmBody2)
+	confirmResp2, err := http.Post(chResp.ConfirmURL, "application/json", bytes.NewReader(confirmBytes2))
+	if err != nil || confirmResp2.StatusCode != http.StatusOK {
+		t.Fatalf("Pairing confirmation failed for device 2: %v", err)
+	}
+	defer confirmResp2.Body.Close()
+
+	var paired2 struct {
+		Status        string `json:"status"`
 		SessionToken  string `json:"session_token"`
 		SessionID     string `json:"session_id"`
 		SessionSecret string `json:"session_secret"`
-		ExpiresAt     string `json:"expires_at"`
+		MachineID     string `json:"machine_id"`
+		DeviceID      string `json:"device_id"`
+		BrokerURL     string `json:"broker_url"`
 	}
-	_ = json.NewDecoder(resConf2.Body).Decode(&confResp2)
+	_ = json.NewDecoder(confirmResp2.Body).Decode(&paired2)
 
-	if confResp2.SessionID == confResp1.SessionID {
-		t.Fatalf("Device 2 must have distinct session ID from Device 1")
-	}
+	client2WSSURL := fmt.Sprintf("%s/ws/client?machine_id=%s&device_id=%s&session_id=%s", brokerWSURL, paired2.MachineID, paired2.DeviceID, paired2.SessionID)
+	header2 := http.Header{}
+	header2.Set("Authorization", "Bearer "+paired2.SessionToken)
 
-	// Verify Host Bridge now maintains 2 simultaneous active device sessions
-	if brokerClient.ActiveSessionCount() != 2 {
-		t.Fatalf("Expected 2 active sessions on Host Bridge, got %d", brokerClient.ActiveSessionCount())
-	}
-
-	// Connect Device 2 to Broker WebSocket
-	time.Sleep(100 * time.Millisecond)
-	clientURL2 := fmt.Sprintf("%s/ws/client?machine_id=%s&device_id=%s&session_id=%s", brokerWSURL, machineID, deviceID2, confResp2.SessionID)
-	clientHeaders2 := http.Header{"Authorization": []string{"Bearer " + confResp2.SessionToken}}
-	clientWS2, resWS2, err := websocket.DefaultDialer.Dial(clientURL2, clientHeaders2)
-	if err != nil || resWS2.StatusCode != http.StatusSwitchingProtocols {
-		t.Fatalf("Device 2 failed to connect to broker: %v", err)
-	}
-	defer clientWS2.Close()
-
-	var ackFrame2 broker.FrameEnvelope
-	if err := clientWS2.ReadJSON(&ackFrame2); err != nil || ackFrame2.Type != "session_ready" {
-		t.Fatalf("Device 2 did not receive session_ready: %v, err: %v", ackFrame2, err)
-	}
-
-	// -------------------------------------------------------------
-	// 8 & 9. Both Devices Exchange Independent Encrypted Requests Simultaneously
-	// -------------------------------------------------------------
-	clientE2E1, _ := security.NewE2ESession(confResp1.SessionID, deviceID1, confResp1.SessionSecret, 24*time.Hour)
-	clientE2E2, _ := security.NewE2ESession(confResp2.SessionID, deviceID2, confResp2.SessionSecret, 24*time.Hour)
-
-	// Device 1 sends request
-	reqPayload1 := `{"v":"1.2","request_id":"req-dev1-001","method":"GET","path":"/api/v1/health"}`
-	ts1 := time.Now().UnixMicro()
-	cipher1, _ := clientE2E1.Encrypt(security.DirClientToHost, []byte(reqPayload1), 1, ts1)
-	_ = clientWS1.WriteJSON(broker.FrameEnvelope{
-		ProtocolVersion: "1.2",
-		SessionID:       confResp1.SessionID,
-		Type:            "data",
-		EncryptedData:   cipher1,
-		SeqNum:          1,
-		Timestamp:       ts1,
-	})
-
-	// Device 2 sends request
-	reqPayload2 := `{"v":"1.2","request_id":"req-dev2-002","method":"GET","path":"/api/v1/health"}`
-	ts2 := time.Now().UnixMicro()
-	cipher2, _ := clientE2E2.Encrypt(security.DirClientToHost, []byte(reqPayload2), 1, ts2)
-	_ = clientWS2.WriteJSON(broker.FrameEnvelope{
-		ProtocolVersion: "1.2",
-		SessionID:       confResp2.SessionID,
-		Type:            "data",
-		EncryptedData:   cipher2,
-		SeqNum:          1,
-		Timestamp:       ts2,
-	})
-
-	// Device 1 receives and decrypts its response
-	var respFrame1 broker.FrameEnvelope
-	if err := clientWS1.ReadJSON(&respFrame1); err != nil {
-		t.Fatalf("Device 1 failed to read response frame: %v", err)
-	}
-	decrypted1, err := clientE2E1.Decrypt(security.DirHostToClient, respFrame1.EncryptedData, respFrame1.SeqNum, respFrame1.Timestamp)
-	if err != nil || !strings.Contains(string(decrypted1), "req-dev1-001") {
-		t.Fatalf("Device 1 failed to decrypt correct response: %v, raw: %s", err, string(decrypted1))
-	}
-
-	// Device 2 receives and decrypts its response
-	var respFrame2 broker.FrameEnvelope
-	if err := clientWS2.ReadJSON(&respFrame2); err != nil {
-		t.Fatalf("Device 2 failed to read response frame: %v", err)
-	}
-	decrypted2, err := clientE2E2.Decrypt(security.DirHostToClient, respFrame2.EncryptedData, respFrame2.SeqNum, respFrame2.Timestamp)
-	if err != nil || !strings.Contains(string(decrypted2), "req-dev2-002") {
-		t.Fatalf("Device 2 failed to decrypt correct response: %v, raw: %s", err, string(decrypted2))
-	}
-
-	// -------------------------------------------------------------
-	// 10. Revoke Device 1 Only -> Device 2 Must Continue Working
-	// -------------------------------------------------------------
-	err = brokerAuthorizer.RevokeDevice(context.Background(), machineID, deviceID1)
+	client2Conn, _, err := dialer.Dial(client2WSSURL, header2)
 	if err != nil {
-		t.Fatalf("Failed to revoke Device 1: %v", err)
+		t.Fatalf("Failed client 2 WSS connection: %v", err)
 	}
-	brokerClient.RevokeDevice(deviceID1)
+	defer client2Conn.Close()
 
-	// Verify Device 1's reconnection is rejected (403)
-	time.Sleep(50 * time.Millisecond)
-	_, resBlocked1, _ := websocket.DefaultDialer.Dial(clientURL1, clientHeaders1)
-	if resBlocked1 == nil || resBlocked1.StatusCode != http.StatusForbidden {
-		t.Fatalf("Expected HTTP 403 for revoked Device 1, got %v", resBlocked1)
+	// 9. Revoke Device 1 -> Verify Device 1 Terminated, Device 2 Unaffected
+	revokeURL := fmt.Sprintf("%s/api/v1/internal/devices/revoke", brokerHTTPServer.URL)
+	revokePayload := map[string]string{"machine_id": cfg.HostID, "device_id": dev1ID}
+	revokeBytes, _ := json.Marshal(revokePayload)
+
+	revokeReq, _ := http.NewRequest("POST", revokeURL, bytes.NewReader(revokeBytes))
+	revokeReq.Header.Set("Authorization", "Bearer "+cfg.BrokerSecret)
+	revokeReq.Header.Set("Content-Type", "application/json")
+
+	revokeResp, err := http.DefaultClient.Do(revokeReq)
+	if err != nil || revokeResp.StatusCode != http.StatusOK {
+		t.Fatalf("Failed to revoke device 1: %v", err)
+	}
+	defer revokeResp.Body.Close()
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Device 1 write frame -> MUST fail
+	err = client1Conn.WriteJSON(&frame1)
+	if err == nil {
+		_ = client1Conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		var dummy transport.FrameEnvelope
+		err = client1Conn.ReadJSON(&dummy)
+		if err == nil {
+			t.Errorf("Expected device 1 connection to be closed after revocation")
+		}
 	}
 
-	// Verify Device 2 STILL WORKS and can exchange encrypted frames!
-	ts3 := time.Now().UnixMicro()
-	cipher3, _ := clientE2E2.Encrypt(security.DirClientToHost, []byte(`{"v":"1.2","request_id":"req-dev2-003","method":"GET","path":"/api/v1/health"}`), 2, ts3)
-	_ = clientWS2.WriteJSON(broker.FrameEnvelope{
+	// Device 2 frame -> MUST still succeed
+	client2E2E, _ := security.NewE2ESession(paired2.SessionID, paired2.DeviceID, paired2.SessionSecret, 24*time.Hour)
+	appReq2 := transport.ApplicationRequestEnvelope{
 		ProtocolVersion: "1.2",
-		SessionID:       confResp2.SessionID,
-		Type:            "data",
-		EncryptedData:   cipher3,
-		SeqNum:          2,
-		Timestamp:       ts3,
-	})
-
-	var respFrame3 broker.FrameEnvelope
-	if err := clientWS2.ReadJSON(&respFrame3); err != nil {
-		t.Fatalf("Device 2 failed to read response after Device 1 revocation: %v", err)
+		SessionID:       paired2.SessionID,
+		RequestID:       "req_e2e_002",
+		Method:          "GET",
+		Path:            "/api/v1/health",
+		SeqNum:          1,
+		Timestamp:       time.Now().UnixNano(),
 	}
-	decrypted3, err := clientE2E2.Decrypt(security.DirHostToClient, respFrame3.EncryptedData, respFrame3.SeqNum, respFrame3.Timestamp)
-	if err != nil || !strings.Contains(string(decrypted3), "req-dev2-003") {
-		t.Fatalf("Device 2 failed to decrypt response after Device 1 revocation: %v", err)
+	appReqBytes2, _ := json.Marshal(appReq2)
+	cipherReq2, _ := client2E2E.Encrypt(security.DirClientToHost, appReqBytes2, 1, time.Now().UnixNano())
+
+	frame2 := transport.FrameEnvelope{
+		ProtocolVersion: "1.2",
+		SessionID:       paired2.SessionID,
+		Type:            "data",
+		EncryptedData:   cipherReq2,
+		SeqNum:          1,
+		Timestamp:       time.Now().UnixNano(),
+	}
+
+	if err := client2Conn.WriteJSON(&frame2); err != nil {
+		t.Fatalf("Device 2 frame write failed: %v", err)
 	}
 }

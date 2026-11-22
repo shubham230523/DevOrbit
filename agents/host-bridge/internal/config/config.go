@@ -124,7 +124,10 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("%w: invalid DEVORBIT_BROKER_HTTP_URL: %v", ErrInvalidConfig, err)
 	}
 	if httpParsed.User != nil {
-		return nil, fmt.Errorf("%w: DEVORBIT_BROKER_HTTP_URL must not contain credentials", ErrInvalidConfig)
+		return nil, fmt.Errorf("%w: DEVORBIT_BROKER_HTTP_URL must not contain embedded credentials", ErrInvalidConfig)
+	}
+	if httpParsed.RawQuery != "" || httpParsed.Fragment != "" {
+		return nil, fmt.Errorf("%w: DEVORBIT_BROKER_HTTP_URL must not contain query parameters or fragments", ErrInvalidConfig)
 	}
 	if env == "production" && strings.ToLower(httpParsed.Scheme) != "https" {
 		return nil, fmt.Errorf("%w: DEVORBIT_BROKER_HTTP_URL '%s' must use https:// in production", ErrInsecureSchemeProd, brokerHTTPURL)
@@ -139,7 +142,10 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("%w: invalid DEVORBIT_BROKER_WS_URL: %v", ErrInvalidConfig, err)
 	}
 	if wsParsed.User != nil {
-		return nil, fmt.Errorf("%w: DEVORBIT_BROKER_WS_URL must not contain credentials", ErrInvalidConfig)
+		return nil, fmt.Errorf("%w: DEVORBIT_BROKER_WS_URL must not contain embedded credentials", ErrInvalidConfig)
+	}
+	if wsParsed.RawQuery != "" || wsParsed.Fragment != "" {
+		return nil, fmt.Errorf("%w: DEVORBIT_BROKER_WS_URL must not contain query parameters or fragments", ErrInvalidConfig)
 	}
 	if env == "production" && strings.ToLower(wsParsed.Scheme) != "wss" {
 		return nil, fmt.Errorf("%w: DEVORBIT_BROKER_WS_URL '%s' must use wss:// in production", ErrInsecureSchemeProd, brokerWSURL)
@@ -229,7 +235,7 @@ func LoadConfig() (*Config, error) {
 		HostID:          hostID,
 		HostName:        hostName,
 		HostSecret:      hostSecret,
-		BrokerURL:       brokerWSURL, // Legacy field points to WebSocket endpoint
+		BrokerURL:       brokerWSURL,
 		BrokerHTTPURL:   brokerHTTPURL,
 		BrokerWSURL:     brokerWSURL,
 		BrokerSecret:    brokerSecret,

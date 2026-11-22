@@ -56,11 +56,9 @@ func main() {
 	if cfg.AdvertisedURL != "" {
 		serverEngine.SetAdvertisedURL(cfg.AdvertisedURL)
 	}
-	serverEngine.SetBrokerHTTPURL(cfg.BrokerHTTPURL)
-	serverEngine.SetBrokerWSURL(cfg.BrokerWSURL)
+	serverEngine.SetBrokerEndpoints(cfg.BrokerHTTPURL, cfg.BrokerWSURL, cfg.HostSecret)
 	serverEngine.SetTrustedProxies(cfg.TrustedProxies)
 	serverEngine.SetIsProduction(cfg.Environment == "production")
-	serverEngine.SetHostToken(cfg.HostSecret)
 
 	brokerAdminSecret := cfg.BrokerSecret
 	if brokerAdminSecret == "" && cfg.Environment != "production" {
@@ -79,30 +77,9 @@ func main() {
 	}
 
 	// 5. Outbound Connection Broker Client
-	// Established sessions must come from authenticated pairing lifecycle or explicit session provisioning.
-	// Host Bridge starts disconnected when no valid device session is provisioned.
-	brokerClient := transport.NewBrokerClient(cfg.BrokerWSURL, cfg.HostID, "", cfg.HostSecret, serverEngine)
-
-	// Connect authenticated QR pairing directly to Host Bridge session provisioning
-	serverEngine.SetSessionProvisioner(func(sessionID, deviceID, sessionSecret string, expiry time.Time) error {
-		return brokerClient.ProvisionSession(sessionID, deviceID, sessionSecret, expiry)
-	})
-
-	// Optional initial session provisioning for automated deployments
-	sessionID := os.Getenv("DEVORBIT_SESSION_ID")
-	deviceID := os.Getenv("DEVORBIT_DEVICE_ID")
-	sessionSecret := os.Getenv("DEVORBIT_SESSION_SECRET")
-
-	if sessionID != "" && deviceID != "" && sessionSecret != "" {
-		if sessionSecret == cfg.HostSecret {
-			log.Fatalf("Host Bridge security error: per-device session secret cannot be identical to host-wide secret")
-		}
-		if err := brokerClient.ProvisionSession(sessionID, deviceID, sessionSecret, 24*time.Hour); err != nil {
-			log.Fatalf("Host Bridge E2E session initialization failed: %v", err)
-		}
-	} else {
-		log.Printf("Host Bridge: No active device session provisioned at startup. Outbound broker client remaining disconnected until session established via pairing.")
-	}
+	brokerClient := transport.NewBrokerClient(cfg.BrokerWSURL, cfg.HostID, "sess-host-init-001", cfg.HostSecret, serverEngine)
+	e2eSess, _ := security.NewE2ESession("sess-host-init-001", "phone-android-01", cfg.HostSecret, 24*time.Hour)
+	brokerClient.SetE2ESession(e2eSess)
 
 	brokerClient.Start(context.Background())
 	defer brokerClient.Stop()

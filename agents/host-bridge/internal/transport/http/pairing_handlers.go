@@ -29,7 +29,7 @@ func (s *Server) HandleCreatePairingChallenge(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	clientIP := r.RemoteAddr
+	clientIP := ExtractIP(r.RemoteAddr)
 	if s.rateLimiter != nil {
 		if err := s.rateLimiter.Allow(clientIP); err != nil {
 			writeError(w, http.StatusTooManyRequests, err.Error())
@@ -62,19 +62,8 @@ func (s *Server) HandleCreatePairingChallenge(w http.ResponseWriter, r *http.Req
 		}
 	} else {
 		if confirmBaseURL == "" {
-			remoteIP := r.RemoteAddr
-			if idx := strings.LastIndex(remoteIP, ":"); idx != -1 {
-				remoteIP = remoteIP[:idx]
-			}
-			remoteIP = strings.Trim(remoteIP, "[]")
-
-			isTrustedProxy := false
-			for _, tp := range s.trustedProxies {
-				if tp == remoteIP || tp == "127.0.0.1" || tp == "::1" || tp == "localhost" {
-					isTrustedProxy = true
-					break
-				}
-			}
+			// Check if requester IP matches trusted reverse proxies safely
+			isTrustedProxy := IsTrustedProxy(r.RemoteAddr, s.trustedProxies)
 
 			scheme := "http"
 			host := ""
@@ -141,7 +130,7 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clientIP := r.RemoteAddr
+	clientIP := ExtractIP(r.RemoteAddr)
 	if s.rateLimiter != nil {
 		if err := s.rateLimiter.Allow(clientIP); err != nil {
 			writeError(w, http.StatusTooManyRequests, err.Error())
@@ -209,10 +198,11 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 	}
 	sessionSecret := hex.EncodeToString(secretBytes)
 
-	// 1. Authorize session with Connection Broker first
+	// Authoritative UTC expiration timestamp calculated ONCE
 	ttl := 24 * time.Hour
 	expiry := time.Now().UTC().Add(ttl)
 
+	// 1. Authorize session with Connection Broker using exact authoritative expiry timestamp
 	if s.brokerAuthorizer != nil {
 		err := s.brokerAuthorizer.AuthorizeSession(
 			r.Context(),
@@ -221,7 +211,7 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 			sessionID,
 			token,
 			s.hostToken,
-			ttl,
+			expiry,
 		)
 		if err != nil {
 			writeError(w, http.StatusBadGateway, "failed to register session authorization with connection broker: "+err.Error())
@@ -229,7 +219,7 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 2. Connect verified pairing directly to Host Bridge session provisioning
+	// 2. Provision session on Host Bridge using exact authoritative expiry timestamp
 	if s.sessionProvisioner != nil {
 		if err := s.sessionProvisioner(sessionID, req.DeviceID, sessionSecret, expiry); err != nil {
 			if s.brokerAuthorizer != nil {

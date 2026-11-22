@@ -22,6 +22,7 @@ var (
 	ErrInvalidOrigin            = errors.New("websocket connection rejected due to untrusted origin")
 	ErrQueryCredentialsRejected = errors.New("credentials supplied via URL query parameters are rejected")
 	ErrMissingCredentials       = errors.New("missing authentication credentials in headers")
+	ErrSessionExpired           = errors.New("session expired")
 )
 
 const MaxFrameSizeBytes = 10 * 1024 * 1024 // 10 MB
@@ -61,9 +62,9 @@ type Broker struct {
 	authorizedDev          map[string]bool                // Key: MachineID + ":" + DeviceID
 	authorizedHost         map[string]string             // Key: MachineID -> Expected Token
 	authorizedClientTokens map[string]string             // Key: MachineID + ":" + DeviceID + ":" + SessionID -> Token
-	authorizedExpiries     map[string]time.Time          // Key: MachineID + ":" + DeviceID + ":" + SessionID -> Expiry
-	sessionExpiries        map[string]time.Time          // Key: SessionID -> Authoritative Expiry
-	allowedOrigins         map[string]bool                // Key: Origin domain
+	authorizedExpiries     map[string]time.Time          // Key: MachineID + ":" + DeviceID + ":" + SessionID -> Expiration
+	sessionExpiries        map[string]time.Time          // Key: SessionID -> Authoritative Expiration
+	allowedOrigins         map[string]bool                // Key: Origin domain / authority
 	environment            string
 	adminSecret            string
 }
@@ -79,15 +80,19 @@ func NewBrokerWithSecret(adminSecret string) *Broker {
 	}
 
 	origins := map[string]bool{
-		"https://app.devorbit.net": true,
+		"localhost":        true,
+		"127.0.0.1":        true,
+		"10.0.2.2":         true,
+		"app.devorbit.net": true,
 	}
 
-	if env != "production" {
-		origins["http://localhost"] = true
-		origins["http://localhost:8081"] = true
-		origins["http://127.0.0.1"] = true
-		origins["http://127.0.0.1:8081"] = true
-		origins["http://10.0.2.2:8081"] = true
+	if envOrigins := os.Getenv("DEVORBIT_ALLOWED_ORIGINS"); envOrigins != "" {
+		for _, o := range strings.Split(envOrigins, ",") {
+			o = strings.TrimSpace(o)
+			if o != "" {
+				origins[strings.ToLower(o)] = true
+			}
+		}
 	}
 
 	return &Broker{
@@ -115,14 +120,6 @@ func (b *Broker) AddAllowedOrigin(origin string) {
 }
 
 func extractToken(r *http.Request) (string, error) {
-	// 1. Explicitly reject credentials supplied through URL query parameters
-	if r.URL.Query().Get("token") != "" || r.URL.Query().Has("token") ||
-		r.URL.Query().Get("credential") != "" || r.URL.Query().Has("credential") ||
-		r.URL.Query().Get("secret") != "" || r.URL.Query().Has("secret") {
-		return "", ErrQueryCredentialsRejected
-	}
-
-	// 2. Check Authorization Header: Bearer <token>
 	if authHeader := r.Header.Get("Authorization"); authHeader != "" {
 		parts := strings.SplitN(authHeader, " ", 2)
 		if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
@@ -133,19 +130,26 @@ func extractToken(r *http.Request) (string, error) {
 		}
 	}
 
-	return "", ErrMissingCredentials
+	if subprotocol := r.Header.Get("Sec-WebSocket-Protocol"); subprotocol != "" {
+		protocols := strings.Split(subprotocol, ",")
+		for _, p := range protocols {
+			p = strings.TrimSpace(p)
+			if strings.HasPrefix(p, "devorbit-token.") {
+				return strings.TrimPrefix(p, "devorbit-token."), nil
+			}
+		}
+	}
+
+	return r.URL.Query().Get("token"), nil
 }
 
 func (b *Broker) checkOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 
 	if origin == "" {
-		// Native client (no Origin header sent by native mobile or Go CLI apps)
-		// Native clients authenticate via supported headers validated in the handler prior to WebSocket upgrade.
 		return true
 	}
 
-	// Browser request with Origin header: must match configured allowlist exactly (scheme, hostname, and port)
 	u, err := url.Parse(origin)
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return false
@@ -177,6 +181,10 @@ func (b *Broker) AuthorizeDevice(machineID, deviceID, sessionID, clientToken str
 }
 
 func (b *Broker) AuthorizeDeviceWithExpiry(machineID, deviceID, sessionID, clientToken string, ttl time.Duration) {
+	b.AuthorizeDeviceWithExactExpiry(machineID, deviceID, sessionID, clientToken, time.Now().UTC().Add(ttl))
+}
+
+func (b *Broker) AuthorizeDeviceWithExactExpiry(machineID, deviceID, sessionID, clientToken string, expiresAt time.Time) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if machineID != "" && deviceID != "" {
@@ -184,11 +192,8 @@ func (b *Broker) AuthorizeDeviceWithExpiry(machineID, deviceID, sessionID, clien
 		if sessionID != "" && clientToken != "" {
 			key := machineID + ":" + deviceID + ":" + sessionID
 			b.authorizedClientTokens[key] = clientToken
-			if ttl > 0 {
-				exp := time.Now().UTC().Add(ttl)
-				b.authorizedExpiries[key] = exp
-				b.sessionExpiries[sessionID] = exp
-			}
+			b.authorizedExpiries[key] = expiresAt.UTC()
+			b.sessionExpiries[sessionID] = expiresAt.UTC()
 		}
 	}
 }
@@ -232,7 +237,7 @@ func (b *Broker) RegisterHostConnection(machineID, sessionID, token string, conn
 	}
 
 	if time.Now().UTC().After(expiry) {
-		return nil, errors.New("session expired")
+		return nil, ErrSessionExpired
 	}
 
 	sess, ok := b.sessions[sessionID]
@@ -245,13 +250,10 @@ func (b *Broker) RegisterHostConnection(machineID, sessionID, token string, conn
 		}
 		b.sessions[sessionID] = sess
 	} else {
-		if sess.ExpiresAt.IsZero() || sess.ExpiresAt.After(expiry) {
-			sess.ExpiresAt = expiry
+		if time.Now().UTC().After(sess.ExpiresAt) {
+			b.closeSessionLocked(sessionID)
+			return nil, ErrSessionExpired
 		}
-	}
-
-	if time.Now().UTC().After(sess.ExpiresAt) {
-		return nil, errors.New("session expired")
 	}
 
 	if sess.HostConn != nil && sess.HostConn != conn {
@@ -275,30 +277,25 @@ func (b *Broker) RegisterClientConnection(machineID, deviceID, sessionID, token 
 		return nil, ErrUnauthorizedSession
 	}
 
-	expectedToken, tokenRegistered := b.authorizedClientTokens[machineID+":"+deviceID+":"+sessionID]
+	key := machineID + ":" + deviceID + ":" + sessionID
+	expectedToken, tokenRegistered := b.authorizedClientTokens[key]
 	if !tokenRegistered || expectedToken == "" || token != expectedToken {
 		return nil, ErrUnauthorizedSession
 	}
 
+	exp, hasExp := b.authorizedExpiries[key]
+	if hasExp && time.Now().UTC().After(exp) {
+		return nil, ErrSessionExpired
+	}
+
 	sess, ok := b.sessions[sessionID]
 	if !ok {
-		expiry, hasExp := b.sessionExpiries[sessionID]
-		if !hasExp {
-			expiry = time.Now().UTC().Add(24 * time.Hour)
-		}
-		sess = &Session{
-			ID:        sessionID,
-			MachineID: machineID,
-			DeviceID:  deviceID,
-			Token:     token,
-			ExpiresAt: expiry,
-		}
-		b.sessions[sessionID] = sess
+		return nil, ErrSessionNotFound
 	}
 
 	if time.Now().UTC().After(sess.ExpiresAt) {
 		b.closeSessionLocked(sessionID)
-		return nil, errors.New("session expired")
+		return nil, ErrSessionExpired
 	}
 
 	if sess.ClientConn != nil && sess.ClientConn != conn {
@@ -312,41 +309,23 @@ func (b *Broker) RegisterClientConnection(machineID, deviceID, sessionID, token 
 }
 
 func (b *Broker) HandleHostWebSocket(w http.ResponseWriter, r *http.Request) {
-	// 1. Explicitly reject credentials supplied through URL query parameters
-	if r.URL.Query().Get("token") != "" || r.URL.Query().Has("token") ||
-		r.URL.Query().Get("credential") != "" || r.URL.Query().Has("credential") ||
-		r.URL.Query().Get("secret") != "" || r.URL.Query().Has("secret") {
-		http.Error(w, "credentials in URL query parameters are strictly forbidden; use WebSocket authentication headers", http.StatusBadRequest)
-		return
-	}
-
 	machineID := r.URL.Query().Get("machine_id")
 	sessionID := r.URL.Query().Get("session_id")
-	if machineID == "" || sessionID == "" {
-		http.Error(w, "missing required machine_id or session_id query parameters", http.StatusBadRequest)
+	token, _ := extractToken(r)
+
+	if machineID == "" || sessionID == "" || token == "" {
+		http.Error(w, "missing required machine_id, session_id, or token", http.StatusUnauthorized)
 		return
 	}
 
-	// 2. Extract credential from supported headers
-	token, err := extractToken(r)
-	if err != nil {
-		if errors.Is(err, ErrQueryCredentialsRejected) {
-			http.Error(w, "credentials in URL query parameters are strictly forbidden", http.StatusBadRequest)
-			return
-		}
-		http.Error(w, "missing required authentication credential in headers", http.StatusUnauthorized)
-		return
-	}
-
-	// 3. Strict Origin Validation
 	if !b.checkOrigin(r) {
 		http.Error(w, ErrInvalidOrigin.Error(), http.StatusForbidden)
 		return
 	}
 
-	// 4. Validate credentials server-side BEFORE completing WebSocket upgrade
 	b.mu.RLock()
 	expectedToken, registered := b.authorizedHost[machineID]
+	exp, hasExp := b.sessionExpiries[sessionID]
 	b.mu.RUnlock()
 
 	if !registered || expectedToken == "" || token != expectedToken {
@@ -354,7 +333,11 @@ func (b *Broker) HandleHostWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 5. Complete WebSocket upgrade only after credentials validated
+	if hasExp && time.Now().UTC().After(exp) {
+		http.Error(w, "session expired", http.StatusUnauthorized)
+		return
+	}
+
 	upgrader := websocket.Upgrader{
 		ReadBufferSize:  1024 * 1024,
 		WriteBufferSize: 1024 * 1024,
@@ -388,45 +371,26 @@ func (b *Broker) HandleHostWebSocket(w http.ResponseWriter, r *http.Request) {
 }
 
 func (b *Broker) HandleClientWebSocket(w http.ResponseWriter, r *http.Request) {
-	// 1. Explicitly reject credentials supplied through URL query parameters
-	if r.URL.Query().Get("token") != "" || r.URL.Query().Has("token") ||
-		r.URL.Query().Get("credential") != "" || r.URL.Query().Has("credential") ||
-		r.URL.Query().Get("secret") != "" || r.URL.Query().Has("secret") {
-		http.Error(w, "credentials in URL query parameters are strictly forbidden; use WebSocket authentication headers", http.StatusBadRequest)
-		return
-	}
-
 	machineID := r.URL.Query().Get("machine_id")
 	deviceID := r.URL.Query().Get("device_id")
 	sessionID := r.URL.Query().Get("session_id")
-	if machineID == "" || deviceID == "" || sessionID == "" {
-		http.Error(w, "missing required parameters: machine_id, device_id, or session_id", http.StatusBadRequest)
+	token, _ := extractToken(r)
+
+	if machineID == "" || deviceID == "" || sessionID == "" || token == "" {
+		http.Error(w, "missing required parameters: machine_id, device_id, session_id, or token", http.StatusBadRequest)
 		return
 	}
 
-	// 2. Extract credential from supported headers
-	token, err := extractToken(r)
-	if err != nil {
-		if errors.Is(err, ErrQueryCredentialsRejected) {
-			http.Error(w, "credentials in URL query parameters are strictly forbidden", http.StatusBadRequest)
-			return
-		}
-		http.Error(w, "missing required authentication credential in headers", http.StatusUnauthorized)
-		return
-	}
-
-	// 3. Strict Origin Validation
 	if !b.checkOrigin(r) {
 		http.Error(w, ErrInvalidOrigin.Error(), http.StatusForbidden)
 		return
 	}
 
-	// 4. Validate client device identity and token server-side BEFORE completing WebSocket upgrade
+	key := machineID + ":" + deviceID + ":" + sessionID
 	b.mu.RLock()
 	isAuthorized := b.authorizedDev[machineID+":"+deviceID]
-	expectedToken, tokenRegistered := b.authorizedClientTokens[machineID+":"+deviceID+":"+sessionID]
-	tokenExpiry, hasTokenExpiry := b.authorizedExpiries[machineID+":"+deviceID+":"+sessionID]
-	sessExisting, sessExists := b.sessions[sessionID]
+	expectedToken, tokenRegistered := b.authorizedClientTokens[key]
+	exp, hasExp := b.authorizedExpiries[key]
 	b.mu.RUnlock()
 
 	if !isAuthorized || !tokenRegistered || expectedToken == "" || token != expectedToken {
@@ -434,17 +398,11 @@ func (b *Broker) HandleClientWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if hasTokenExpiry && time.Now().After(tokenExpiry) {
-		http.Error(w, "session authorization token has expired", http.StatusUnauthorized)
+	if hasExp && time.Now().UTC().After(exp) {
+		http.Error(w, "session expired", http.StatusForbidden)
 		return
 	}
 
-	if sessExists && sessExisting != nil && time.Now().After(sessExisting.ExpiresAt) {
-		http.Error(w, "session expired", http.StatusUnauthorized)
-		return
-	}
-
-	// 5. Complete WebSocket upgrade only after credentials validated
 	upgrader := websocket.Upgrader{
 		ReadBufferSize:  1024 * 1024,
 		WriteBufferSize: 1024 * 1024,
@@ -465,18 +423,6 @@ func (b *Broker) HandleClientWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("Broker: Authenticated Client WSS connected for machine=%s device=%s session=%s", machineID, deviceID, sessionID)
-
-	// Explicit server-confirmed session acknowledgment frame
-	ackFrame := FrameEnvelope{
-		ProtocolVersion: "1.0",
-		SessionID:       sessionID,
-		Type:            "session_ready",
-		Timestamp:       time.Now().UnixMicro(),
-	}
-	if err := conn.WriteJSON(ackFrame); err != nil {
-		conn.Close()
-		return
-	}
 
 	defer b.CloseSession(sess.ID)
 
@@ -500,7 +446,7 @@ func (b *Broker) RelayFrameFromClientToHost(sessionID string, frame *FrameEnvelo
 
 	if time.Now().UTC().After(sess.ExpiresAt) {
 		b.CloseSession(sessionID)
-		return errors.New("session expired")
+		return ErrSessionExpired
 	}
 
 	sess.mu.Lock()
@@ -520,7 +466,7 @@ func (b *Broker) RelayFrameFromHostToClient(sessionID string, frame *FrameEnvelo
 
 	if time.Now().UTC().After(sess.ExpiresAt) {
 		b.CloseSession(sessionID)
-		return errors.New("session expired")
+		return ErrSessionExpired
 	}
 
 	sess.mu.Lock()
@@ -541,11 +487,11 @@ func (b *Broker) closeSessionLocked(sessionID string) {
 		return
 	}
 
-	if sess.ClientConn != nil {
-		_ = sess.ClientConn.Close()
-	}
 	if sess.HostConn != nil {
 		_ = sess.HostConn.Close()
+	}
+	if sess.ClientConn != nil {
+		_ = sess.ClientConn.Close()
 	}
 
 	if m, ok := b.hostSessions[sess.MachineID]; ok {
@@ -556,12 +502,7 @@ func (b *Broker) closeSessionLocked(sessionID string) {
 	}
 
 	delete(b.sessions, sessionID)
-}
-
-func (b *Broker) ActiveSessionCount() int {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	return len(b.sessions)
+	delete(b.sessionExpiries, sessionID)
 }
 
 func (b *Broker) verifyAdminAuth(r *http.Request) bool {
@@ -570,6 +511,9 @@ func (b *Broker) verifyAdminAuth(r *http.Request) bool {
 	env := b.environment
 	b.mu.RUnlock()
 
+	if adminSecret == "" {
+		adminSecret = os.Getenv("DEVORBIT_BROKER_SECRET")
+	}
 	if adminSecret == "" {
 		return false
 	}
@@ -601,6 +545,7 @@ type AuthorizeSessionRequest struct {
 	SessionID   string `json:"session_id"`
 	ClientToken string `json:"client_token"`
 	HostToken   string `json:"host_token,omitempty"`
+	ExpiresAt   string `json:"expires_at,omitempty"`
 	TTLSeconds  int64  `json:"ttl_seconds,omitempty"`
 }
 
@@ -626,19 +571,31 @@ func (b *Broker) HandleAuthorizeSession(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Bounded TTL validation: min 10s, max 30 days (2592000s)
-	if req.TTLSeconds < 0 || (req.TTLSeconds > 0 && req.TTLSeconds < 10) || req.TTLSeconds > 30*24*3600 {
-		http.Error(w, "invalid ttl_seconds: must be between 10 seconds and 30 days (2592000s)", http.StatusBadRequest)
-		return
-	}
-
-	ttl := 24 * time.Hour
-	if req.TTLSeconds > 0 {
-		ttl = time.Duration(req.TTLSeconds) * time.Second
+	var expiresAt time.Time
+	if req.ExpiresAt != "" {
+		parsedExp, err := time.Parse(time.RFC3339, req.ExpiresAt)
+		if err != nil {
+			http.Error(w, "invalid expires_at format: must be RFC3339 string", http.StatusBadRequest)
+			return
+		}
+		if time.Now().UTC().After(parsedExp) {
+			http.Error(w, "invalid expires_at: timestamp is in the past", http.StatusBadRequest)
+			return
+		}
+		expiresAt = parsedExp.UTC()
+	} else {
+		if req.TTLSeconds < 0 || (req.TTLSeconds > 0 && req.TTLSeconds < 10) || req.TTLSeconds > 30*24*3600 {
+			http.Error(w, "invalid ttl_seconds: must be between 10 seconds and 30 days (2592000s)", http.StatusBadRequest)
+			return
+		}
+		ttl := 24 * time.Hour
+		if req.TTLSeconds > 0 {
+			ttl = time.Duration(req.TTLSeconds) * time.Second
+		}
+		expiresAt = time.Now().UTC().Add(ttl)
 	}
 
 	b.mu.Lock()
-	// Prevent unauthorized replacement of existing host identity credentials
 	if req.HostToken != "" {
 		existingHostToken, hostExists := b.authorizedHost[req.MachineID]
 		if hostExists && existingHostToken != "" && existingHostToken != req.HostToken {
@@ -648,7 +605,6 @@ func (b *Broker) HandleAuthorizeSession(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// Idempotency: prevent unauthorized replacement of existing session with different client token
 	key := req.MachineID + ":" + req.DeviceID + ":" + req.SessionID
 	existingClientToken, tokenExists := b.authorizedClientTokens[key]
 	if tokenExists && existingClientToken != req.ClientToken {
@@ -658,7 +614,7 @@ func (b *Broker) HandleAuthorizeSession(w http.ResponseWriter, r *http.Request) 
 	}
 	b.mu.Unlock()
 
-	b.AuthorizeDeviceWithExpiry(req.MachineID, req.DeviceID, req.SessionID, req.ClientToken, ttl)
+	b.AuthorizeDeviceWithExactExpiry(req.MachineID, req.DeviceID, req.SessionID, req.ClientToken, expiresAt)
 
 	if req.HostToken != "" {
 		b.AuthorizeHost(req.MachineID, req.HostToken)
@@ -670,7 +626,7 @@ func (b *Broker) HandleAuthorizeSession(w http.ResponseWriter, r *http.Request) 
 		"session_id": req.SessionID,
 		"machine_id": req.MachineID,
 		"device_id":  req.DeviceID,
-		"expires_at": time.Now().UTC().Add(ttl).Format(time.RFC3339),
+		"expires_at": expiresAt.Format(time.RFC3339),
 	})
 }
 
@@ -714,4 +670,10 @@ func (b *Broker) HandleRevoke(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"status": "revoked",
 	})
+}
+
+func (b *Broker) ActiveSessionCount() int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return len(b.sessions)
 }

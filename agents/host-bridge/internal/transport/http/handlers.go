@@ -16,17 +16,24 @@ import (
 	"devorbit.net/agents/host-bridge/internal/security"
 )
 
+type SessionProvisioner func(sessionID, deviceID, masterSecret string, expiresAt time.Time) error
+
+type BrokerAuthorizer interface {
+	AuthorizeSession(ctx context.Context, machineID, deviceID, sessionID, clientToken, hostToken string, expiresAt time.Time) error
+	RevokeDevice(ctx context.Context, machineID, deviceID string) error
+}
+
 type Server struct {
-	workspaceSvc  *application.WorkspaceService
-	filesystemSvc *application.FilesystemService
-	processSvc    *application.ProcessService
-	gitSvc        *application.GitService
-	deviceSvc     *application.DeviceService
+	workspaceSvc       *application.WorkspaceService
+	filesystemSvc      *application.FilesystemService
+	processSvc         *application.ProcessService
+	gitSvc             *application.GitService
+	deviceSvc          *application.DeviceService
 	pairingEngine      *security.PairingEngine
 	rateLimiter        *security.RateLimiter
 	idempotency        *security.IdempotencyManager
-	sessionProvisioner func(sessionID, deviceID, sessionSecret string, expiry time.Time) error
 	brokerAuthorizer   BrokerAuthorizer
+	sessionProvisioner SessionProvisioner
 	advertisedURL      string
 	brokerHTTPURL      string
 	brokerWSURL        string
@@ -36,51 +43,6 @@ type Server struct {
 	isProduction       bool
 	muxOnce            sync.Once
 	cachedMux          *http.ServeMux
-}
-
-type BrokerAuthorizer interface {
-	AuthorizeSession(ctx context.Context, machineID, deviceID, sessionID, clientToken, hostToken string, ttl time.Duration) error
-	RevokeDevice(ctx context.Context, machineID, deviceID string) error
-}
-
-func (s *Server) SetBrokerAuthorizer(authorizer BrokerAuthorizer) {
-	s.brokerAuthorizer = authorizer
-}
-
-func (s *Server) SetAdvertisedURL(url string) {
-	s.advertisedURL = url
-}
-
-func (s *Server) SetBrokerURL(url string) {
-	s.brokerURL = url
-	if s.brokerWSURL == "" {
-		s.brokerWSURL = url
-	}
-}
-
-func (s *Server) SetBrokerHTTPURL(url string) {
-	s.brokerHTTPURL = url
-}
-
-func (s *Server) SetBrokerWSURL(url string) {
-	s.brokerWSURL = url
-	s.brokerURL = url
-}
-
-func (s *Server) SetTrustedProxies(proxies []string) {
-	s.trustedProxies = proxies
-}
-
-func (s *Server) SetIsProduction(isProd bool) {
-	s.isProduction = isProd
-}
-
-func (s *Server) SetHostToken(token string) {
-	s.hostToken = token
-}
-
-func (s *Server) SetSessionProvisioner(provisioner func(sessionID, deviceID, sessionSecret string, expiry time.Time) error) {
-	s.sessionProvisioner = provisioner
 }
 
 func NewServer(
@@ -97,6 +59,36 @@ func NewServer(
 		gitSvc:        gs,
 		deviceSvc:     ds,
 	}
+}
+
+func (s *Server) SetBrokerAuthorizer(authorizer BrokerAuthorizer) {
+	s.brokerAuthorizer = authorizer
+}
+
+func (s *Server) SetSessionProvisioner(provisioner SessionProvisioner) {
+	s.sessionProvisioner = provisioner
+}
+
+func (s *Server) SetAdvertisedURL(url string) {
+	s.advertisedURL = url
+}
+
+func (s *Server) SetBrokerURL(url string) {
+	s.brokerURL = url
+}
+
+func (s *Server) SetBrokerEndpoints(httpURL, wsURL, hostToken string) {
+	s.brokerHTTPURL = httpURL
+	s.brokerWSURL = wsURL
+	s.hostToken = hostToken
+}
+
+func (s *Server) SetTrustedProxies(proxies []string) {
+	s.trustedProxies = proxies
+}
+
+func (s *Server) SetIsProduction(isProd bool) {
+	s.isProduction = isProd
 }
 
 func (s *Server) Mux() *http.ServeMux {
