@@ -111,4 +111,40 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 		}
 		s.HandleAIPrompt(w, r)
 	})
+
+	mux.HandleFunc("/api/v1/agent/tasks", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		s.HandleCreateAgentTask(w, r)
+	})
+
+	mux.HandleFunc("/api/v1/agent/tasks/approve", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		s.HandleApproveAgentTask(w, r)
+	})
+
+	mux.HandleFunc("/api/v1/agent/tasks/cancel", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		s.HandleCancelAgentTask(w, r)
+	})
+
+	mux.HandleFunc("/api/v1/agent/tasks/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/v1/agent/tasks/") {
+			if r.Method != http.MethodGet {
+				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			s.HandleGetAgentTask(w, r)
+			return
+		}
+		http.NotFound(w, r)
+	})
 }

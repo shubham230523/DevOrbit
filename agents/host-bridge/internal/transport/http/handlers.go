@@ -11,10 +11,10 @@ import (
 	"sync"
 	"time"
 
+	"devorbit.net/agents/ai-router/pkg/router"
 	"devorbit.net/agents/host-bridge/internal/application"
 	"devorbit.net/agents/host-bridge/internal/domain"
 	"devorbit.net/agents/host-bridge/internal/security"
-	"devorbit.net/agents/ai-router/pkg/router"
 )
 
 type SessionProvisioner func(sessionID, deviceID, masterSecret string, expiresAt time.Time) error
@@ -35,6 +35,7 @@ type Server struct {
 	idempotency        *security.IdempotencyManager
 	brokerAuthorizer   BrokerAuthorizer
 	sessionProvisioner SessionProvisioner
+	agentEngine        *application.GeminiAgentEngine
 	advertisedURL      string
 	brokerHTTPURL      string
 	brokerWSURL        string
@@ -71,6 +72,14 @@ func (s *Server) SetSessionProvisioner(provisioner SessionProvisioner) {
 	s.sessionProvisioner = provisioner
 }
 
+func (s *Server) SetAgentEngine(engine *application.GeminiAgentEngine) {
+	s.agentEngine = engine
+}
+
+func (s *Server) SetAIRouter(aiRouter *router.AIRouter) {
+	s.aiRouter = aiRouter
+}
+
 func (s *Server) SetAdvertisedURL(url string) {
 	s.advertisedURL = url
 }
@@ -91,10 +100,6 @@ func (s *Server) SetTrustedProxies(proxies []string) {
 
 func (s *Server) SetIsProduction(isProd bool) {
 	s.isProduction = isProd
-}
-
-func (s *Server) SetAIRouter(r *router.AIRouter) {
-	s.aiRouter = r
 }
 
 func (s *Server) Mux() *http.ServeMux {
@@ -344,36 +349,128 @@ func (s *Server) HandleListADBDevices(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, devices)
 }
 
-// HandleAIPrompt processes an AI request using the host-side AI router and Gemini provider.
 func (s *Server) HandleAIPrompt(w http.ResponseWriter, r *http.Request) {
 	if s.aiRouter == nil {
-		writeError(w, http.StatusServiceUnavailable, "AI router is not configured on this host")
+		writeError(w, http.StatusServiceUnavailable, "AI router service not configured")
 		return
 	}
 
 	var req router.GenerateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request payload: "+err.Error())
+		writeError(w, http.StatusBadRequest, "invalid request JSON")
 		return
 	}
 
-	if len(req.Messages) == 0 {
-		writeError(w, http.StatusBadRequest, "messages array cannot be empty")
-		return
-	}
-
-	// Supply Stage C tool declarations if caller didn't provide custom tools
-	if len(req.Tools) == 0 {
-		req.Tools = router.GetStageCToolDeclarations()
+	if req.Model == "" {
+		req.Model = "gemini-2.5-flash"
 	}
 
 	resp, err := s.aiRouter.Generate(r.Context(), req)
 	if err != nil {
+		if errors.Is(err, router.ErrProviderUnavailable) {
+			writeError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) HandleCreateAgentTask(w http.ResponseWriter, r *http.Request) {
+	if s.agentEngine == nil {
+		writeError(w, http.StatusInternalServerError, "agent engine not initialized")
+		return
+	}
+
+	var req struct {
+		WorkspaceID string `json:"workspace_id"`
+		Prompt      string `json:"prompt"`
+		ModelID     string `json:"model_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request JSON")
+		return
+	}
+
+	if req.WorkspaceID == "" || req.Prompt == "" {
+		writeError(w, http.StatusBadRequest, "workspace_id and prompt are required")
+		return
+	}
+
+	task, err := s.agentEngine.CreateTask(req.WorkspaceID, req.Prompt, req.ModelID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	go func() {
+		_ = s.agentEngine.RunTask(context.Background(), task.ID, "")
+	}()
+
+	writeJSON(w, http.StatusOK, task)
+}
+
+func (s *Server) HandleApproveAgentTask(w http.ResponseWriter, r *http.Request) {
+	if s.agentEngine == nil {
+		writeError(w, http.StatusInternalServerError, "agent engine not initialized")
+		return
+	}
+
+	var req struct {
+		TaskID        string `json:"task_id"`
+		ApprovalToken string `json:"approval_token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.TaskID == "" || req.ApprovalToken == "" {
+		writeError(w, http.StatusBadRequest, "task_id and approval_token are required")
+		return
+	}
+
+	go func() {
+		_ = s.agentEngine.ResumeTaskWithApproval(context.Background(), req.TaskID, req.ApprovalToken)
+	}()
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "resumed"})
+}
+
+func (s *Server) HandleGetAgentTask(w http.ResponseWriter, r *http.Request) {
+	if s.agentEngine == nil {
+		writeError(w, http.StatusInternalServerError, "agent engine not initialized")
+		return
+	}
+
+	taskID := strings.TrimPrefix(r.URL.Path, "/api/v1/agent/tasks/")
+	if taskID == "" {
+		writeError(w, http.StatusBadRequest, "task_id is required")
+		return
+	}
+
+	task, found := s.agentEngine.GetTask(taskID)
+	if !found {
+		writeError(w, http.StatusNotFound, "task not found")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, task)
+}
+
+func (s *Server) HandleCancelAgentTask(w http.ResponseWriter, r *http.Request) {
+	if s.agentEngine == nil {
+		writeError(w, http.StatusInternalServerError, "agent engine not initialized")
+		return
+	}
+
+	var req struct {
+		TaskID string `json:"task_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.TaskID == "" {
+		writeError(w, http.StatusBadRequest, "task_id is required")
+		return
+	}
+
+	ok := s.agentEngine.CancelTask(req.TaskID)
+	writeJSON(w, http.StatusOK, map[string]any{"task_id": req.TaskID, "cancelled": ok})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

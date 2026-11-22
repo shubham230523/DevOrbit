@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"unicode/utf8"
 
 	"devorbit.net/agents/host-bridge/internal/domain"
@@ -157,6 +158,58 @@ func (s *StorageEngine) WriteFile(req *domain.WriteFileRequest) (*domain.WriteFi
 		RelativePath:  req.RelativePath,
 		UpdatedSHA256: newHashStr,
 	}, nil
+}
+
+func (s *StorageEngine) DeleteFile(workspaceID, relativePath string) error {
+	absPath, err := s.jail.ResolveAndValidate(workspaceID, relativePath)
+	if err != nil {
+		return err
+	}
+	return os.Remove(absPath)
+}
+
+func (s *StorageEngine) SearchFiles(workspaceID, subPath, pattern string, caseSensitive bool) ([]map[string]any, error) {
+	absPath, err := s.jail.ResolveAndValidate(workspaceID, subPath)
+	if err != nil {
+		return nil, err
+	}
+
+	var matches []map[string]any
+	targetPattern := pattern
+	if !caseSensitive {
+		targetPattern = strings.ToLower(pattern)
+	}
+
+	_ = filepath.Walk(absPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		if info.Size() > s.maxFileSize {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil || !utf8.Valid(data) {
+			return nil
+		}
+
+		content := string(data)
+		checkContent := content
+		if !caseSensitive {
+			checkContent = strings.ToLower(content)
+		}
+
+		if strings.Contains(checkContent, targetPattern) {
+			rel, _ := filepath.Rel(absPath, path)
+			matches = append(matches, map[string]any{
+				"path": rel,
+				"size": info.Size(),
+			})
+		}
+		return nil
+	})
+
+	return matches, nil
 }
 
 func (s *StorageEngine) CreateWatcher(workspaceID, rootPath string) (*fsnotify.Watcher, error) {

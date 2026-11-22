@@ -24,3 +24,11 @@ func (s *FilesystemService) ReadFile(workspaceID, relativePath string) (*domain.
 func (s *FilesystemService) WriteFile(req *domain.WriteFileRequest) (*domain.WriteFileResult, error) {
 	return s.storage.WriteFile(req)
 }
+
+func (s *FilesystemService) DeleteFile(workspaceID, relativePath string) error {
+	return s.storage.DeleteFile(workspaceID, relativePath)
+}
+
+func (s *FilesystemService) SearchFiles(workspaceID, subPath, pattern string, caseSensitive bool) ([]map[string]any, error) {
+	return s.storage.SearchFiles(workspaceID, subPath, pattern, caseSensitive)
+}
