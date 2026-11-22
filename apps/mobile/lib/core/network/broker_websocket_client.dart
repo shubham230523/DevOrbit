@@ -9,10 +9,14 @@ enum BrokerConnectionState {
   connecting,
   transportConnected,
   authenticating,
+  waitingForHost,
   authenticatedBrokerSessionActive,
   reconnecting,
+  sessionExpired,
   authFailed,
+  connectionFailed,
   revoked,
+  hostDisconnected,
 }
 
 class ApplicationResponseEnvelope {
@@ -51,13 +55,22 @@ class BrokerWebSocketClient {
   final String sessionId;
   final String token;
   final String masterSecret;
+  final Duration readinessTimeout;
 
   WebSocketChannel? _channel;
+  StreamSubscription? _channelSubscription;
   FlutterE2ESession? _e2eSession;
   BrokerConnectionState _state = BrokerConnectionState.disconnected;
   final StreamController<BrokerConnectionState> _stateController = StreamController<BrokerConnectionState>.broadcast();
   final Map<String, Completer<ApplicationResponseEnvelope>> _pendingRequests = {};
   int _sequenceNum = 0;
+
+  bool _isReconnecting = false;
+  bool _manuallyDisconnected = false;
+  Timer? _reconnectTimer;
+  Timer? _readinessTimer;
+  int _reconnectAttempts = 0;
+  static const int _maxBackoffSeconds = 30;
 
   BrokerConnectionState get state => _state;
   Stream<BrokerConnectionState> get stateStream => _stateController.stream;
@@ -69,11 +82,19 @@ class BrokerWebSocketClient {
     required this.sessionId,
     required this.token,
     required this.masterSecret,
+    this.readinessTimeout = const Duration(seconds: 30),
   });
 
+  void _updateState(BrokerConnectionState newState) {
+    if (_state != newState) {
+      _state = newState;
+      _stateController.add(_state);
+    }
+  }
+
   Future<void> connect() async {
-    _state = BrokerConnectionState.connecting;
-    _stateController.add(_state);
+    _manuallyDisconnected = false;
+    _updateState(BrokerConnectionState.connecting);
 
     try {
       _e2eSession = await FlutterE2ESession.create(
@@ -91,6 +112,9 @@ class BrokerWebSocketClient {
         '$brokerUrl/ws/client?machine_id=$machineId&device_id=$deviceId&session_id=$sessionId',
       );
 
+      await _channelSubscription?.cancel();
+      _channel?.sink.close();
+
       _channel = IOWebSocketChannel.connect(
         wsUri,
         headers: {
@@ -99,30 +123,71 @@ class BrokerWebSocketClient {
       );
       await _channel!.ready;
 
-      _state = BrokerConnectionState.transportConnected;
-      _stateController.add(_state);
+      _updateState(BrokerConnectionState.transportConnected);
+      _updateState(BrokerConnectionState.authenticating);
 
-      _state = BrokerConnectionState.authenticating;
-      _stateController.add(_state);
+      // Start readiness timer: if no session_ready or session_pending arrives in time, fail
+      _readinessTimer?.cancel();
+      _readinessTimer = Timer(readinessTimeout, () {
+        if (_state == BrokerConnectionState.authenticating) {
+          _updateState(BrokerConnectionState.connectionFailed);
+          _failPendingRequests(TimeoutException('Readiness handshake timed out waiting for broker response'));
+          _channel?.sink.close();
+          _scheduleReconnect();
+        }
+      });
 
-      _channel!.stream.listen(
+      _channelSubscription = _channel!.stream.listen(
         (data) async {
           try {
             final jsonMap = jsonDecode(data.toString()) as Map<String, dynamic>;
             final frameType = jsonMap['type'];
+            final frameSessionId = jsonMap['session_id'];
 
-            // 1. Server-confirmed session acknowledgment
-            if (frameType == 'session_ready' || frameType == 'auth_ack') {
-              _state = BrokerConnectionState.authenticatedBrokerSessionActive;
-              _stateController.add(_state);
+            // 1. Host disconnected while client remained connected
+            if (frameType == 'host_disconnected') {
+              _updateState(BrokerConnectionState.hostDisconnected);
               return;
             }
 
-            // 2. Server-side session revocation
+            // 2. Session Pending (client connected, waiting for host)
+            if (frameType == 'session_pending') {
+              _readinessTimer?.cancel();
+              _updateState(BrokerConnectionState.waitingForHost);
+              return;
+            }
+
+            // 3. Server-confirmed session readiness
+            if (frameType == 'session_ready' || frameType == 'auth_ack') {
+              // Validate session identity
+              if (frameSessionId != null && frameSessionId != sessionId) {
+                // Session mismatch; do not treat as ready
+                return;
+              }
+              _readinessTimer?.cancel();
+              _reconnectAttempts = 0;
+              _isReconnecting = false;
+              _updateState(BrokerConnectionState.authenticatedBrokerSessionActive);
+              return;
+            }
+
+            // 4. Server-side session revocation
             if (frameType == 'revoked') {
-              _state = BrokerConnectionState.revoked;
-              _stateController.add(_state);
+              _readinessTimer?.cancel();
+              _cancelReconnect();
+              _updateState(BrokerConnectionState.revoked);
               _failPendingRequests(Exception('Session revoked by server'));
+              _channel?.sink.close();
+              _channel = null;
+              return;
+            }
+
+            // 5. Session expired
+            if (frameType == 'expired' || (frameType == 'error' && jsonMap['error']?.toString().contains('expired') == true)) {
+              _readinessTimer?.cancel();
+              _cancelReconnect();
+              _updateState(BrokerConnectionState.sessionExpired);
+              _failPendingRequests(Exception('Session expired'));
               _channel?.sink.close();
               _channel = null;
               return;
@@ -152,25 +217,70 @@ class BrokerWebSocketClient {
           } catch (_) {}
         },
         onError: (error) {
-          if (_state != BrokerConnectionState.revoked) {
-            _state = BrokerConnectionState.reconnecting;
-            _stateController.add(_state);
+          _readinessTimer?.cancel();
+          if (_state != BrokerConnectionState.revoked && _state != BrokerConnectionState.sessionExpired) {
+            _failPendingRequests(Exception('WebSocket error: $error'));
+            _scheduleReconnect();
           }
-          _failPendingRequests(Exception('WebSocket error: $error'));
         },
         onDone: () {
-          if (_state != BrokerConnectionState.revoked) {
-            _state = BrokerConnectionState.disconnected;
-            _stateController.add(_state);
+          _readinessTimer?.cancel();
+          if (_state != BrokerConnectionState.revoked && _state != BrokerConnectionState.sessionExpired) {
+            _failPendingRequests(Exception('WebSocket connection closed'));
+            if (!_manuallyDisconnected) {
+              _scheduleReconnect();
+            } else {
+              _updateState(BrokerConnectionState.disconnected);
+            }
           }
-          _failPendingRequests(Exception('WebSocket connection closed'));
         },
       );
     } catch (e) {
-      _state = BrokerConnectionState.authFailed;
-      _stateController.add(_state);
+      _readinessTimer?.cancel();
+      _updateState(BrokerConnectionState.authFailed);
       _failPendingRequests(Exception('Authentication failed: $e'));
+      if (!_manuallyDisconnected) {
+        _scheduleReconnect();
+      }
     }
+  }
+
+  void _scheduleReconnect() {
+    if (_manuallyDisconnected ||
+        _state == BrokerConnectionState.revoked ||
+        _state == BrokerConnectionState.sessionExpired) {
+      return;
+    }
+    if (_isReconnecting) return;
+    _isReconnecting = true;
+
+    _updateState(BrokerConnectionState.reconnecting);
+
+    int delaySeconds = 1 << _reconnectAttempts;
+    if (delaySeconds > _maxBackoffSeconds) {
+      delaySeconds = _maxBackoffSeconds;
+    }
+    _reconnectAttempts++;
+
+    _reconnectTimer?.cancel();
+    _reconnectTimer = Timer(Duration(seconds: delaySeconds), () async {
+      _isReconnecting = false;
+      if (_manuallyDisconnected ||
+          _state == BrokerConnectionState.revoked ||
+          _state == BrokerConnectionState.sessionExpired) {
+        return;
+      }
+      try {
+        await connect();
+      } catch (_) {}
+    });
+  }
+
+  void _cancelReconnect() {
+    _isReconnecting = false;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    _reconnectAttempts = 0;
   }
 
   void _failPendingRequests(Exception error) {
@@ -242,14 +352,21 @@ class BrokerWebSocketClient {
   }
 
   void disconnect() {
+    _manuallyDisconnected = true;
+    _cancelReconnect();
+    _readinessTimer?.cancel();
+    _channelSubscription?.cancel();
     _channel?.sink.close();
     _channel = null;
-    _state = BrokerConnectionState.disconnected;
-    _stateController.add(_state);
+    _updateState(BrokerConnectionState.disconnected);
     _failPendingRequests(Exception('Client disconnected'));
   }
 
   void dispose() {
+    _manuallyDisconnected = true;
+    _cancelReconnect();
+    _readinessTimer?.cancel();
+    _channelSubscription?.cancel();
     _channel?.sink.close();
     _stateController.close();
     for (final completer in _pendingRequests.values) {

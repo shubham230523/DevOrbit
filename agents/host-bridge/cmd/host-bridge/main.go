@@ -77,9 +77,10 @@ func main() {
 	}
 
 	// 5. Outbound Connection Broker Client
-	brokerClient := transport.NewBrokerClient(cfg.BrokerWSURL, cfg.HostID, "sess-host-init-001", cfg.HostSecret, serverEngine)
-	e2eSess, _ := security.NewE2ESession("sess-host-init-001", "phone-android-01", cfg.HostSecret, 24*time.Hour)
-	brokerClient.SetE2ESession(e2eSess)
+	brokerClient := transport.NewBrokerClient(cfg.BrokerWSURL, cfg.HostID, "", cfg.HostSecret, serverEngine)
+	serverEngine.SetSessionProvisioner(func(sessionID, deviceID, sessionSecret string, expiry time.Time) error {
+		return brokerClient.ProvisionSession(sessionID, deviceID, sessionSecret, expiry)
+	})
 
 	brokerClient.Start(context.Background())
 	defer brokerClient.Stop()

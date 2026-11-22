@@ -213,6 +213,33 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
       if (state == BrokerConnectionState.authenticatedBrokerSessionActive) {
         await _fetchLiveHostDataOverBroker();
+      } else if (state == BrokerConnectionState.waitingForHost) {
+        if (mounted) {
+          setState(() {
+            _isLoading = false;
+            _errorMessage = 'Host offline: Waiting for authorized host to connect to broker...';
+          });
+        }
+      } else if (state == BrokerConnectionState.hostDisconnected) {
+        if (mounted) {
+          setState(() {
+            _isLoading = false;
+            _errorMessage = 'Host disconnected: Waiting for host reconnection...';
+          });
+        }
+      } else if (state == BrokerConnectionState.sessionExpired) {
+        await _storage.clearPairedSession();
+        if (mounted) {
+          setState(() {
+            _machineId = null;
+            _deviceId = null;
+            _sessionId = null;
+            _token = null;
+            _masterSecret = null;
+            _isLoading = false;
+            _errorMessage = 'Session expired: Session exceeded valid lifetime. Please re-pair.';
+          });
+        }
       } else if (state == BrokerConnectionState.revoked) {
         await _storage.clearPairedSession();
         if (mounted) {
@@ -231,6 +258,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
           setState(() {
             _isLoading = false;
             _errorMessage = 'Authentication failed: connection rejected by broker.';
+          });
+        }
+      } else if (state == BrokerConnectionState.connectionFailed) {
+        if (mounted) {
+          setState(() {
+            _isLoading = false;
+            _errorMessage = 'Connection failed: Handshake timed out or failed to reach broker.';
           });
         }
       }
@@ -312,12 +346,18 @@ class _DashboardScreenState extends State<DashboardScreen> {
     switch (state) {
       case BrokerConnectionState.authenticatedBrokerSessionActive:
         return Colors.green;
+      case BrokerConnectionState.waitingForHost:
+        return Colors.cyan;
+      case BrokerConnectionState.hostDisconnected:
+        return Colors.deepOrange;
       case BrokerConnectionState.connecting:
       case BrokerConnectionState.transportConnected:
       case BrokerConnectionState.authenticating:
       case BrokerConnectionState.reconnecting:
         return Colors.amber;
+      case BrokerConnectionState.sessionExpired:
       case BrokerConnectionState.authFailed:
+      case BrokerConnectionState.connectionFailed:
       case BrokerConnectionState.revoked:
       case BrokerConnectionState.disconnected:
         return Colors.red;
@@ -331,6 +371,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
     switch (state) {
       case BrokerConnectionState.authenticatedBrokerSessionActive:
         return 'AUTHENTICATED BROKER SESSION ACTIVE';
+      case BrokerConnectionState.waitingForHost:
+        return 'WAITING FOR HOST TO CONNECT';
+      case BrokerConnectionState.hostDisconnected:
+        return 'HOST DISCONNECTED — WAITING FOR RECONNECT';
       case BrokerConnectionState.connecting:
         return 'CONNECTING TO BROKER';
       case BrokerConnectionState.transportConnected:
@@ -339,8 +383,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
         return 'AUTHENTICATING';
       case BrokerConnectionState.reconnecting:
         return 'RECONNECTING';
+      case BrokerConnectionState.sessionExpired:
+        return 'SESSION EXPIRED';
       case BrokerConnectionState.authFailed:
         return 'AUTHENTICATION FAILED';
+      case BrokerConnectionState.connectionFailed:
+        return 'CONNECTION FAILED';
       case BrokerConnectionState.revoked:
         return 'DEVICE REVOKED';
       case BrokerConnectionState.disconnected:
