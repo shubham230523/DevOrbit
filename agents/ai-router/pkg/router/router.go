@@ -4,8 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"os"
 	"strings"
 	"sync"
+)
+
+var (
+	ErrModelNotFound       = errors.New("model not registered in AI router")
+	ErrModelUnavailable    = errors.New("requested model is currently unavailable")
+	ErrProviderUnavailable = errors.New("503 Service Unavailable: GEMINI_API_KEY is not configured on the host")
 )
 
 type AIModel struct {
@@ -16,25 +24,66 @@ type AIModel struct {
 	IsAvailable     bool   `json:"is_available"`
 }
 
+type AIRouterOptions struct {
+	UseMockProvider bool
+	GeminiAPIKey    string
+	Environment     string
+}
+
 type AIRouter struct {
-	mu        sync.RWMutex
-	models    map[string]AIModel
-	providers map[string]Provider
+	mu          sync.RWMutex
+	models      map[string]AIModel
+	providers   map[string]Provider
+	environment string
 }
 
 func NewAIRouter() *AIRouter {
-	r := &AIRouter{
-		models:    make(map[string]AIModel),
-		providers: make(map[string]Provider),
+	env := strings.ToLower(os.Getenv("DEVORBIT_ENV"))
+	if env == "" {
+		env = "development"
 	}
 
-	// Register models according to requirements
+	useMock := strings.EqualFold(os.Getenv("DEVORBIT_GEMINI_USE_MOCK"), "true")
+	geminiKey := os.Getenv("GEMINI_API_KEY")
+	if geminiKey == "" {
+		geminiKey = os.Getenv("DEVORBIT_GEMINI_API_KEY")
+	}
+
+	return NewAIRouterWithOptions(AIRouterOptions{
+		UseMockProvider: useMock,
+		GeminiAPIKey:    geminiKey,
+		Environment:     env,
+	})
+}
+
+func NewAIRouterWithOptions(opts AIRouterOptions) *AIRouter {
+	r := &AIRouter{
+		models:      make(map[string]AIModel),
+		providers:   make(map[string]Provider),
+		environment: opts.Environment,
+	}
+
 	r.RegisterModel(AIModel{ID: "gemini-2.5-flash", Provider: "Gemini API", Name: "Gemini 2.5 Flash", IntegrationType: "direct_api", IsAvailable: true})
 	r.RegisterModel(AIModel{ID: "gemini-2.5-pro", Provider: "Gemini API", Name: "Gemini 2.5 Pro", IntegrationType: "direct_api", IsAvailable: true})
 	r.RegisterModel(AIModel{ID: "antigravity-gemini-3.8-flash", Provider: "Google Antigravity", Name: "Gemini 3.8 Flash (Antigravity)", IntegrationType: "acp_agent", IsAvailable: true})
 	r.RegisterModel(AIModel{ID: "antigravity-gemini-3.6-flash", Provider: "Google Antigravity", Name: "Gemini 3.6 Flash (Antigravity)", IntegrationType: "acp_agent", IsAvailable: true})
-	r.RegisterModel(AIModel{ID: "gpt-4o", Provider: "OpenAI", Name: "GPT-4o", IntegrationType: "direct_api", IsAvailable: true})
-	r.RegisterModel(AIModel{ID: "claude-3-7-sonnet", Provider: "Anthropic", Name: "Claude 3.7 Sonnet", IntegrationType: "direct_api", IsAvailable: true})
+
+	if opts.UseMockProvider {
+		log.Println("AI Router Warning: Using MockProvider as explicitly requested by DEVORBIT_GEMINI_USE_MOCK=true")
+		mockP := NewMockGeminiProvider()
+		r.RegisterProvider("Gemini API", mockP)
+		r.RegisterProvider("Google Antigravity", mockP)
+	} else if opts.GeminiAPIKey != "" {
+		geminiP, err := NewGeminiProvider(context.Background(), GeminiConfig{APIKey: opts.GeminiAPIKey})
+		if err == nil {
+			r.RegisterProvider("Gemini API", geminiP)
+			r.RegisterProvider("Google Antigravity", geminiP)
+		} else {
+			log.Printf("AI Router Warning: Failed to initialize GeminiProvider: %v", err)
+		}
+	} else if opts.Environment != "production" {
+		log.Println("AI Router Notice: No GEMINI_API_KEY provided in development mode.")
+	}
 
 	return r
 }
@@ -76,17 +125,16 @@ func (r *AIRouter) RoutePrompt(modelID, prompt string) (string, error) {
 	r.mu.RUnlock()
 
 	if !found {
-		return "", errors.New("model not found in registry")
+		return "", ErrModelNotFound
 	}
 
 	if !model.IsAvailable {
-		return "", errors.New("requested model is currently unavailable")
+		return "", ErrModelUnavailable
 	}
 
 	return model.Provider, nil
 }
 
-// Generate routes a full generation request to the registered provider for modelID.
 func (r *AIRouter) Generate(ctx context.Context, req GenerateRequest) (*GenerateResponse, error) {
 	r.mu.RLock()
 	model, found := r.models[req.Model]
@@ -104,7 +152,7 @@ func (r *AIRouter) Generate(ctx context.Context, req GenerateRequest) (*Generate
 	r.mu.RUnlock()
 
 	if !hasProvider || provider == nil {
-		return nil, fmt.Errorf("no provider registered for '%s'", model.Provider)
+		return nil, ErrProviderUnavailable
 	}
 
 	return provider.Generate(ctx, req)

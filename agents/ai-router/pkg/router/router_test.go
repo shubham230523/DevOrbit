@@ -24,6 +24,50 @@ func TestAIRouter_ModelRegistrationAndRouting(t *testing.T) {
 	}
 }
 
+func TestAIRouter_NoSilentMockFallbackWhenAPIKeyMissing(t *testing.T) {
+	// Without mock flag and without API key -> MUST return ErrProviderUnavailable (HTTP 503)
+	r := NewAIRouterWithOptions(AIRouterOptions{
+		UseMockProvider: false,
+		GeminiAPIKey:    "",
+		Environment:     "production",
+	})
+
+	ctx := context.Background()
+	_, err := r.Generate(ctx, GenerateRequest{
+		Model: "gemini-2.5-flash",
+		Messages: []Message{
+			{Role: "user", Content: "Hello"},
+		},
+	})
+
+	if !errors.Is(err, ErrProviderUnavailable) {
+		t.Fatalf("Expected ErrProviderUnavailable (503 Service Unavailable) when GEMINI_API_KEY is missing, got: %v", err)
+	}
+}
+
+func TestAIRouter_ExplicitMockProvider(t *testing.T) {
+	// Explicit DEVORBIT_GEMINI_USE_MOCK=true -> Uses MockProvider
+	r := NewAIRouterWithOptions(AIRouterOptions{
+		UseMockProvider: true,
+		Environment:     "development",
+	})
+
+	ctx := context.Background()
+	resp, err := r.Generate(ctx, GenerateRequest{
+		Model: "gemini-2.5-flash",
+		Messages: []Message{
+			{Role: "user", Content: "Hello"},
+		},
+	})
+
+	if err != nil {
+		t.Fatalf("Expected successful generation with explicit MockProvider, got error: %v", err)
+	}
+	if resp.Text == "" {
+		t.Errorf("Expected mock text response")
+	}
+}
+
 func TestAIRouter_InvalidModel(t *testing.T) {
 	r := NewAIRouter()
 
@@ -89,7 +133,6 @@ func TestTools_StageCToolDeclarationsSchema(t *testing.T) {
 }
 
 func TestTools_ValidationAndParsing(t *testing.T) {
-	// 1. Valid call
 	validCall := &FunctionCall{
 		Name: ToolReadFile,
 		Arguments: map[string]any{
@@ -100,7 +143,6 @@ func TestTools_ValidationAndParsing(t *testing.T) {
 		t.Fatalf("Expected valid call to pass, got: %v", err)
 	}
 
-	// 2. Missing required parameter
 	missingArgCall := &FunctionCall{
 		Name: ToolReadFile,
 		Arguments: map[string]any{
@@ -111,7 +153,6 @@ func TestTools_ValidationAndParsing(t *testing.T) {
 		t.Errorf("Expected ErrMissingRequiredArg, got: %v", err)
 	}
 
-	// 3. Unknown tool
 	unknownCall := &FunctionCall{
 		Name: "unregistered_dangerous_tool",
 		Arguments: map[string]any{
@@ -122,7 +163,6 @@ func TestTools_ValidationAndParsing(t *testing.T) {
 		t.Errorf("Expected ErrToolNotFound, got: %v", err)
 	}
 
-	// 4. Parse from JSON
 	rawJSON := []byte(`[{"name":"create_file","arguments":{"path":"README.md","content":"# DevOrbit"}}]`)
 	calls, err := ParseFunctionCallsFromJSON(rawJSON)
 	if err != nil {
@@ -132,7 +172,6 @@ func TestTools_ValidationAndParsing(t *testing.T) {
 		t.Errorf("Parsed calls unexpected: %+v", calls)
 	}
 
-	// 5. Malformed JSON
 	_, err = ParseFunctionCallsFromJSON([]byte(`not a json`))
 	if err == nil {
 		t.Errorf("Expected error for malformed JSON")
@@ -150,7 +189,6 @@ func TestSecretRedaction(t *testing.T) {
 }
 
 func TestGeminiProvider_MissingAPIKey(t *testing.T) {
-	// Explicitly pass empty API key and ensure environment is clean
 	t.Setenv("DEVORBIT_GEMINI_API_KEY", "")
 	t.Setenv("GEMINI_API_KEY", "")
 
@@ -164,7 +202,6 @@ func TestMockGeminiProvider_FunctionCallingAndContinuationWorkflow(t *testing.T)
 	ctx := context.Background()
 	mock := NewMockGeminiProvider()
 
-	// Step 1: User prompt -> returns function call
 	mock.SetResponseForPrompt("read config", &GenerateResponse{
 		Model: "gemini-2.5-flash",
 		FunctionCalls: []FunctionCall{
@@ -197,18 +234,15 @@ func TestMockGeminiProvider_FunctionCallingAndContinuationWorkflow(t *testing.T)
 		t.Errorf("Expected ToolReadFile, got %s", fc.Name)
 	}
 
-	// Step 2: Validate function call schema (without executing project operations)
 	if err := ValidateFunctionCall(&fc); err != nil {
 		t.Fatalf("Function call schema validation failed: %v", err)
 	}
 
-	// Step 3: Simulate tool execution result and return to Gemini
 	simulatedToolResult := map[string]any{
 		"path":    "config.yaml",
 		"content": "port: 8080\nenv: production",
 	}
 
-	// Step 4: Assistant continuation turn with FunctionResponse
 	step2Resp, err := mock.Generate(ctx, GenerateRequest{
 		Model: "gemini-2.5-flash",
 		Messages: []Message{

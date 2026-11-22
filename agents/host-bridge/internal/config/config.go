@@ -36,7 +36,8 @@ type Config struct {
 	Environment     string
 	GeminiAPIKey    string // Host-only: DEVORBIT_GEMINI_API_KEY
 	GeminiModel     string // Host-only: DEVORBIT_GEMINI_MODEL
-	UseMockProvider bool // Host-only: DEVORBIT_GEMINI_USE_MOCK (true to enable mock provider)}
+	UseMockProvider bool   // Host-only: DEVORBIT_GEMINI_USE_MOCK (true to enable mock provider)
+}
 
 func LoadConfig() (*Config, error) {
 	env := strings.ToLower(os.Getenv("DEVORBIT_ENV"))
@@ -218,6 +219,17 @@ func LoadConfig() (*Config, error) {
 		}
 	}
 
+	// 5. Host-Only Gemini API Credentials
+	geminiKey := os.Getenv("DEVORBIT_GEMINI_API_KEY")
+	if geminiKey == "" {
+		geminiKey = os.Getenv("GEMINI_API_KEY")
+	}
+	geminiModel := os.Getenv("DEVORBIT_GEMINI_MODEL")
+	if geminiModel == "" {
+		geminiModel = "gemini-2.5-flash"
+	}
+	useMockProvider := strings.EqualFold(os.Getenv("DEVORBIT_GEMINI_USE_MOCK"), "true")
+
 	// Default allowed roots
 	cwd, _ := os.Getwd()
 	home, _ := os.UserHomeDir()
@@ -227,15 +239,6 @@ func LoadConfig() (*Config, error) {
 		if _, err := os.Stat(projDir); err == nil {
 			roots = append(roots, projDir)
 		}
-	}
-
-	geminiKey := strings.TrimSpace(os.Getenv("DEVORBIT_GEMINI_API_KEY"))
-	if geminiKey == "" {
-		geminiKey = strings.TrimSpace(os.Getenv("GEMINI_API_KEY"))
-	}
-	geminiModel := strings.TrimSpace(os.Getenv("DEVORBIT_GEMINI_MODEL"))
-	if geminiModel == "" {
-		geminiModel = "gemini-2.5-flash"
 	}
 
 	return &Config{
@@ -255,6 +258,7 @@ func LoadConfig() (*Config, error) {
 		Environment:     env,
 		GeminiAPIKey:    geminiKey,
 		GeminiModel:     geminiModel,
+		UseMockProvider: useMockProvider,
 		AllowedBinaries: []string{
 			"git", "git.exe", "gradlew", "gradlew.bat", "gradle", "gradle.bat", "adb", "adb.exe",
 		},
