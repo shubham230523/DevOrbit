@@ -142,7 +142,7 @@ func main() {
 			for _, row := range bitmap {
 				for _, cell := range row {
 					if cell {
-						fmt.Print("██")
+						fmt.Print("##")
 					} else {
 						fmt.Print("  ")
 					}
