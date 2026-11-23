@@ -2,8 +2,13 @@ import 'package:flutter/material.dart';
 
 class ProjectExplorerScreen extends StatefulWidget {
   final Function(String path)? onFileSelected;
+  final List<Map<String, dynamic>>? initialFiles;
 
-  const ProjectExplorerScreen({super.key, this.onFileSelected});
+  const ProjectExplorerScreen({
+    super.key,
+    this.onFileSelected,
+    this.initialFiles,
+  });
 
   @override
   State<ProjectExplorerScreen> createState() => _ProjectExplorerScreenState();
@@ -12,37 +17,13 @@ class ProjectExplorerScreen extends StatefulWidget {
 class _ProjectExplorerScreenState extends State<ProjectExplorerScreen> {
   final List<String> _breadcrumbs = ['/'];
   String _searchQuery = '';
+  late List<Map<String, dynamic>> _files;
 
-  final List<Map<String, dynamic>> _files = [
-    {
-      'name': 'app',
-      'path': 'app',
-      'is_dir': true,
-      'size': 0,
-      'type': 'folder',
-    },
-    {
-      'name': 'build.gradle.kts',
-      'path': 'build.gradle.kts',
-      'is_dir': false,
-      'size': 1420,
-      'type': 'gradle',
-    },
-    {
-      'name': 'settings.gradle.kts',
-      'path': 'settings.gradle.kts',
-      'is_dir': false,
-      'size': 680,
-      'type': 'gradle',
-    },
-    {
-      'name': 'README.md',
-      'path': 'README.md',
-      'is_dir': false,
-      'size': 2040,
-      'type': 'markdown',
-    },
-  ];
+  @override
+  void initState() {
+    super.initState();
+    _files = widget.initialFiles ?? [];
+  }
 
   IconData _getFileIcon(String type, bool isDir) {
     if (isDir) return Icons.folder;
@@ -50,8 +31,11 @@ class _ProjectExplorerScreenState extends State<ProjectExplorerScreen> {
       case 'gradle':
         return Icons.build;
       case 'markdown':
+      case 'md':
         return Icons.description;
       case 'kt':
+      case 'dart':
+      case 'go':
         return Icons.code;
       default:
         return Icons.insert_drive_file;
@@ -64,8 +48,11 @@ class _ProjectExplorerScreenState extends State<ProjectExplorerScreen> {
       case 'gradle':
         return Colors.tealAccent;
       case 'markdown':
+      case 'md':
         return Colors.lightBlueAccent;
       case 'kt':
+      case 'dart':
+      case 'go':
         return Colors.purpleAccent;
       default:
         return Colors.grey;
@@ -111,7 +98,7 @@ class _ProjectExplorerScreenState extends State<ProjectExplorerScreen> {
                 icon: const Icon(Icons.refresh, size: 18),
                 onPressed: () {
                   ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Refreshed directory listing from remote host')),
+                    const SnackBar(content: Text('Refreshing workspace directory listing from host...')),
                   );
                 },
               ),
@@ -137,43 +124,67 @@ class _ProjectExplorerScreenState extends State<ProjectExplorerScreen> {
           ),
         ),
 
-        // Directory & File List
+        // Directory & File List or Empty State
         Expanded(
-          child: ListView.builder(
-            itemCount: filteredFiles.length,
-            itemBuilder: (context, index) {
-              final file = filteredFiles[index];
-              final isDir = file['is_dir'] as bool;
-              final type = file['type'] as String;
+          child: filteredFiles.isEmpty
+              ? Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(32.0),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(Icons.folder_off, size: 48, color: Colors.grey.shade600),
+                        const SizedBox(height: 12),
+                        const Text(
+                          'No workspace files loaded.',
+                          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                        ),
+                        const SizedBox(height: 6),
+                        const Text(
+                          'Connect to an active Host Bridge session or select a project in Travel AI Cockpit to inspect live files.',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(fontSize: 12, color: Colors.grey),
+                        ),
+                      ],
+                    ),
+                  ),
+                )
+              : ListView.builder(
+                  itemCount: filteredFiles.length,
+                  itemBuilder: (context, index) {
+                    final file = filteredFiles[index];
+                    final isDir = file['is_dir'] == true;
+                    final type = (file['type'] ?? 'file') as String;
 
-              return ListTile(
-                leading: Icon(
-                  _getFileIcon(type, isDir),
-                  color: _getFileIconColor(type, isDir),
+                    return ListTile(
+                      leading: Icon(
+                        _getFileIcon(type, isDir),
+                        color: _getFileIconColor(type, isDir),
+                      ),
+                      title: Text(file['name'] as String),
+                      subtitle: isDir
+                          ? const Text('Directory')
+                          : Text('${file['size'] ?? 0} bytes'),
+                      trailing: isDir
+                          ? const Icon(Icons.chevron_right)
+                          : const Icon(Icons.edit_note, color: Colors.grey),
+                      onTap: () {
+                        if (isDir) {
+                          setState(() {
+                            _breadcrumbs.add(file['name'] as String);
+                          });
+                        } else {
+                          if (widget.onFileSelected != null) {
+                            widget.onFileSelected!(file['path'] as String);
+                          }
+                        }
+                      },
+                    );
+                  },
                 ),
-                title: Text(file['name'] as String),
-                subtitle: isDir
-                    ? const Text('Directory')
-                    : Text('${file['size']} bytes'),
-                trailing: isDir
-                    ? const Icon(Icons.chevron_right)
-                    : const Icon(Icons.edit_note, color: Colors.grey),
-                onTap: () {
-                  if (isDir) {
-                    setState(() {
-                      _breadcrumbs.add(file['name'] as String);
-                    });
-                  } else {
-                    if (widget.onFileSelected != null) {
-                      widget.onFileSelected!(file['path'] as String);
-                    }
-                  }
-                },
-              );
-            },
-          ),
         ),
       ],
     );
   }
 }
+

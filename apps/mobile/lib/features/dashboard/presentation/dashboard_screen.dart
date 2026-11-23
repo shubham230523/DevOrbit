@@ -399,9 +399,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
   @override
   Widget build(BuildContext context) {
     final hostname = _healthData?['hostname'] ?? 'Desktop Host';
-    final osType = _healthData?['os'] ?? 'Unknown OS';
+    final osType = _healthData?['os'] ?? 'Host';
     final arch = _healthData?['arch'] ?? '';
-    final version = _healthData?['host_bridge_version'] ?? 'v1.2.1';
+    final version = _healthData?['host_bridge_version'] != null ? 'Host Bridge ${_healthData!["host_bridge_version"]}' : '';
     final allowedRoots = _healthData?['allowed_workspaces_count'] ?? 0;
     final isOnline = _connectionState == BrokerConnectionState.authenticatedBrokerSessionActive;
 
@@ -423,9 +423,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       children: [
                         Icon(Icons.warning_amber_rounded, color: Colors.amberAccent, size: 28),
                         SizedBox(width: 8),
-                        Text(
-                          'Host Pairing Required',
-                          style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white),
+                        Expanded(
+                          child: Text(
+                            'Host Pairing Required',
+                            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white),
+                          ),
                         ),
                       ],
                     ),
@@ -464,7 +466,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       controller: _brokerController,
                       enabled: hasValidCredentials,
                       decoration: InputDecoration(
-                        labelText: 'Connection Broker WSS Endpoint',
+                        labelText: 'Broker WSS URL',
                         hintText: hasValidCredentials ? 'e.g. ws://localhost:8081' : 'Pair host machine first',
                         isDense: true,
                         border: const OutlineInputBorder(),
@@ -484,41 +486,65 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
           // Real Authenticated Session Health Status Card
           Card(
-            child: ListTile(
-              leading: Icon(
-                Icons.computer,
-                color: _getStatusColor(_connectionState),
-                size: 32,
-              ),
-              title: Text(
-                !hasValidCredentials
-                    ? 'Host Session (Unpaired)'
-                    : isOnline
-                        ? '$hostname ($osType/$arch)'
-                        : 'Host Session Inactive',
-                style: const TextStyle(fontWeight: FontWeight.bold),
-              ),
-              subtitle: !hasValidCredentials
-                  ? const Text('Pair host machine to enable authenticated remote IDE connection.')
-                  : isOnline
-                      ? Text('Host Bridge $version • Via Broker WSS\nAllowed Roots: $allowedRoots')
-                      : Text(_errorMessage ?? _getStatusLabel(_connectionState)),
-              isThreeLine: isOnline,
-              trailing: Row(
-                mainAxisSize: MainAxisSize.min,
+            child: Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Chip(
-                    label: Text(_getStatusLabel(_connectionState)),
-                    backgroundColor: _getStatusColor(_connectionState).withValues(alpha: 0.2),
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.center,
+                    children: [
+                      Icon(
+                        Icons.computer,
+                        color: _getStatusColor(_connectionState),
+                        size: 28,
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Text(
+                          !hasValidCredentials
+                              ? 'Host Session (Unpaired)'
+                              : isOnline
+                                  ? '$hostname ($osType/$arch)'
+                                  : 'Host Session Inactive',
+                          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+                        ),
+                      ),
+                      if (hasValidCredentials) ...[
+                        IconButton(
+                          icon: const Icon(Icons.link_off, color: Colors.redAccent, size: 20),
+                          tooltip: 'Unpair / Logout Session',
+                          onPressed: _handleLogout,
+                        ),
+                      ],
+                    ],
                   ),
-                  if (hasValidCredentials) ...[
-                    const SizedBox(width: 4),
-                    IconButton(
-                      icon: const Icon(Icons.link_off, color: Colors.redAccent, size: 20),
-                      tooltip: 'Unpair / Logout Session',
-                      onPressed: _handleLogout,
+                  const SizedBox(height: 8),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: _getStatusColor(_connectionState).withValues(alpha: 0.15),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: _getStatusColor(_connectionState).withValues(alpha: 0.4)),
                     ),
-                  ],
+                    child: Text(
+                      _getStatusLabel(_connectionState),
+                      style: TextStyle(
+                        color: _getStatusColor(_connectionState),
+                        fontSize: 11,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    !hasValidCredentials
+                        ? 'Pair host machine to enable authenticated remote IDE connection.'
+                        : isOnline
+                            ? '${version.isNotEmpty ? "$version • " : ""}Via Broker WSS • Allowed Roots: $allowedRoots'
+                            : (_errorMessage ?? _getStatusLabel(_connectionState)),
+                    style: TextStyle(fontSize: 12, color: Colors.grey.shade400),
+                  ),
                 ],
               ),
             ),

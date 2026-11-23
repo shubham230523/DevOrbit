@@ -3,8 +3,13 @@ import 'conflict_resolution_modal.dart';
 
 class CodeEditorScreen extends StatefulWidget {
   final String? filePath;
+  final String? initialContent;
 
-  const CodeEditorScreen({super.key, this.filePath});
+  const CodeEditorScreen({
+    super.key,
+    this.filePath,
+    this.initialContent,
+  });
 
   @override
   State<CodeEditorScreen> createState() => _CodeEditorScreenState();
@@ -18,23 +23,10 @@ class _CodeEditorScreenState extends State<CodeEditorScreen> {
   @override
   void initState() {
     super.initState();
-    _textController = TextEditingController(
-      text: '''// DevOrbit Remote Code Editor
-package com.devorbit.mobile
-
-import android.os.Bundle
-import androidx.appcompat.app.AppCompatActivity
-
-class MainActivity : AppCompatActivity() {
-    override func onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        println("DevOrbit Connected to Remote Host!")
-    }
-}''',
-    );
+    _textController = TextEditingController(text: widget.initialContent ?? '');
 
     _textController.addListener(() {
-      if (!_isModified) {
+      if (!_isModified && _textController.text != (widget.initialContent ?? '')) {
         setState(() {
           _isModified = true;
         });
@@ -42,7 +34,20 @@ class MainActivity : AppCompatActivity() {
     });
   }
 
+  @override
+  void didUpdateWidget(covariant CodeEditorScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.filePath != widget.filePath || oldWidget.initialContent != widget.initialContent) {
+      _textController.text = widget.initialContent ?? '';
+      setState(() {
+        _isModified = false;
+      });
+    }
+  }
+
   void _saveFile() async {
+    if (widget.filePath == null) return;
+
     setState(() {
       _isSaving = true;
     });
@@ -56,8 +61,8 @@ class MainActivity : AppCompatActivity() {
       });
 
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Saved file to remote host (Atomic write OK)'),
+        SnackBar(
+          content: Text('Saved "${widget.filePath}" to host.'),
           backgroundColor: Colors.green,
         ),
       );
@@ -68,9 +73,9 @@ class MainActivity : AppCompatActivity() {
     showDialog(
       context: context,
       builder: (context) => ConflictResolutionModal(
-        filePath: widget.filePath ?? 'src/MainActivity.kt',
+        filePath: widget.filePath ?? 'src/File.kt',
         localContent: _textController.text,
-        remoteContent: '// Modified on desktop host by another process\nprintln("Desktop Edit")',
+        remoteContent: '// Modified on host by another process',
         onKeepLocal: () {
           setState(() {
             _isModified = false;
@@ -78,7 +83,7 @@ class MainActivity : AppCompatActivity() {
         },
         onAcceptRemote: () {
           setState(() {
-            _textController.text = '// Modified on desktop host by another process\nprintln("Desktop Edit")';
+            _textController.text = '// Modified on host by another process';
             _isModified = false;
           });
         },
@@ -94,6 +99,31 @@ class MainActivity : AppCompatActivity() {
 
   @override
   Widget build(BuildContext context) {
+    if (widget.filePath == null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(32.0),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(Icons.edit_note, size: 56, color: Colors.grey.shade600),
+              const SizedBox(height: 12),
+              const Text(
+                'No file open in editor.',
+                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+              ),
+              const SizedBox(height: 6),
+              const Text(
+                'Select a file from Project Explorer to view or edit its contents.',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 12, color: Colors.grey),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
     return Column(
       children: [
         // Editor Header Bar
@@ -103,21 +133,27 @@ class MainActivity : AppCompatActivity() {
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Row(
-                children: [
-                  const Icon(Icons.code, size: 18, color: Colors.purpleAccent),
-                  const SizedBox(width: 8),
-                  Text(
-                    widget.filePath ?? 'src/MainActivity.kt',
-                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
-                  ),
-                  if (_isModified)
-                    const Padding(
-                      padding: EdgeInsets.only(left: 6.0),
-                      child: Icon(Icons.circle, size: 8, color: Colors.amber),
+              Expanded(
+                child: Row(
+                  children: [
+                    const Icon(Icons.code, size: 18, color: Colors.purpleAccent),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        widget.filePath!,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                      ),
                     ),
-                ],
+                    if (_isModified)
+                      const Padding(
+                        padding: EdgeInsets.only(left: 6.0),
+                        child: Icon(Icons.circle, size: 8, color: Colors.amber),
+                      ),
+                  ],
+                ),
               ),
+              const SizedBox(width: 8),
               ElevatedButton.icon(
                 onPressed: _isSaving || !_isModified ? null : _saveFile,
                 icon: _isSaving
@@ -149,6 +185,7 @@ class MainActivity : AppCompatActivity() {
               ),
               decoration: const InputDecoration(
                 border: InputBorder.none,
+                hintText: 'Enter code or text...',
               ),
             ),
           ),
@@ -157,3 +194,4 @@ class MainActivity : AppCompatActivity() {
     );
   }
 }
+
