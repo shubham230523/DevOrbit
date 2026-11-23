@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -27,7 +28,24 @@ import (
 	airouter "devorbit.net/agents/ai-router/pkg/router"
 )
 
+// setWindowsUTF8Console switches the Windows console input/output code pages
+// to UTF-8 (65001) so that Unicode block characters render correctly.
+// It is a no-op on non-Windows platforms.
+func setWindowsUTF8Console() {
+	if runtime.GOOS != "windows" {
+		return
+	}
+	kernel32 := syscall.NewLazyDLL("kernel32.dll")
+	setConsoleCP := kernel32.NewProc("SetConsoleCP")
+	setConsoleOutputCP := kernel32.NewProc("SetConsoleOutputCP")
+	_, _, _ = setConsoleCP.Call(65001)
+	_, _, _ = setConsoleOutputCP.Call(65001)
+}
+
 func main() {
+	// Ensure the Windows console uses UTF-8 so QR block characters render correctly.
+	setWindowsUTF8Console()
+
 	cfg, err := config.LoadConfig()
 	if err != nil {
 		log.Fatalf("Host Bridge configuration error: %v", err)
@@ -141,21 +159,21 @@ func main() {
 			fmt.Println("Scan this Compact QR Code in DevOrbit Mobile (Machines -> Pair Host):")
 			fmt.Println()
 			for y := 0; y < len(bitmap); y += 2 {
-				fmt.Print("  ") // padding margin
+				fmt.Print("  ")
 				for x := 0; x < len(bitmap[y]); x++ {
 					top := bitmap[y][x]
 					bottom := false
 					if y+1 < len(bitmap) {
 						bottom = bitmap[y+1][x]
 					}
-
-					if top && bottom {
+					switch {
+					case top && bottom:
 						fmt.Print("█")
-					} else if top && !bottom {
+					case top && !bottom:
 						fmt.Print("▀")
-					} else if !top && bottom {
+					case !top && bottom:
 						fmt.Print("▄")
-					} else {
+					default:
 						fmt.Print(" ")
 					}
 				}
