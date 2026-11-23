@@ -28,6 +28,13 @@ type PairingChallenge struct {
 	Consumed     bool      `json:"consumed"`
 	ExpiresAt    time.Time `json:"expires_at"`
 	ExpiresAtStr string    `json:"expires_at_str"`
+
+	// CachedDeviceID and CachedSessionToken are set when the challenge is first
+	// successfully confirmed. If the same device retries (e.g. due to a network
+	// timeout that prevented the response from reaching the mobile client), the
+	// cached token is returned instead of ErrPairingUsed.
+	CachedDeviceID      string `json:"-"`
+	CachedSessionToken  string `json:"-"`
 }
 
 type PairingEngine struct {
@@ -123,6 +130,12 @@ func (p *PairingEngine) ConfirmPairing(chID, deviceID, deviceName, pubKey, proof
 	}
 
 	if ch.Consumed {
+		// If the SAME device retries (e.g. response lost due to network timeout),
+		// replay the cached session token instead of returning an error.
+		// This makes pairing idempotent for the confirming device.
+		if ch.CachedDeviceID == deviceID && ch.CachedSessionToken != "" {
+			return ch.CachedSessionToken, nil
+		}
 		return "", ErrPairingUsed
 	}
 
@@ -155,6 +168,10 @@ func (p *PairingEngine) ConfirmPairing(chID, deviceID, deviceName, pubKey, proof
 		return "", fmt.Errorf("failed to generate session token: %w", err)
 	}
 	sessionToken := hex.EncodeToString(tokenBytes)
+
+	// Cache so the same device can recover if the response was lost in transit.
+	ch.CachedDeviceID = deviceID
+	ch.CachedSessionToken = sessionToken
 
 	return sessionToken, nil
 }

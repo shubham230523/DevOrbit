@@ -47,10 +47,21 @@ func TestHostBridge_PairingLifecycleAndSecurity(t *testing.T) {
 		t.Fatalf("Expected non-empty token")
 	}
 
-	// Replay must be rejected with ErrPairingUsed
-	_, err = engine.ConfirmPairing(ch.ID, deviceID, "Pixel 9", "pubkey-123", proofSig)
+	// Replay by SAME device returns the CACHED token (idempotent retry support).
+	// This allows the mobile client to recover when the first response was lost
+	// in transit (e.g. network timeout before the HTTP response arrived).
+	replayToken, err := engine.ConfirmPairing(ch.ID, deviceID, "Pixel 9", "pubkey-123", proofSig)
+	if err != nil {
+		t.Fatalf("Expected cached-token replay to succeed for same device, got error: %v", err)
+	}
+	if replayToken != token {
+		t.Fatalf("Expected replay to return the same cached token, got different value")
+	}
+
+	// Replay by a DIFFERENT device must still be rejected with ErrPairingUsed.
+	_, err = engine.ConfirmPairing(ch.ID, "different-device-99", "Other Phone", "", proofSig)
 	if err != ErrPairingUsed {
-		t.Fatalf("Expected ErrPairingUsed on replay, got: %v", err)
+		t.Fatalf("Expected ErrPairingUsed for different device replay, got: %v", err)
 	}
 }
 
@@ -89,9 +100,12 @@ func TestHostBridge_PairingConcurrentConfirmation(t *testing.T) {
 	const concurrentAttempts = 10
 	var wg sync.WaitGroup
 	successCount := 0
-	usedCount := 0
+	failCount := 0
 	var mu sync.Mutex
 
+	// All 10 goroutines use the SAME device ID and valid proof.
+	// After the first confirm, subsequent calls return the cached token —
+	// all 10 must succeed (idempotent replay for same device).
 	for i := 0; i < concurrentAttempts; i++ {
 		wg.Add(1)
 		go func() {
@@ -101,17 +115,21 @@ func TestHostBridge_PairingConcurrentConfirmation(t *testing.T) {
 			defer mu.Unlock()
 			if err == nil {
 				successCount++
-			} else if err == ErrPairingUsed {
-				usedCount++
+			} else {
+				failCount++
 			}
 		}()
 	}
 	wg.Wait()
 
-	if successCount != 1 {
-		t.Errorf("Expected exactly 1 success under concurrency, got: %d", successCount)
+	if successCount != concurrentAttempts {
+		t.Errorf("Expected all %d same-device attempts to succeed via cached replay, got: %d successes, %d failures",
+			concurrentAttempts, successCount, failCount)
 	}
-	if usedCount != concurrentAttempts-1 {
-		t.Errorf("Expected %d attempts to fail with ErrPairingUsed, got: %d", concurrentAttempts-1, usedCount)
+
+	// A DIFFERENT device must still be rejected.
+	_, err = engine.ConfirmPairing(ch.ID, "other-device", "iPad", "", proofSig)
+	if err != ErrPairingUsed {
+		t.Errorf("Expected ErrPairingUsed for a different device, got: %v", err)
 	}
 }

@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 import 'package:http/http.dart' as http;
 import '../security/secure_storage.dart';
 import 'qr_pairing_payload.dart';
@@ -93,35 +94,64 @@ class PairingClient {
     });
 
     final port = confirmUri.hasPort ? confirmUri.port : 8082;
-    final candidateUris = <Uri>[
-      Uri.parse('http://localhost:$port/api/v1/pairing/confirm'),
-      confirmUri,
-      Uri.parse('http://10.0.2.2:$port/api/v1/pairing/confirm'),
-    ];
+    // Primary candidate: the IP from the QR payload (the real host LAN address).
+    // Fallback candidates are only tried when the primary refuses the connection
+    // outright (SocketException). A TimeoutException means the host likely received
+    // the request and is processing it — retrying with a different address would
+    // consume the same challenge twice and cause "already consumed" errors.
+    final primaryUri = confirmUri;
+    final fallbackUris = <Uri>[];
+    if (confirmUri.host != 'localhost') {
+      fallbackUris.add(Uri.parse('http://localhost:$port/api/v1/pairing/confirm'));
+    }
+    if (confirmUri.host != '10.0.2.2') {
+      fallbackUris.add(Uri.parse('http://10.0.2.2:$port/api/v1/pairing/confirm'));
+    }
 
     http.Response? response;
     Object? lastError;
 
-    for (final uri in candidateUris) {
-      try {
-        final res = await _httpClient
-            .post(
-              uri,
-              headers: {
-                'Content-Type': 'application/json',
-                'Accept': 'application/json',
-              },
-              body: reqBody,
-            )
-            .timeout(const Duration(seconds: 3));
-
-        response = res;
-        if (res.statusCode == 200 || res.statusCode == 201) {
-          break;
+    // Try primary with a generous 10-second timeout (session provisioning + broker
+    // authorization can take several seconds on the host side).
+    try {
+      final res = await _httpClient
+          .post(
+            primaryUri,
+            headers: {
+              'Content-Type': 'application/json',
+              'Accept': 'application/json',
+            },
+            body: reqBody,
+          )
+          .timeout(const Duration(seconds: 10));
+      response = res;
+    } on SocketException catch (e) {
+      // Connection refused / unreachable — host not listening on that address.
+      // Safe to try fallback candidates because the request never reached the host.
+      lastError = e;
+      for (final uri in fallbackUris) {
+        try {
+          final res = await _httpClient
+              .post(
+                uri,
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Accept': 'application/json',
+                },
+                body: reqBody,
+              )
+              .timeout(const Duration(seconds: 5));
+          response = res;
+          if (res.statusCode == 200 || res.statusCode == 201) break;
+        } catch (fe) {
+          lastError = fe;
         }
-      } catch (e) {
-        lastError = e;
       }
+    } catch (e) {
+      // TimeoutException or other error. Do NOT retry with a different URL —
+      // the host may have already processed the request. Surface the error
+      // so the user can retry with the same QR (host caches the response).
+      lastError = e;
     }
 
     if (response == null) {

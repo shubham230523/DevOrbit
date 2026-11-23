@@ -132,10 +132,13 @@ func TestTransport_HTTPAPIEndpointsAndPairing(t *testing.T) {
 			confResp.SessionID, confResp.SessionSecret, provisionedSession, provisionedDevice, provisionedSecret)
 	}
 
-	// 5. Test Replaying Consumed Challenge Fails
+	// 5. Test Replaying Consumed Challenge by SAME device returns 200 (cached response).
+	// This is the idempotent retry behaviour: if the mobile lost the response due to
+	// a network timeout, it can safely retry the same confirm request and get back
+	// the same session credentials.
 	resReplay, err := http.Post(ts.URL+"/api/v1/pairing/confirm", "application/json", bytes.NewBuffer(confirmBody))
-	if err != nil || resReplay.StatusCode != http.StatusBadRequest {
-		t.Fatalf("Expected replayed challenge to be rejected with 400 Bad Request, got: %v", resReplay)
+	if err != nil || resReplay.StatusCode != http.StatusOK {
+		t.Fatalf("Expected same-device replay to return 200 OK (cached response), got: %v", resReplay)
 	}
 }
 
