@@ -99,6 +99,12 @@ class QrPairingPayload {
 
     final expiresAt = DateTime.parse(expiresAtStr);
 
+    // Normalise expiresAtStr to RFC3339 seconds-precision (no milliseconds)
+    // so it always matches what the Go host stored in ch.ExpiresAtStr.
+    // Go uses time.RFC3339 which produces "2006-01-02T15:04:05Z07:00" (no sub-seconds).
+    // Dart's DateTime.parse accepts both; toIso8601String() may add .000 — we strip it.
+    final normalisedExpiresAtStr = _normaliseRFC3339(expiresAtStr);
+
     return QrPairingPayload(
       version: v!,
       challengeId: challengeId,
@@ -109,8 +115,16 @@ class QrPairingPayload {
       confirmUrl: confirmUrl,
       brokerUrl: brokerUrl,
       expiresAt: expiresAt,
-      rawExpiresAt: expiresAtStr,
+      rawExpiresAt: normalisedExpiresAtStr,
     );
+  }
+
+  /// Strips sub-second precision from an RFC3339 timestamp so it matches
+  /// Go's time.RFC3339 format exactly (e.g. "2026-11-23T18:27:35Z" not
+  /// "2026-11-23T18:27:35.000Z").
+  static String _normaliseRFC3339(String s) {
+    // Remove fractional seconds: replace ".NNN" before "Z" or "+HH:MM" / "-HH:MM"
+    return s.replaceFirst(RegExp(r'\.\d+(?=[Z+\-])'), '');
   }
 
   factory QrPairingPayload.fromRawString(String raw) {
@@ -137,7 +151,10 @@ class QrPairingPayload {
       if (pairingSecret.isNotEmpty) 'pairing_secret': pairingSecret,
       'confirm_url': confirmUrl,
       if (brokerUrl != null && brokerUrl!.isNotEmpty) 'broker_url': brokerUrl,
-      'expires_at': expiresAt.toUtc().toIso8601String(),
+      // IMPORTANT: preserve rawExpiresAt exactly as received from the host
+      // so the HMAC proof input string never diverges due to millisecond
+      // formatting differences (Dart toIso8601String adds .000, Go RFC3339 does not).
+      'expires_at': rawExpiresAt,
     };
   }
 }
