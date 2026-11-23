@@ -92,15 +92,12 @@ class PairingClient {
       'proof_signature': proofSig,
     });
 
-    final candidateUris = <Uri>[confirmUri];
     final port = confirmUri.hasPort ? confirmUri.port : 8082;
-
-    if (!candidateUris.any((u) => u.host == 'localhost')) {
-      candidateUris.add(Uri.parse('http://localhost:$port/api/v1/pairing/confirm'));
-    }
-    if (!candidateUris.any((u) => u.host == '10.0.2.2')) {
-      candidateUris.add(Uri.parse('http://10.0.2.2:$port/api/v1/pairing/confirm'));
-    }
+    final candidateUris = <Uri>[
+      Uri.parse('http://localhost:$port/api/v1/pairing/confirm'),
+      confirmUri,
+      Uri.parse('http://10.0.2.2:$port/api/v1/pairing/confirm'),
+    ];
 
     http.Response? response;
     Object? lastError;
