@@ -1,7 +1,11 @@
 import 'package:flutter/material.dart';
+import '../../../core/network/api_client.dart';
+import '../../../core/security/secure_storage.dart';
 
 class RemoteTasksScreen extends StatefulWidget {
-  const RemoteTasksScreen({super.key});
+  final String? workspaceId;
+
+  const RemoteTasksScreen({super.key, this.workspaceId});
 
   @override
   State<RemoteTasksScreen> createState() => _RemoteTasksScreenState();
@@ -13,7 +17,7 @@ class _RemoteTasksScreenState extends State<RemoteTasksScreen> {
   bool _autoScroll = true;
   final ScrollController _scrollController = ScrollController();
 
-  void _runTask(String taskName, String command, List<String> args) async {
+  Future<void> _runTask(String taskName, String command, List<String> args) async {
     setState(() {
       _isRunning = true;
       _logs.add('--- Executing Task: $taskName ($command ${args.join(" ")}) ---');
@@ -21,30 +25,53 @@ class _RemoteTasksScreenState extends State<RemoteTasksScreen> {
 
     _scrollToBottom();
 
-    // Stream simulated output chunks from host
-    final chunks = [
-      'Initializing Gradle Daemon...',
-      'Executing tasks: [:app:assembleDebug]',
-      '> Task :app:preBuild UP-TO-DATE',
-      '> Task :app:compileDebugKotlin OK',
-      '> Task :app:compileDebugJavaWithJavac OK',
-      'BUILD SUCCESSFUL in 3s (5 actionable tasks: 3 executed, 2 up-to-date)',
-    ];
-
-    for (final chunk in chunks) {
-      await Future.delayed(const Duration(milliseconds: 500));
-      if (!mounted) return;
-      setState(() {
-        _logs.add(chunk);
-      });
-      _scrollToBottom();
+    final session = await SecureStorageService.instance.getPairedSession();
+    if (session == null || session['brokerUrl'] == null) {
+      if (mounted) {
+        setState(() {
+          _isRunning = false;
+          _logs.add('--- Error: No active host session. Pair machine to execute terminal commands. ---');
+        });
+        _scrollToBottom();
+      }
+      return;
     }
+
+    final client = HostBridgeApiClient(
+      baseUrl: session['brokerUrl'] ?? 'http://localhost:8082',
+      sessionToken: session['token'],
+    );
+
+    final wsId = widget.workspaceId ?? (session['machineId'] ?? 'workspace');
+
+    final res = await client.executeProcess(
+      workspaceId: wsId,
+      command: command,
+      args: args,
+    );
 
     if (mounted) {
       setState(() {
         _isRunning = false;
-        _logs.add('--- Task Completed with exit code 0 ---\n');
       });
+
+      if (res != null) {
+        final stdout = res['stdout'] as String? ?? '';
+        final stderr = res['stderr'] as String? ?? '';
+        final exitCode = res['exit_code'] ?? 0;
+
+        if (stdout.isNotEmpty) {
+          _logs.add(stdout);
+        }
+        if (stderr.isNotEmpty) {
+          _logs.add('[STDERR] $stderr');
+        }
+
+        _logs.add('--- Task Completed with exit code $exitCode ---\n');
+      } else {
+        _logs.add('--- Task Execution Error: Host bridge did not return a valid response ---');
+      }
+
       _scrollToBottom();
     }
   }
@@ -80,12 +107,14 @@ class _RemoteTasksScreenState extends State<RemoteTasksScreen> {
                   onPressed: _isRunning ? null : () => _runTask('Gradle Build', 'gradlew', ['assembleDebug']),
                   icon: const Icon(Icons.play_arrow, size: 16),
                   label: const Text('Gradle Build'),
+                  style: ElevatedButton.styleFrom(backgroundColor: Colors.purpleAccent, foregroundColor: Colors.white),
                 ),
                 const SizedBox(width: 8),
                 ElevatedButton.icon(
                   onPressed: _isRunning ? null : () => _runTask('Run Tests', 'gradlew', ['test']),
                   icon: const Icon(Icons.bug_report, size: 16),
                   label: const Text('Gradle Test'),
+                  style: ElevatedButton.styleFrom(backgroundColor: Colors.deepPurple, foregroundColor: Colors.white),
                 ),
                 const SizedBox(width: 8),
                 ElevatedButton.icon(
@@ -99,11 +128,11 @@ class _RemoteTasksScreenState extends State<RemoteTasksScreen> {
                     onPressed: () {
                       setState(() {
                         _isRunning = false;
-                        _logs.add('--- Process Cancelled by User ---');
+                        _logs.add('--- Process Execution Stopped ---');
                       });
                     },
                     icon: const Icon(Icons.stop, color: Colors.redAccent),
-                    label: const Text('Cancel Process', style: TextStyle(color: Colors.redAccent)),
+                    label: const Text('Stop', style: TextStyle(color: Colors.redAccent)),
                   ),
               ],
             ),
@@ -121,7 +150,7 @@ class _RemoteTasksScreenState extends State<RemoteTasksScreen> {
                 children: [
                   Icon(Icons.terminal, size: 16, color: Colors.tealAccent),
                   SizedBox(width: 8),
-                  Text('Host Build Output Terminal', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                  Text('Host Terminal Output', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
                 ],
               ),
               Row(
@@ -150,38 +179,62 @@ class _RemoteTasksScreenState extends State<RemoteTasksScreen> {
           ),
         ),
 
-        // Streaming Terminal Log View
+        // Streaming Terminal Log View or Empty Terminal Prompt
         Expanded(
           child: Container(
             color: const Color(0xFF121212),
             padding: const EdgeInsets.all(12.0),
-            child: ListView.builder(
-              controller: _scrollController,
-              itemCount: _logs.length,
-              itemBuilder: (context, index) {
-                final logLine = _logs[index];
-                final isHeader = logLine.startsWith('---');
-                final isSuccess = logLine.contains('SUCCESSFUL');
-                return Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 2.0),
-                  child: Text(
-                    logLine,
-                    style: TextStyle(
-                      fontFamily: 'monospace',
-                      fontSize: 12.0,
-                      color: isHeader
-                          ? Colors.purpleAccent
-                          : isSuccess
-                              ? Colors.greenAccent
-                              : Colors.white70,
-                    ),
+            width: double.infinity,
+            child: _logs.isEmpty
+                ? const Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    crossAxisAlignment: CrossAxisAlignment.center,
+                    children: [
+                      Icon(Icons.terminal, size: 48, color: Colors.grey),
+                      SizedBox(height: 12),
+                      Text(
+                        'Host Terminal Ready',
+                        style: TextStyle(fontWeight: FontWeight.bold, color: Colors.tealAccent, fontSize: 15),
+                      ),
+                      SizedBox(height: 6),
+                      Text(
+                        'Select a quick task above (Gradle Build, Gradle Test, ADB Devices) to execute commands on your desktop host.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(color: Colors.grey, fontSize: 12),
+                      ),
+                    ],
+                  )
+                : ListView.builder(
+                    controller: _scrollController,
+                    itemCount: _logs.length,
+                    itemBuilder: (context, index) {
+                      final logLine = _logs[index];
+                      final isHeader = logLine.startsWith('---');
+                      final isSuccess = logLine.contains('SUCCESSFUL') || logLine.contains('Completed');
+                      final isErr = logLine.contains('STDERR') || logLine.contains('Error');
+                      return Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 2.0),
+                        child: Text(
+                          logLine,
+                          style: TextStyle(
+                            fontFamily: 'monospace',
+                            fontSize: 12.0,
+                            color: isHeader
+                                ? Colors.purpleAccent
+                                : isSuccess
+                                    ? Colors.greenAccent
+                                    : isErr
+                                        ? Colors.redAccent
+                                        : Colors.white70,
+                          ),
+                        ),
+                      );
+                    },
                   ),
-                );
-              },
-            ),
           ),
         ),
       ],
     );
   }
 }
+
