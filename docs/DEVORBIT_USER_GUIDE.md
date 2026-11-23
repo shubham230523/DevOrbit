@@ -29,45 +29,33 @@ DevOrbit Mobile features a dark-themed 5-tab bottom navigation bar designed for 
 
 ---
 
-## 3. How to Launch the Host Bridge Daemon on Your Computer
+## 3. How to Launch Services & Connect (Connection Broker + Host Bridge)
 
-Before your mobile phone can connect, you need to start the **DevOrbit Host Bridge** on your computer.
+Before your mobile phone can connect via WSS broker, ensure both services are running on your computer:
 
-### Option A: Launching on Windows (PowerShell or Command Prompt)
-1. Open PowerShell in your project root and navigate to the host bridge folder:
-   ```powershell
-   Set-Location agents/host-bridge
-   ```
-2. (Optional) Set your Gemini API key for real AI coding:
-   ```powershell
-   $env:DEVORBIT_GEMINI_API_KEY="AIzaSy..."
-   ```
-3. Run the Host Bridge daemon:
-   ```powershell
-   # Option 1: Direct Go run
-   go run ./cmd/host-bridge
+### Step A: Launch Connection Broker (Port 8081)
+In terminal / PowerShell:
+```powershell
+Set-Location services/connection-broker
+go run ./cmd/connection-broker
+```
+*(Listening on `:8081`)*
 
-   # Option 2: Build & run executable
-   go build -o host-bridge.exe ./cmd/host-bridge
-   .\host-bridge.exe
-   ```
+### Step B: Launch Host Bridge (Port 8082)
+In a second terminal window:
+```powershell
+Set-Location agents/host-bridge
+$env:DEVORBIT_GEMINI_API_KEY="AIzaSy..."  # (Optional for Gemini AI)
+go run ./cmd/host-bridge
+```
+*(Listening on `:8082`)*
 
-### Option B: Launching on Linux / macOS (Terminal)
-1. Open terminal and navigate to the host bridge folder:
-   ```bash
-   cd agents/host-bridge
-   ```
-2. (Optional) Set your Gemini API key:
-   ```bash
-   export DEVORBIT_GEMINI_API_KEY="AIzaSy..."
-   ```
-3. Run the Host Bridge daemon:
-   ```bash
-   # Option 1: Direct Go run
-   go run ./cmd/host-bridge
-
-   # Option 2: Build binary & run
-   go build -o host-bridge ./cmd/host-bridge
+### Step C: Enable USB / ADB Forwarding (For USB testing)
+If testing on a physical phone connected over USB, run this command once in terminal:
+```bash
+adb reverse tcp:8081 tcp:8081; adb reverse tcp:8082 tcp:8082
+```
+*(This allows `ws://127.0.0.1:8081` on your phone to connect directly to the broker over USB).*
    ./host-bridge
    ```
 
