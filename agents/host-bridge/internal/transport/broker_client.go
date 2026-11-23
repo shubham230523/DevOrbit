@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -49,13 +51,14 @@ type ApplicationResponseEnvelope struct {
 }
 
 type DeviceSession struct {
-	SessionID  string
-	DeviceID   string
-	E2ESession *security.E2ESession
-	ExpiresAt  time.Time
-	cancel     context.CancelFunc
-	mu         sync.Mutex
-	conn       *websocket.Conn
+	SessionID     string
+	DeviceID      string
+	MasterSecret  string
+	E2ESession    *security.E2ESession
+	ExpiresAt     time.Time
+	cancel        context.CancelFunc
+	mu            sync.Mutex
+	conn          *websocket.Conn
 }
 
 type BrokerClient struct {
@@ -71,6 +74,7 @@ type BrokerClient struct {
 	stopChan       chan struct{}
 	ctx            context.Context
 	cancel         context.CancelFunc
+	storePath      string
 }
 
 func NewBrokerClient(brokerURL, machineID, sessionID, hostToken string, server *httptransport.Server) *BrokerClient {
@@ -172,11 +176,12 @@ func (bc *BrokerClient) ProvisionSession(sessionID, deviceID, sessionSecret stri
 
 	sessCtx, sessCancel := context.WithCancel(bc.ctx)
 	ds := &DeviceSession{
-		SessionID:  sessionID,
-		DeviceID:   deviceID,
-		E2ESession: e2eSess,
-		ExpiresAt:  expiry,
-		cancel:     sessCancel,
+		SessionID:    sessionID,
+		DeviceID:     deviceID,
+		MasterSecret: sessionSecret,
+		E2ESession:   e2eSess,
+		ExpiresAt:    expiry,
+		cancel:       sessCancel,
 	}
 
 	bc.sessions[sessionID] = ds
@@ -186,6 +191,7 @@ func (bc *BrokerClient) ProvisionSession(sessionID, deviceID, sessionSecret stri
 	bc.deviceSessions[deviceID][sessionID] = true
 	bc.SessionID = sessionID // Update primary session pointer
 	bc.E2ESession = e2eSess
+	bc.saveSessionsToDiskLocked()
 	bc.mu.Unlock()
 
 	// Launch dedicated, concurrent session loop for this device session
@@ -194,6 +200,73 @@ func (bc *BrokerClient) ProvisionSession(sessionID, deviceID, sessionSecret stri
 	log.Printf("BrokerClient: Authenticated independent session provisioned for session=%s device=%s (total active: %d)",
 		sessionID, deviceID, bc.ActiveSessionCount())
 	return nil
+}
+
+type StoredSession struct {
+	SessionID     string    `json:"session_id"`
+	DeviceID      string    `json:"device_id"`
+	SessionSecret string    `json:"session_secret"`
+	ExpiresAt     time.Time `json:"expires_at"`
+}
+
+func (bc *BrokerClient) EnableSessionPersistence(customPath string) {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+	if customPath != "" {
+		bc.storePath = customPath
+	} else {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			home = "."
+		}
+		dir := filepath.Join(home, ".devorbit")
+		_ = os.MkdirAll(dir, 0700)
+		bc.storePath = filepath.Join(dir, "host_sessions.json")
+	}
+}
+
+func (bc *BrokerClient) saveSessionsToDiskLocked() {
+	if bc.storePath == "" {
+		return
+	}
+	var list []StoredSession
+	for _, ds := range bc.sessions {
+		if ds.MasterSecret != "" && time.Now().UTC().Before(ds.ExpiresAt) {
+			list = append(list, StoredSession{
+				SessionID:     ds.SessionID,
+				DeviceID:      ds.DeviceID,
+				SessionSecret: ds.MasterSecret,
+				ExpiresAt:     ds.ExpiresAt,
+			})
+		}
+	}
+	data, err := json.MarshalIndent(list, "", "  ")
+	if err == nil {
+		_ = os.WriteFile(bc.storePath, data, 0600)
+	}
+}
+
+func (bc *BrokerClient) LoadPersistedSessions() {
+	bc.mu.RLock()
+	storePath := bc.storePath
+	bc.mu.RUnlock()
+
+	if storePath == "" {
+		return
+	}
+	data, err := os.ReadFile(storePath)
+	if err != nil {
+		return
+	}
+	var list []StoredSession
+	if err := json.Unmarshal(data, &list); err != nil {
+		return
+	}
+	for _, s := range list {
+		if time.Now().UTC().Before(s.ExpiresAt) {
+			_ = bc.ProvisionSession(s.SessionID, s.DeviceID, s.SessionSecret, s.ExpiresAt)
+		}
+	}
 }
 
 func (bc *BrokerClient) RevokeSession(sessionID string) {
@@ -436,7 +509,7 @@ func (bc *BrokerClient) runSessionLoop(ctx context.Context, ds *DeviceSession) {
 }
 
 func (bc *BrokerClient) Start(ctx context.Context) {
-	// Active sessions manage their own connection loops via ProvisionSession
+	bc.LoadPersistedSessions()
 }
 
 func (bc *BrokerClient) Stop() {

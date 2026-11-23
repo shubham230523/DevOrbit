@@ -126,6 +126,7 @@ func main() {
 
 	// 5. Outbound Connection Broker Client
 	brokerClient := transport.NewBrokerClient(cfg.BrokerWSURL, cfg.HostID, "", cfg.HostSecret, serverEngine)
+	brokerClient.EnableSessionPersistence("")
 	serverEngine.SetSessionProvisioner(func(sessionID, deviceID, sessionSecret string, expiry time.Time) error {
 		return brokerClient.ProvisionSession(sessionID, deviceID, sessionSecret, expiry)
 	})
