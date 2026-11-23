@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	qrcode "github.com/skip2/go-qrcode"
+
 	"devorbit.net/agents/host-bridge/internal/application"
 	"devorbit.net/agents/host-bridge/internal/config"
 	"devorbit.net/agents/host-bridge/internal/infrastructure/adb"
@@ -126,12 +128,31 @@ func main() {
 			"broker_url":      cfg.BrokerWSURL,
 			"expires_at":      ch.ExpiresAt.UTC().Format(time.RFC3339),
 		}
+		compactJSON, _ := json.Marshal(qrMap)
 		qrBytes, _ := json.MarshalIndent(qrMap, "", "  ")
 
 		fmt.Println("================================================================================")
-		fmt.Println("                DEVORBIT HOST BRIDGE — PAIRING CHALLENGE PAYLOAD                ")
+		fmt.Println("                DEVORBIT HOST BRIDGE — PAIRING QR CODE & PAYLOAD                 ")
 		fmt.Println("================================================================================")
-		fmt.Println("Copy or scan this JSON payload into DevOrbit Mobile app (Machines -> Pair Host):")
+
+		if q, err := qrcode.New(string(compactJSON), qrcode.Low); err == nil {
+			fmt.Println("Scan this QR Code with your phone camera in DevOrbit Mobile:")
+			fmt.Println()
+			bitmap := q.Bitmap()
+			for _, row := range bitmap {
+				for _, cell := range row {
+					if cell {
+						fmt.Print("██")
+					} else {
+						fmt.Print("  ")
+					}
+				}
+				fmt.Println()
+			}
+			fmt.Println()
+		}
+
+		fmt.Println("Or copy/paste this JSON payload manually (Machines -> Pair Host):")
 		fmt.Println()
 		fmt.Println(string(qrBytes))
 		fmt.Println("================================================================================")

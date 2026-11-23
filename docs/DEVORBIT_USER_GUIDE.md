@@ -71,13 +71,22 @@ Before your mobile phone can connect, you need to start the **DevOrbit Host Brid
    ./host-bridge
    ```
 
-> **Console Output & Pairing Payload Confirmation**:
-> When the Host Bridge starts, it prints the startup confirmation and initial **Pairing Challenge Payload**:
+> **Console Output & Visual Terminal QR Code**:
+> When the Host Bridge starts, it renders a **visual 2D QR Code image** directly in your terminal using Unicode block characters, as well as the JSON payload:
 > ```text
 > ================================================================================
->                 DEVORBIT HOST BRIDGE — PAIRING CHALLENGE PAYLOAD
+>                 DEVORBIT HOST BRIDGE — PAIRING QR CODE & PAYLOAD
 > ================================================================================
-> Copy or scan this JSON payload into DevOrbit Mobile app (Machines -> Pair Host):
+> Scan this QR Code with your phone camera in DevOrbit Mobile:
+>
+> ██████████████████████████████████████████████████
+> ██████████████████████████████████████████████████
+> ████      ████  ██    ██    ██  ██████    ████████
+> ████  ██  ████  ████  ██  ████      ██  ████  ████
+> ████  ██  ████  ████  ██  ██████  ████  ████  ████
+> ...
+>
+> Or copy/paste this JSON payload manually (Machines -> Pair Host):
 >
 > {
 >   "v": "1.0",
@@ -85,8 +94,7 @@ Before your mobile phone can connect, you need to start the **DevOrbit Host Brid
 >   "host_id": "host-desktop-...",
 >   "host_name": "Desktop Host",
 >   "pairing_payload": "...",
->   "confirm_url": "http://...",
->   "expires_at": "..."
+>   "confirm_url": "http://10.118.3.69:8082/api/v1/pairing/confirm"
 > }
 > ================================================================================
 > 2026/11/23 21:43:12 DevOrbit Host Bridge v1.2.1 listening on :8082
@@ -98,11 +106,10 @@ Before your mobile phone can connect, you need to start the **DevOrbit Host Brid
 
 ### Step 1: Pair Your Phone with Your Computer (One-Time Setup)
 1. Launch the **Host Bridge** daemon on your workstation computer (as shown above).
-2. Copy the **Pairing Challenge JSON** printed in your terminal.
-3. On your mobile phone, open DevOrbit and go to the **`Machines`** tab (or tap **`Pair Host Machine`** on Home).
-4. Tap **`Pair Host Machine (Scan QR)`**.
-5. Tap **`Enter Payload Manually / Test`** and paste the JSON payload (or scan QR code).
-6. Your phone and computer are now cryptographically paired via HKDF-SHA256 E2E encryption!
+2. On your mobile phone, open DevOrbit and go to **`Machines`** → tap **`Pair Host Machine (Scan QR)`**.
+3. Point your phone camera at the **terminal screen QR Code** to scan it instantly!
+   *(Or tap "Enter Payload Manually" and paste the JSON payload).*
+4. Your phone and computer are now cryptographically paired via HKDF-SHA256 E2E encryption!
 
 ---
 
