@@ -176,6 +176,17 @@ func (p *PairingEngine) ConfirmPairing(chID, deviceID, deviceName, pubKey, proof
 	return sessionToken, nil
 }
 
+func (p *PairingEngine) UnconsumeChallenge(chID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if ch, found := p.challenges[chID]; found {
+		ch.Consumed = false
+		ch.CachedDeviceID = ""
+		ch.CachedSessionToken = ""
+	}
+}
+
 func (p *PairingEngine) GenerateProofForChallenge(chID, deviceID string) (string, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()

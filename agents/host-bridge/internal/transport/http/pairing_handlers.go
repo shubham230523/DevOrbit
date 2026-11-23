@@ -214,6 +214,7 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 			expiry,
 		)
 		if err != nil {
+			s.pairingEngine.UnconsumeChallenge(req.ChallengeID)
 			writeError(w, http.StatusBadGateway, "failed to register session authorization with connection broker: "+err.Error())
 			return
 		}
@@ -225,6 +226,7 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 			if s.brokerAuthorizer != nil {
 				_ = s.brokerAuthorizer.RevokeDevice(r.Context(), s.pairingEngine.HostID(), req.DeviceID)
 			}
+			s.pairingEngine.UnconsumeChallenge(req.ChallengeID)
 			writeError(w, http.StatusInternalServerError, "failed to provision session on host bridge: "+err.Error())
 			return
 		}

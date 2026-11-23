@@ -23,6 +23,7 @@ class QrPairingDialog extends StatefulWidget {
 class _QrPairingDialogState extends State<QrPairingDialog> {
   late final PairingClient _pairingClient;
   late final SecureStorageService _storage;
+  late final String _dialogDeviceId;
   MobileScannerController? _scannerController;
 
   bool _isPairing = false;
@@ -34,6 +35,7 @@ class _QrPairingDialogState extends State<QrPairingDialog> {
   @override
   void initState() {
     super.initState();
+    _dialogDeviceId = widget.testDeviceId ?? 'mobile-${DateTime.now().millisecondsSinceEpoch % 1000000}';
     _pairingClient = widget.pairingClient ?? PairingClient();
     _storage = widget.secureStorage ?? SecureStorageService.instance;
     _scannerController = MobileScannerController(
@@ -58,6 +60,9 @@ class _QrPairingDialogState extends State<QrPairingDialog> {
       _statusText = 'Validating QR pairing payload...';
     });
 
+    // Temporarily pause the scanner so it doesn't fire continuously while processing
+    _scannerController?.stop();
+
     QrPairingPayload payload;
     try {
       payload = QrPairingPayload.fromRawString(rawPayload);
@@ -68,6 +73,9 @@ class _QrPairingDialogState extends State<QrPairingDialog> {
           _errorMessage = 'Invalid QR code: ${e.toString().replaceAll("FormatException: ", "")}';
           _statusText = null;
         });
+        if (!_showManualInput) {
+          _scannerController?.start();
+        }
       }
       return;
     }
@@ -79,6 +87,9 @@ class _QrPairingDialogState extends State<QrPairingDialog> {
           _errorMessage = 'Pairing challenge expired at ${payload.expiresAt.toLocal()}. Please generate a fresh QR code.';
           _statusText = null;
         });
+        if (!_showManualInput) {
+          _scannerController?.start();
+        }
       }
       return;
     }
@@ -87,7 +98,7 @@ class _QrPairingDialogState extends State<QrPairingDialog> {
       _statusText = 'Verifying pairing with ${payload.hostName} (${payload.hostId})...';
     });
 
-    final deviceId = widget.testDeviceId ?? 'mobile-${DateTime.now().millisecondsSinceEpoch % 1000000}';
+    final deviceId = _dialogDeviceId;
     const deviceName = 'DevOrbit Mobile Client';
 
     try {
@@ -115,6 +126,9 @@ class _QrPairingDialogState extends State<QrPairingDialog> {
             _errorMessage = 'Pairing error: $e';
           }
         });
+        if (!_showManualInput) {
+          _scannerController?.start();
+        }
       }
     }
   }
