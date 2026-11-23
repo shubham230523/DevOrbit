@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import '../../../core/network/broker_websocket_client.dart';
@@ -181,7 +182,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
     }
 
     final url = _brokerController.text.trim();
-    if (url.isEmpty) return;
+    if (url.isEmpty) {
+      if (mounted) {
+        setState(() {
+          _errorMessage = 'Please enter a valid Broker WSS URL (e.g. ws://127.0.0.1:8081).';
+        });
+      }
+      return;
+    }
 
     _brokerClient?.disconnect();
     _brokerClient?.dispose();
@@ -200,14 +208,21 @@ class _DashboardScreenState extends State<DashboardScreen> {
       _errorMessage = null;
     });
 
+    Timer(const Duration(seconds: 4), () {
+      if (mounted && _isLoading && _connectionState != BrokerConnectionState.authenticatedBrokerSessionActive) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
+    });
+
     _brokerClient!.stateStream.listen((state) async {
       if (mounted) {
         setState(() {
           _connectionState = state;
-          if (state == BrokerConnectionState.authenticatedBrokerSessionActive) {
-            _isLoading = false;
-            _errorMessage = null;
-          }
+          _isLoading = (state == BrokerConnectionState.connecting ||
+                        state == BrokerConnectionState.authenticating ||
+                        state == BrokerConnectionState.reconnecting);
         });
       }
 
@@ -475,8 +490,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   ),
                   const SizedBox(width: 8),
                   ElevatedButton(
-                    onPressed: (_isLoading || !hasValidCredentials) ? null : _connectToBroker,
-                    child: const Text('Connect'),
+                    onPressed: !hasValidCredentials ? null : _connectToBroker,
+                    child: _isLoading
+                        ? const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                          )
+                        : const Text('Connect'),
                   ),
                 ],
               ),
