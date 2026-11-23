@@ -136,15 +136,27 @@ func main() {
 		fmt.Println("================================================================================")
 
 		if q, err := qrcode.New(string(compactJSON), qrcode.Low); err == nil {
-			fmt.Println("Scan this QR Code with your phone camera in DevOrbit Mobile:")
-			fmt.Println()
+			q.DisableBorder = true
 			bitmap := q.Bitmap()
-			for _, row := range bitmap {
-				for _, cell := range row {
-					if cell {
-						fmt.Print("##")
+			fmt.Println("Scan this Compact QR Code in DevOrbit Mobile (Machines -> Pair Host):")
+			fmt.Println()
+			for y := 0; y < len(bitmap); y += 2 {
+				fmt.Print("  ") // padding margin
+				for x := 0; x < len(bitmap[y]); x++ {
+					top := bitmap[y][x]
+					bottom := false
+					if y+1 < len(bitmap) {
+						bottom = bitmap[y+1][x]
+					}
+
+					if top && bottom {
+						fmt.Print("█")
+					} else if top && !bottom {
+						fmt.Print("▀")
+					} else if !top && bottom {
+						fmt.Print("▄")
 					} else {
-						fmt.Print("  ")
+						fmt.Print(" ")
 					}
 				}
 				fmt.Println()
