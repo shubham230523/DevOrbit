@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -103,6 +105,36 @@ func main() {
 
 	brokerClient.Start(context.Background())
 	defer brokerClient.Stop()
+
+	// Print initial pairing challenge on startup for mobile pairing
+	if ch, err := pairingEngine.CreateChallenge(30 * time.Minute); err == nil {
+		hostIP := "10.0.2.2"
+		confirmURL := fmt.Sprintf("http://%s:%d/api/v1/pairing/confirm", hostIP, cfg.Port)
+		if cfg.AdvertisedURL != "" {
+			confirmURL = fmt.Sprintf("%s/api/v1/pairing/confirm", strings.TrimRight(cfg.AdvertisedURL, "/"))
+		}
+
+		qrMap := map[string]interface{}{
+			"v":               "1.0",
+			"challenge_id":    ch.ID,
+			"host_id":         cfg.HostID,
+			"host_name":       cfg.HostName,
+			"pairing_payload": ch.Payload,
+			"pairing_secret":  ch.Secret,
+			"confirm_url":     confirmURL,
+			"broker_url":      cfg.BrokerWSURL,
+			"expires_at":      ch.ExpiresAt.UTC().Format(time.RFC3339),
+		}
+		qrBytes, _ := json.MarshalIndent(qrMap, "", "  ")
+
+		fmt.Println("================================================================================")
+		fmt.Println("                DEVORBIT HOST BRIDGE — PAIRING CHALLENGE PAYLOAD                ")
+		fmt.Println("================================================================================")
+		fmt.Println("Copy or scan this JSON payload into DevOrbit Mobile app (Machines -> Pair Host):")
+		fmt.Println()
+		fmt.Println(string(qrBytes))
+		fmt.Println("================================================================================")
+	}
 
 	go func() {
 		log.Printf("DevOrbit Host Bridge v1.2.1 listening on %s (HostID: %s, Allowed Roots: %d)", addr, cfg.HostID, len(cfg.AllowedRoots))
