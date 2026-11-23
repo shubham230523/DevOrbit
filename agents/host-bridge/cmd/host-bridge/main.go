@@ -186,12 +186,25 @@ func getLocalIP() string {
 	if err != nil {
 		return "127.0.0.1"
 	}
+	var fallbackIP string
 	for _, address := range addrs {
-		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-			if ipnet.IP.To4() != nil {
-				return ipnet.IP.String()
+		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && !ipnet.IP.IsLinkLocalUnicast() {
+			ip := ipnet.IP.To4()
+			if ip == nil {
+				continue
 			}
+			ipStr := ip.String()
+			if strings.HasPrefix(ipStr, "169.254.") {
+				continue
+			}
+			if strings.HasPrefix(ipStr, "10.") || strings.HasPrefix(ipStr, "192.168.") {
+				return ipStr
+			}
+			fallbackIP = ipStr
 		}
+	}
+	if fallbackIP != "" {
+		return fallbackIP
 	}
 	return "127.0.0.1"
 }

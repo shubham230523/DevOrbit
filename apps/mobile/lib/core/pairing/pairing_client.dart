@@ -95,8 +95,10 @@ class PairingClient {
     final candidateUris = <Uri>[confirmUri];
     final port = confirmUri.hasPort ? confirmUri.port : 8082;
 
-    if (confirmUri.host == '10.0.2.2' || confirmUri.host == '127.0.0.1' || confirmUri.host == 'localhost') {
+    if (!candidateUris.any((u) => u.host == 'localhost')) {
       candidateUris.add(Uri.parse('http://localhost:$port/api/v1/pairing/confirm'));
+    }
+    if (!candidateUris.any((u) => u.host == '10.0.2.2')) {
       candidateUris.add(Uri.parse('http://10.0.2.2:$port/api/v1/pairing/confirm'));
     }
 
