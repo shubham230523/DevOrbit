@@ -79,36 +79,35 @@ class _MachineManagementScreenState extends State<MachineManagementScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    Text(
-                      'Connection Mode',
-                      style: Theme.of(context).textTheme.titleMedium,
-                    ),
-                    SegmentedButton<bool>(
-                      segments: const [
-                        ButtonSegment(
-                          value: false,
-                          label: Text('Broker (WSS)'),
-                          icon: Icon(Icons.cloud_sync),
-                        ),
-                        ButtonSegment(
-                          value: true,
-                          label: Text('LAN (mTLS)'),
-                          icon: Icon(Icons.wifi),
-                        ),
-                      ],
-                      selected: {_isLanMode},
-                      onSelectionChanged: (set) {
-                        setState(() {
-                          _isLanMode = set.first;
-                        });
-                      },
-                    ),
-                  ],
+                Text(
+                  'Connection Mode',
+                  style: Theme.of(context).textTheme.titleMedium,
                 ),
-                const SizedBox(height: 8),
+                const SizedBox(height: 10),
+                SizedBox(
+                  width: double.infinity,
+                  child: SegmentedButton<bool>(
+                    segments: const [
+                      ButtonSegment(
+                        value: false,
+                        label: Text('Broker (WSS)'),
+                        icon: Icon(Icons.cloud_sync, size: 18),
+                      ),
+                      ButtonSegment(
+                        value: true,
+                        label: Text('LAN (mTLS)'),
+                        icon: Icon(Icons.wifi, size: 18),
+                      ),
+                    ],
+                    selected: {_isLanMode},
+                    onSelectionChanged: (set) {
+                      setState(() {
+                        _isLanMode = set.first;
+                      });
+                    },
+                  ),
+                ),
+                const SizedBox(height: 10),
                 Text(
                   _isLanMode
                       ? 'Direct mutual TLS connection on local Wi-Fi network.'
