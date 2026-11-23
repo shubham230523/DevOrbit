@@ -19,7 +19,7 @@ class HostBridgeApiClient {
       final res = await http.get(
         Uri.parse('$baseUrl/api/v1/health'),
         headers: _headers,
-      ).timeout(const Duration(seconds: 4));
+      ).timeout(const Duration(seconds: 2));
       stopwatch.stop();
 
       if (res.statusCode == 200) {
@@ -36,7 +36,7 @@ class HostBridgeApiClient {
       final res = await http.get(
         Uri.parse('$baseUrl/api/v1/workspaces'),
         headers: _headers,
-      ).timeout(const Duration(seconds: 5));
+      ).timeout(const Duration(milliseconds: 2500));
 
       if (res.statusCode == 200) {
         final list = jsonDecode(res.body) as List<dynamic>;
@@ -58,7 +58,7 @@ class HostBridgeApiClient {
           'workspace_id': workspaceId,
           'relative_path': relativePath,
         }),
-      ).timeout(const Duration(seconds: 5));
+      ).timeout(const Duration(milliseconds: 2500));
       if (res.statusCode == 200) {
         return jsonDecode(res.body) as Map<String, dynamic>;
       }

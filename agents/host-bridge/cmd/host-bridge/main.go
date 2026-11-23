@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -108,7 +109,7 @@ func main() {
 
 	// Print initial pairing challenge on startup for mobile pairing
 	if ch, err := pairingEngine.CreateChallenge(30 * time.Minute); err == nil {
-		hostIP := "10.0.2.2"
+		hostIP := getLocalIP()
 		confirmURL := fmt.Sprintf("http://%s:%d/api/v1/pairing/confirm", hostIP, cfg.Port)
 		if cfg.AdvertisedURL != "" {
 			confirmURL = fmt.Sprintf("%s/api/v1/pairing/confirm", strings.TrimRight(cfg.AdvertisedURL, "/"))
@@ -158,3 +159,19 @@ func main() {
 
 	log.Println("Host Bridge exited cleanly")
 }
+
+func getLocalIP() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "127.0.0.1"
+	}
+	for _, address := range addrs {
+		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			if ipnet.IP.To4() != nil {
+				return ipnet.IP.String()
+			}
+		}
+	}
+	return "127.0.0.1"
+}
+

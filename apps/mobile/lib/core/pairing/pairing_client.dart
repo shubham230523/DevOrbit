@@ -92,20 +92,41 @@ class PairingClient {
       'proof_signature': proofSig,
     });
 
-    http.Response response;
-    try {
-      response = await _httpClient
-          .post(
-            confirmUri,
-            headers: {
-              'Content-Type': 'application/json',
-              'Accept': 'application/json',
-            },
-            body: reqBody,
-          )
-          .timeout(const Duration(seconds: 10));
-    } catch (e) {
-      throw PairingException('Failed to connect to host/control plane: $e');
+    final candidateUris = <Uri>[confirmUri];
+    final port = confirmUri.hasPort ? confirmUri.port : 8082;
+
+    if (confirmUri.host == '10.0.2.2' || confirmUri.host == '127.0.0.1' || confirmUri.host == 'localhost') {
+      candidateUris.add(Uri.parse('http://localhost:$port/api/v1/pairing/confirm'));
+      candidateUris.add(Uri.parse('http://10.0.2.2:$port/api/v1/pairing/confirm'));
+    }
+
+    http.Response? response;
+    Object? lastError;
+
+    for (final uri in candidateUris) {
+      try {
+        final res = await _httpClient
+            .post(
+              uri,
+              headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+              },
+              body: reqBody,
+            )
+            .timeout(const Duration(seconds: 3));
+
+        response = res;
+        if (res.statusCode == 200 || res.statusCode == 201) {
+          break;
+        }
+      } catch (e) {
+        lastError = e;
+      }
+    }
+
+    if (response == null) {
+      throw PairingException('Failed to connect to host/control plane (${payload.confirmUrl}): $lastError');
     }
 
     if (response.statusCode != 200 && response.statusCode != 201) {
