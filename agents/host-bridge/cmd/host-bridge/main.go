@@ -109,6 +109,12 @@ func main() {
 	}
 	serverEngine.SetAIRouter(aiRouter)
 
+	// Initialize Gemini Agent Engine, Tool Executor, and Approval Manager
+	approvalMgr := application.NewApprovalManager()
+	agentExecutor := application.NewAgentToolExecutor(wsSvc, fsSvc, psSvc, gsSvc, dsSvc, approvalMgr)
+	agentEngine := application.NewGeminiAgentEngine(aiRouter, agentExecutor, approvalMgr)
+	serverEngine.SetAgentEngine(agentEngine)
+
 	mux := http.NewServeMux()
 	serverEngine.RegisterRoutes(mux)
 
