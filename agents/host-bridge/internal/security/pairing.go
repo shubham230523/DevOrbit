@@ -93,7 +93,9 @@ func (p *PairingEngine) CreateChallenge(ttl time.Duration) (*PairingChallenge, e
 	secretStr := hex.EncodeToString(secretBytes)
 
 	expiresAt := time.Now().Add(ttl)
-	expiresAtStr := expiresAt.Format(time.RFC3339)
+	// Always store as UTC RFC3339 so the HMAC authData string is timezone-independent.
+	// The QR JSON and the verification path must use the identical string.
+	expiresAtStr := expiresAt.UTC().Format(time.RFC3339)
 
 	ch := &PairingChallenge{
 		Version:      "1.0",

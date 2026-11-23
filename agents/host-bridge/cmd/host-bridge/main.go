@@ -144,7 +144,10 @@ func main() {
 			"pairing_secret":  ch.Secret,
 			"confirm_url":     confirmURL,
 			"broker_url":      cfg.BrokerWSURL,
-			"expires_at":      ch.ExpiresAt.UTC().Format(time.RFC3339),
+			// Use ch.ExpiresAtStr exactly — same string the host uses for HMAC verification.
+			// Never re-format ExpiresAt here: any timezone difference produces a different
+			// string and breaks the cryptographic proof on the mobile side.
+			"expires_at": ch.ExpiresAtStr,
 		}
 		compactJSON, _ := json.Marshal(qrMap)
 		qrBytes, _ := json.MarshalIndent(qrMap, "", "  ")
