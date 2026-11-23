@@ -196,16 +196,20 @@ class _QrPairingDialogState extends State<QrPairingDialog> {
                         }
                       },
                       errorBuilder: (context, error, child) {
+                        final errCode = error.errorCode.toString();
+                        final isAlreadyInit = errCode.contains('controllerAlreadyInitialized');
                         return Center(
                           child: Padding(
                             padding: const EdgeInsets.all(8.0),
                             child: Column(
                               mainAxisSize: MainAxisSize.min,
                               children: [
-                                const Icon(Icons.camera_alt_outlined, color: Colors.grey, size: 48),
+                                const Icon(Icons.qr_code_2, color: Colors.purpleAccent, size: 44),
                                 const SizedBox(height: 8),
                                 Text(
-                                  'Camera unavailable in test/desktop mode: ${error.errorCode}',
+                                  isAlreadyInit
+                                      ? 'Camera initialized. Tap below to enter payload manually if scanner is paused.'
+                                      : 'Camera scanner unavailable: $errCode',
                                   textAlign: TextAlign.center,
                                   style: const TextStyle(fontSize: 11, color: Colors.grey),
                                 ),
