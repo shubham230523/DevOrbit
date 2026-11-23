@@ -23,6 +23,12 @@ class _MachineManagementScreenState extends State<MachineManagementScreen> {
     _loadSession();
   }
 
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _loadSession();
+  }
+
   Future<void> _loadSession() async {
     final session = await _storage.getPairedSession();
     if (mounted) {

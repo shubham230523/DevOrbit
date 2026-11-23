@@ -42,37 +42,46 @@ class _ProjectExplorerScreenState extends State<ProjectExplorerScreen> {
     });
 
     final session = await SecureStorageService.instance.getPairedSession();
-    if (session == null || session['brokerUrl'] == null) {
-      if (mounted) {
-        setState(() {
-          _isLoading = false;
-          _files = [];
-        });
+    final token = session?['token'];
+
+    final candidateUrls = <String>[
+      'http://localhost:8082',
+      'http://127.0.0.1:8082',
+      'http://10.0.2.2:8082',
+    ];
+
+    if (session != null && session['brokerUrl'] != null && session['brokerUrl']!.isNotEmpty) {
+      final bUrl = session['brokerUrl']!
+          .replaceAll('ws://', 'http://')
+          .replaceAll('wss://', 'https://')
+          .replaceAll(':8081', ':8082');
+      if (!candidateUrls.contains(bUrl)) {
+        candidateUrls.insert(0, bUrl);
       }
-      return;
     }
 
-    final client = HostBridgeApiClient(
-      baseUrl: session['brokerUrl'] ?? 'http://localhost:8082',
-      sessionToken: session['token'],
-    );
+    for (final url in candidateUrls) {
+      final client = HostBridgeApiClient(baseUrl: url, sessionToken: token);
+      final wsRes = await client.listWorkspaces();
+      if (wsRes['success'] == true && mounted) {
+        final list = wsRes['workspaces'] as List<dynamic>;
+        setState(() {
+          _workspaces = list;
+          if (list.isNotEmpty) {
+            _selectedWorkspaceId = list.first['root_path'] as String?;
+            _loadDirectoryFiles(client, _selectedWorkspaceId!, '');
+          } else {
+            _isLoading = false;
+          }
+        });
+        return;
+      }
+    }
 
-    final wsRes = await client.listWorkspaces();
-    if (wsRes['success'] == true && mounted) {
-      final list = wsRes['workspaces'] as List<dynamic>;
-      setState(() {
-        _workspaces = list;
-        if (list.isNotEmpty) {
-          _selectedWorkspaceId = list.first['root_path'] as String?;
-          _loadDirectoryFiles(client, _selectedWorkspaceId!, '');
-        } else {
-          _isLoading = false;
-        }
-      });
-    } else if (mounted) {
+    if (mounted) {
       setState(() {
         _isLoading = false;
-        _errorMessage = wsRes['error'] ?? 'Unable to connect to host workspace service';
+        _errorMessage = 'Unable to connect to host workspace service';
       });
     }
   }

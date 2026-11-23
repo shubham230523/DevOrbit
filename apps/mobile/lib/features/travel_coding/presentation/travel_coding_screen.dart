@@ -20,7 +20,6 @@ class TravelCodingScreen extends StatefulWidget {
 }
 
 class _TravelCodingScreenState extends State<TravelCodingScreen> {
-  late HostBridgeApiClient _hostClient;
   late AgentApiClient _agentClient;
   late SecureStorageService _secureStorage;
 
@@ -37,7 +36,6 @@ class _TravelCodingScreenState extends State<TravelCodingScreen> {
   @override
   void initState() {
     super.initState();
-    _hostClient = HostBridgeApiClient(baseUrl: widget.hostBaseUrl, sessionToken: widget.sessionToken);
     _agentClient = AgentApiClient(baseUrl: widget.hostBaseUrl, sessionToken: widget.sessionToken);
     _secureStorage = SecureStorageService.instance;
     _initHostProjects();
@@ -45,15 +43,39 @@ class _TravelCodingScreenState extends State<TravelCodingScreen> {
   }
 
   Future<void> _initHostProjects() async {
-    final wsRes = await _hostClient.listWorkspaces();
-    if (wsRes['success'] == true && mounted) {
-      final list = wsRes['workspaces'] as List<dynamic>;
-      setState(() {
-        _workspaces = list;
-        if (list.isNotEmpty) {
-          _selectedWorkspaceId = list.first['root_path'];
-        }
-      });
+    final session = await _secureStorage.getPairedSession();
+    final token = session?['token'] ?? widget.sessionToken;
+
+    final candidateUrls = <String>[
+      'http://localhost:8082',
+      'http://127.0.0.1:8082',
+      'http://10.0.2.2:8082',
+    ];
+
+    if (session != null && session['brokerUrl'] != null && session['brokerUrl']!.isNotEmpty) {
+      final bUrl = session['brokerUrl']!
+          .replaceAll('ws://', 'http://')
+          .replaceAll('wss://', 'https://')
+          .replaceAll(':8081', ':8082');
+      if (!candidateUrls.contains(bUrl)) {
+        candidateUrls.insert(0, bUrl);
+      }
+    }
+
+    for (final url in candidateUrls) {
+      final client = HostBridgeApiClient(baseUrl: url, sessionToken: token);
+      final wsRes = await client.listWorkspaces();
+      if (wsRes['success'] == true && mounted) {
+        final list = wsRes['workspaces'] as List<dynamic>;
+        setState(() {
+          _agentClient = AgentApiClient(baseUrl: url, sessionToken: token);
+          _workspaces = list;
+          if (list.isNotEmpty) {
+            _selectedWorkspaceId = list.first['root_path'];
+          }
+        });
+        return;
+      }
     }
   }
 
