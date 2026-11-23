@@ -1,13 +1,17 @@
 import 'package:flutter/material.dart';
+import '../../../core/network/api_client.dart';
+import '../../../core/security/secure_storage.dart';
 import 'conflict_resolution_modal.dart';
 
 class CodeEditorScreen extends StatefulWidget {
   final String? filePath;
+  final String? workspaceId;
   final String? initialContent;
 
   const CodeEditorScreen({
     super.key,
     this.filePath,
+    this.workspaceId,
     this.initialContent,
   });
 
@@ -18,7 +22,10 @@ class CodeEditorScreen extends StatefulWidget {
 class _CodeEditorScreenState extends State<CodeEditorScreen> {
   late TextEditingController _textController;
   bool _isModified = false;
+  bool _isLoading = false;
   bool _isSaving = false;
+  String? _baseSHA256;
+  String? _errorMessage;
 
   @override
   void initState() {
@@ -32,6 +39,10 @@ class _CodeEditorScreenState extends State<CodeEditorScreen> {
         });
       }
     });
+
+    if (widget.filePath != null && widget.initialContent == null) {
+      _loadRemoteFileContent();
+    }
   }
 
   @override
@@ -41,54 +52,164 @@ class _CodeEditorScreenState extends State<CodeEditorScreen> {
       _textController.text = widget.initialContent ?? '';
       setState(() {
         _isModified = false;
+        _errorMessage = null;
+      });
+
+      if (widget.filePath != null && widget.initialContent == null) {
+        _loadRemoteFileContent();
+      }
+    }
+  }
+
+  Future<void> _loadRemoteFileContent() async {
+    if (widget.filePath == null) return;
+
+    setState(() {
+      _isLoading = true;
+      _errorMessage = null;
+    });
+
+    final session = await SecureStorageService.instance.getPairedSession();
+    if (session == null || session['brokerUrl'] == null) {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
+      return;
+    }
+
+    final client = HostBridgeApiClient(
+      baseUrl: session['brokerUrl'] ?? 'http://localhost:8082',
+      sessionToken: session['token'],
+    );
+
+    final wsId = widget.workspaceId ?? (session['machineId'] ?? 'workspace');
+    final res = await client.readFile(wsId, widget.filePath!);
+
+    if (res != null && mounted) {
+      setState(() {
+        _textController.text = res['content'] ?? '';
+        _baseSHA256 = res['sha256_hash'];
+        _isLoading = false;
+        _isModified = false;
+      });
+    } else if (mounted) {
+      setState(() {
+        _isLoading = false;
+        _errorMessage = 'Failed to load file content from host bridge.';
       });
     }
   }
 
-  void _saveFile() async {
+  Future<void> _saveFile() async {
     if (widget.filePath == null) return;
 
     setState(() {
       _isSaving = true;
+      _errorMessage = null;
     });
 
-    await Future.delayed(const Duration(milliseconds: 400));
+    final session = await SecureStorageService.instance.getPairedSession();
+    if (session == null || session['brokerUrl'] == null) {
+      if (mounted) {
+        setState(() {
+          _isSaving = false;
+          _errorMessage = 'No active host session. Pair machine to save changes.';
+        });
+      }
+      return;
+    }
+
+    final client = HostBridgeApiClient(
+      baseUrl: session['brokerUrl'] ?? 'http://localhost:8082',
+      sessionToken: session['token'],
+    );
+
+    final wsId = widget.workspaceId ?? (session['machineId'] ?? 'workspace');
+    final res = await client.writeFile(
+      workspaceId: wsId,
+      relativePath: widget.filePath!,
+      newContent: _textController.text,
+      baseSHA256: _baseSHA256 ?? '',
+    );
 
     if (mounted) {
       setState(() {
         _isSaving = false;
-        _isModified = false;
       });
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Saved "${widget.filePath}" to host.'),
-          backgroundColor: Colors.green,
-        ),
-      );
+      if (res['success'] == true) {
+        final data = res['data'] as Map<String, dynamic>?;
+        if (data != null && data['updated_sha256'] != null) {
+          _baseSHA256 = data['updated_sha256'];
+        }
+        setState(() {
+          _isModified = false;
+        });
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Saved "${widget.filePath}" to remote host.'),
+            backgroundColor: Colors.green,
+          ),
+        );
+      } else if (res['conflict'] == true) {
+        final data = res['data'] as Map<String, dynamic>?;
+        _handleSaveConflict(data?['current_content'] ?? '');
+      } else {
+        setState(() {
+          _errorMessage = res['error'] ?? 'Failed to save file to host.';
+        });
+      }
     }
   }
 
-  void triggerConflictModalForTest() {
+  void _handleSaveConflict(String remoteContent) {
     showDialog(
       context: context,
       builder: (context) => ConflictResolutionModal(
-        filePath: widget.filePath ?? 'src/File.kt',
+        filePath: widget.filePath!,
         localContent: _textController.text,
-        remoteContent: '// Modified on host by another process',
+        remoteContent: remoteContent,
         onKeepLocal: () {
-          setState(() {
-            _isModified = false;
-          });
+          _saveFileForce();
         },
         onAcceptRemote: () {
           setState(() {
-            _textController.text = '// Modified on host by another process';
+            _textController.text = remoteContent;
             _isModified = false;
           });
         },
       ),
     );
+  }
+
+  Future<void> _saveFileForce() async {
+    final session = await SecureStorageService.instance.getPairedSession();
+    if (session == null || session['brokerUrl'] == null) return;
+
+    final client = HostBridgeApiClient(
+      baseUrl: session['brokerUrl'] ?? 'http://localhost:8082',
+      sessionToken: session['token'],
+    );
+
+    final wsId = widget.workspaceId ?? (session['machineId'] ?? 'workspace');
+    final res = await client.writeFile(
+      workspaceId: wsId,
+      relativePath: widget.filePath!,
+      newContent: _textController.text,
+      baseSHA256: '', // Empty base SHA bypasses optimistic lock
+    );
+
+    if (res['success'] == true && mounted) {
+      setState(() {
+        _isModified = false;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Overwrote remote host file.'), backgroundColor: Colors.orange),
+      );
+    }
   }
 
   @override
@@ -114,7 +235,7 @@ class _CodeEditorScreenState extends State<CodeEditorScreen> {
               ),
               const SizedBox(height: 6),
               const Text(
-                'Select a file from Project Explorer to view or edit its contents.',
+                'Select a file from Project Explorer or Travel AI Cockpit to view or edit its contents.',
                 textAlign: TextAlign.center,
                 style: TextStyle(fontSize: 12, color: Colors.grey),
               ),
@@ -169,29 +290,40 @@ class _CodeEditorScreenState extends State<CodeEditorScreen> {
           ),
         ),
 
+        if (_errorMessage != null)
+          Container(
+            padding: const EdgeInsets.all(8.0),
+            color: Colors.red[900],
+            width: double.infinity,
+            child: Text(_errorMessage!, style: const TextStyle(color: Colors.white, fontSize: 12)),
+          ),
+
         // Text Editor Area
         Expanded(
-          child: Container(
-            color: const Color(0xFF1E1E1E),
-            padding: const EdgeInsets.all(12.0),
-            child: TextField(
-              controller: _textController,
-              maxLines: null,
-              expands: true,
-              style: const TextStyle(
-                fontFamily: 'monospace',
-                fontSize: 13.0,
-                color: Colors.white,
-              ),
-              decoration: const InputDecoration(
-                border: InputBorder.none,
-                hintText: 'Enter code or text...',
-              ),
-            ),
-          ),
+          child: _isLoading
+              ? const Center(child: CircularProgressIndicator())
+              : Container(
+                  color: const Color(0xFF1E1E1E),
+                  padding: const EdgeInsets.all(12.0),
+                  child: TextField(
+                    controller: _textController,
+                    maxLines: null,
+                    expands: true,
+                    style: const TextStyle(
+                      fontFamily: 'monospace',
+                      fontSize: 13.0,
+                      color: Colors.white,
+                    ),
+                    decoration: const InputDecoration(
+                      border: InputBorder.none,
+                      hintText: 'Enter code or text...',
+                    ),
+                  ),
+                ),
         ),
       ],
     );
   }
 }
+
 
