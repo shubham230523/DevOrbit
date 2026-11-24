@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -217,6 +218,79 @@ func (b *Broker) AuthorizeDeviceWithExactExpiry(machineID, deviceID, sessionID, 
 			b.authorizedClientTokens[key] = clientToken
 			b.authorizedExpiries[key] = expiresAt.UTC()
 			b.sessionExpiries[sessionID] = expiresAt.UTC()
+			b.saveAuthorizedSessionsLocked()
+		}
+	}
+}
+
+type StoredBrokerSession struct {
+	MachineID   string    `json:"machine_id"`
+	DeviceID    string    `json:"device_id"`
+	SessionID   string    `json:"session_id"`
+	ClientToken string    `json:"client_token"`
+	HostToken   string    `json:"host_token"`
+	ExpiresAt   time.Time `json:"expires_at"`
+}
+
+func getBrokerSessionStorePath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = "."
+	}
+	dir := filepath.Join(home, ".devorbit")
+	_ = os.MkdirAll(dir, 0700)
+	return filepath.Join(dir, "broker_sessions.json")
+}
+
+func (b *Broker) saveAuthorizedSessionsLocked() {
+	storePath := getBrokerSessionStorePath()
+	var list []StoredBrokerSession
+	for key, clientToken := range b.authorizedClientTokens {
+		parts := strings.SplitN(key, ":", 3)
+		if len(parts) == 3 {
+			mID, dID, sID := parts[0], parts[1], parts[2]
+			exp := b.authorizedExpiries[key]
+			if time.Now().UTC().Before(exp) {
+				hostToken := b.authorizedHost[mID]
+				list = append(list, StoredBrokerSession{
+					MachineID:   mID,
+					DeviceID:    dID,
+					SessionID:   sID,
+					ClientToken: clientToken,
+					HostToken:   hostToken,
+					ExpiresAt:   exp,
+				})
+			}
+		}
+	}
+	data, err := json.MarshalIndent(list, "", "  ")
+	if err == nil {
+		_ = os.WriteFile(storePath, data, 0600)
+	}
+}
+
+func (b *Broker) LoadPersistedSessions() {
+	storePath := getBrokerSessionStorePath()
+	data, err := os.ReadFile(storePath)
+	if err != nil {
+		return
+	}
+	var list []StoredBrokerSession
+	if err := json.Unmarshal(data, &list); err != nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, s := range list {
+		if time.Now().UTC().Before(s.ExpiresAt) {
+			key := s.MachineID + ":" + s.DeviceID + ":" + s.SessionID
+			b.authorizedClientTokens[key] = s.ClientToken
+			b.authorizedDev[s.MachineID+":"+s.DeviceID] = true
+			if s.HostToken != "" {
+				b.authorizedHost[s.MachineID] = s.HostToken
+			}
+			b.authorizedExpiries[key] = s.ExpiresAt
+			b.sessionExpiries[s.SessionID] = s.ExpiresAt
 		}
 	}
 }

@@ -28,6 +28,7 @@ func main() {
 	}
 
 	b := broker.NewBroker()
+	b.LoadPersistedSessions()
 
 	mux := http.NewServeMux()
 
