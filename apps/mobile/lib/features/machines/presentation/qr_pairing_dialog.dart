@@ -30,6 +30,8 @@ class _QrPairingDialogState extends State<QrPairingDialog> {
   String? _statusText;
   String? _errorMessage;
   bool _showManualInput = false;
+  String? _lastRejectedPayload;
+  DateTime? _lastRejectedAt;
   final TextEditingController _manualInputController = TextEditingController();
 
   @override
@@ -51,8 +53,28 @@ class _QrPairingDialogState extends State<QrPairingDialog> {
     super.dispose();
   }
 
+  Future<void> _pauseScanner() async {
+    try {
+      await _scannerController?.stop();
+    } catch (_) {}
+  }
+
+  Future<void> _resumeScanner() async {
+    if (!mounted || _showManualInput) return;
+    try {
+      await _scannerController?.start();
+    } catch (_) {}
+  }
+
   Future<void> processPairingPayload(String rawPayload) async {
     if (_isPairing) return;
+
+    // Ignore duplicate frames for the same rejected payload within 3 seconds
+    if (_lastRejectedPayload == rawPayload &&
+        _lastRejectedAt != null &&
+        DateTime.now().difference(_lastRejectedAt!) < const Duration(seconds: 3)) {
+      return;
+    }
 
     setState(() {
       _isPairing = true;
@@ -60,36 +82,36 @@ class _QrPairingDialogState extends State<QrPairingDialog> {
       _statusText = 'Validating QR pairing payload...';
     });
 
-    // Temporarily pause the scanner so it doesn't fire continuously while processing
-    _scannerController?.stop();
+    // Pause the scanner and await completion before continuing
+    await _pauseScanner();
 
     QrPairingPayload payload;
     try {
       payload = QrPairingPayload.fromRawString(rawPayload);
     } catch (e) {
+      _lastRejectedPayload = rawPayload;
+      _lastRejectedAt = DateTime.now();
       if (mounted) {
         setState(() {
           _isPairing = false;
           _errorMessage = 'Invalid QR code: ${e.toString().replaceAll("FormatException: ", "")}';
           _statusText = null;
         });
-        if (!_showManualInput) {
-          _scannerController?.start();
-        }
+        await _resumeScanner();
       }
       return;
     }
 
     if (payload.isExpired) {
+      _lastRejectedPayload = rawPayload;
+      _lastRejectedAt = DateTime.now();
       if (mounted) {
         setState(() {
           _isPairing = false;
           _errorMessage = 'Pairing challenge expired at ${payload.expiresAt.toLocal()}. Please generate a fresh QR code.';
           _statusText = null;
         });
-        if (!_showManualInput) {
-          _scannerController?.start();
-        }
+        await _resumeScanner();
       }
       return;
     }
@@ -116,6 +138,8 @@ class _QrPairingDialogState extends State<QrPairingDialog> {
         Navigator.of(context).pop(true);
       }
     } catch (e) {
+      _lastRejectedPayload = rawPayload;
+      _lastRejectedAt = DateTime.now();
       if (mounted) {
         setState(() {
           _isPairing = false;
@@ -126,9 +150,7 @@ class _QrPairingDialogState extends State<QrPairingDialog> {
             _errorMessage = 'Pairing error: $e';
           }
         });
-        if (!_showManualInput) {
-          _scannerController?.start();
-        }
+        await _resumeScanner();
       }
     }
   }
@@ -273,11 +295,17 @@ class _QrPairingDialogState extends State<QrPairingDialog> {
             ],
             const SizedBox(height: 8),
             TextButton(
-              onPressed: () {
+              onPressed: () async {
+                final switchingToCamera = _showManualInput;
                 setState(() {
                   _showManualInput = !_showManualInput;
                   _errorMessage = null;
                 });
+                if (switchingToCamera) {
+                  await _resumeScanner();
+                } else {
+                  await _pauseScanner();
+                }
               },
               child: Text(
                 _showManualInput ? 'Switch to Camera Scanner' : 'Enter Payload Manually / Test',

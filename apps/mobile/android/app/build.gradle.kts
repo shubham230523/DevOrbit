@@ -27,15 +27,21 @@ android {
         // flag during build.
         versionCode = flutter.versionCode
         versionName = flutter.versionName
-
-        // Restrict debug build to physical 64-bit ARM architecture (arm64-v8a)
-        // Drops debug APK size from 137 MB down to ~45 MB for 3x faster installs!
-        ndk {
-            abiFilters.addAll(listOf("arm64-v8a"))
-        }
     }
 
     buildTypes {
+        debug {
+            ndk {
+                abiFilters.clear()
+                abiFilters.add("arm64-v8a")
+            }
+            packaging {
+                jniLibs {
+                    useLegacyPackaging = true
+                    excludes += setOf("**/armeabi-v7a/**", "**/x86_64/**", "**/x86/**")
+                }
+            }
+        }
         release {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.

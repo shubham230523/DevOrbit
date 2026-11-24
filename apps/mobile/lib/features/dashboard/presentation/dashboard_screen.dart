@@ -221,8 +221,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
         setState(() {
           _connectionState = state;
           _isLoading = (state == BrokerConnectionState.connecting ||
-                        state == BrokerConnectionState.authenticating ||
-                        state == BrokerConnectionState.reconnecting);
+                        state == BrokerConnectionState.authenticating);
         });
       }
 
