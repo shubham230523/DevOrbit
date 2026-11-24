@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'core/theme/app_theme.dart';
 import 'features/dashboard/presentation/dashboard_screen.dart';
 import 'features/travel_coding/presentation/travel_coding_screen.dart';
@@ -8,6 +9,16 @@ import 'features/machines/presentation/machine_management_screen.dart';
 import 'features/settings/presentation/settings_screen.dart';
 
 void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  SystemChrome.setSystemUIOverlayStyle(
+    const SystemUiOverlayStyle(
+      statusBarColor: Colors.transparent,
+      statusBarIconBrightness: Brightness.light,
+      systemNavigationBarColor: Color(0xFF121212),
+      systemNavigationBarDividerColor: Colors.transparent,
+      systemNavigationBarIconBrightness: Brightness.light,
+    ),
+  );
   runApp(const DevOrbitApp());
 }
 
@@ -71,9 +82,9 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
       ),
       bottomNavigationBar: Container(
         decoration: const BoxDecoration(
-          color: Color(0xFF1E1E1E),
+          color: Color(0xFF121212),
           border: Border(
-            top: BorderSide(color: Color(0xFF2C2C2C), width: 0.5),
+            top: BorderSide(color: Color(0xFF222222), width: 0.5),
           ),
         ),
         child: BottomNavigationBar(
@@ -84,7 +95,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
             });
           },
           type: BottomNavigationBarType.fixed,
-          backgroundColor: const Color(0xFF1E1E1E),
+          backgroundColor: const Color(0xFF121212),
           selectedItemColor: const Color(0xFFBB86FC),
           unselectedItemColor: Colors.grey,
           elevation: 0,
