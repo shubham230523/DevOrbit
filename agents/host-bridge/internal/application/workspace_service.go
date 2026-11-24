@@ -41,6 +41,14 @@ func (s *WorkspaceService) ListWorkspaces() ([]domain.Workspace, error) {
 	return workspaces, nil
 }
 
+func (s *WorkspaceService) RegisterWorkspace(id, rootPath string) (*domain.Workspace, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	resolved := s.jail.AddRoot(id, rootPath)
+	return s.InspectWorkspace(id, resolved)
+}
+
 func (s *WorkspaceService) InspectWorkspace(id, rootPath string) (*domain.Workspace, error) {
 	name := filepath.Base(rootPath)
 	hasGradle := false

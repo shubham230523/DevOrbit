@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -97,19 +98,7 @@ func (s *Server) HandleCreatePairingChallenge(w http.ResponseWriter, r *http.Req
 	confirmBaseURL = strings.TrimRight(confirmBaseURL, "/")
 	confirmURL := fmt.Sprintf("%s/api/v1/pairing/confirm", confirmBaseURL)
 
-	brokerWSURL := s.brokerWSURL
-	if brokerWSURL == "" {
-		brokerWSURL = s.brokerURL
-	}
-	if brokerWSURL == "" {
-		brokerWSURL = os.Getenv("DEVORBIT_BROKER_WS_URL")
-	}
-	if brokerWSURL == "" {
-		brokerWSURL = os.Getenv("DEVORBIT_BROKER_URL")
-	}
-	if brokerWSURL == "" {
-		brokerWSURL = "ws://127.0.0.1:8081"
-	}
+	brokerWSURL := s.resolveAdvertisedBrokerWSURL(r)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"v":               ch.Version,
@@ -232,6 +221,30 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	brokerWSURL := s.resolveAdvertisedBrokerWSURL(r)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":         "success",
+		"session_token":  token,
+		"session_id":     sessionID,
+		"session_secret": sessionSecret,
+		"machine_id":     s.pairingEngine.HostID(),
+		"device_id":      req.DeviceID,
+		"broker_url":     brokerWSURL,
+		"expires_at":     expiry.Format(time.RFC3339),
+	})
+}
+
+func isLoopbackHost(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	return h == "127.0.0.1" || h == "localhost" || h == "::1"
+}
+
+// resolveAdvertisedBrokerWSURL returns the WebSocket broker URL for the pairing
+// client. When the configured URL is loopback (127.0.0.1/localhost) and the
+// client reached the host bridge via a non-loopback LAN host, rewrite the
+// broker host to match the request host so Wi-Fi clients don't get 127.0.0.1.
+func (s *Server) resolveAdvertisedBrokerWSURL(r *http.Request) string {
 	brokerWSURL := s.brokerWSURL
 	if brokerWSURL == "" {
 		brokerWSURL = s.brokerURL
@@ -246,14 +259,27 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 		brokerWSURL = "ws://127.0.0.1:8081"
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status":         "success",
-		"session_token":  token,
-		"session_id":     sessionID,
-		"session_secret": sessionSecret,
-		"machine_id":     s.pairingEngine.HostID(),
-		"device_id":      req.DeviceID,
-		"broker_url":     brokerWSURL,
-		"expires_at":     expiry.Format(time.RFC3339),
-	})
+	if r == nil || r.Host == "" {
+		return brokerWSURL
+	}
+
+	reqHost := r.Host
+	if h, _, err := net.SplitHostPort(r.Host); err == nil {
+		reqHost = h
+	}
+	if reqHost == "" || isLoopbackHost(reqHost) || strings.ContainsAny(reqHost, "/\\?#@ \t\r\n") {
+		return brokerWSURL
+	}
+
+	parsed, err := url.Parse(brokerWSURL)
+	if err != nil || !isLoopbackHost(parsed.Hostname()) {
+		return brokerWSURL
+	}
+
+	if port := parsed.Port(); port != "" {
+		parsed.Host = net.JoinHostPort(reqHost, port)
+	} else {
+		parsed.Host = reqHost
+	}
+	return parsed.String()
 }

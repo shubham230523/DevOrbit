@@ -109,6 +109,7 @@ class PairingClient {
     }
 
     http.Response? response;
+    Uri usedConfirmUri = primaryUri;
     Object? lastError;
 
     // Try primary with a generous 10-second timeout (session provisioning + broker
@@ -142,6 +143,7 @@ class PairingClient {
               )
               .timeout(const Duration(seconds: 5));
           response = res;
+          usedConfirmUri = uri;
           if (res.statusCode == 200 || res.statusCode == 201) break;
         } catch (fe) {
           lastError = fe;
@@ -228,6 +230,23 @@ class PairingClient {
       throw PairingException('Server returned broker_url containing embedded user credentials');
     }
 
+    // If the host returned a loopback broker URL (e.g. 127.0.0.1) while we
+    // confirmed pairing over a LAN IP, rewrite the broker host to that LAN IP
+    // so the mobile device does not depend on `adb reverse`.
+    final brokerHostLower = bUri.host.toLowerCase();
+    final confirmHostLower = usedConfirmUri.host.toLowerCase();
+    final isBrokerLoopback = brokerHostLower == '127.0.0.1' ||
+        brokerHostLower == 'localhost' ||
+        brokerHostLower == '::1';
+    final isConfirmLoopbackOrEmu = confirmHostLower == '127.0.0.1' ||
+        confirmHostLower == 'localhost' ||
+        confirmHostLower == '::1' ||
+        confirmHostLower == '10.0.2.2';
+
+    final resolvedBrokerUrl = (isBrokerLoopback && !isConfirmLoopbackOrEmu)
+        ? bUri.replace(host: usedConfirmUri.host).toString()
+        : brokerUrl;
+
     // Persist securely to platform storage
     await secureStorage.savePairedSession(
       machineId: payload.hostId,
@@ -235,7 +254,7 @@ class PairingClient {
       sessionId: sessionId,
       token: token,
       masterSecret: masterSecret,
-      brokerUrl: brokerUrl,
+      brokerUrl: resolvedBrokerUrl,
     );
 
     return PairingConfirmationResult(
@@ -244,7 +263,7 @@ class PairingClient {
       sessionId: sessionId,
       token: token,
       masterSecret: masterSecret,
-      brokerUrl: brokerUrl,
+      brokerUrl: resolvedBrokerUrl,
       expiresAt: expiresAtStr != null ? DateTime.tryParse(expiresAtStr) : null,
     );
   }

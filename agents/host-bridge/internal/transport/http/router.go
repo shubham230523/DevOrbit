@@ -147,4 +147,20 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 		}
 		http.NotFound(w, r)
 	})
+
+	mux.HandleFunc("/api/v1/github/repos", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		s.HandleListGitHubRepos(w, r)
+	})
+
+	mux.HandleFunc("/api/v1/github/clone", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		s.HandleCloneGitHubRepo(w, r)
+	})
 }

@@ -180,4 +180,66 @@ class HostBridgeApiClient {
     } catch (_) {}
     return [];
   }
+
+  Future<Map<String, dynamic>> listGitHubRepos({String? githubToken}) async {
+    try {
+      final headers = {
+        ..._headers,
+        if (githubToken != null && githubToken.trim().isNotEmpty)
+          'X-GitHub-Token': githubToken.trim(),
+      };
+      final res = await http.get(
+        Uri.parse('$baseUrl/api/v1/github/repos'),
+        headers: headers,
+      ).timeout(const Duration(seconds: 15));
+
+      final body = jsonDecode(res.body) as Map<String, dynamic>;
+      if (res.statusCode == 200) {
+        return {
+          'success': true,
+          'repositories': body['repositories'] ?? <dynamic>[],
+          'clone_base': body['clone_base'],
+        };
+      }
+      return {
+        'success': false,
+        'error': body['error'] ?? 'HTTP ${res.statusCode}',
+      };
+    } catch (e) {
+      return {'success': false, 'error': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> cloneGitHubRepo({
+    required String cloneUrl,
+    required String name,
+    String? githubToken,
+  }) async {
+    try {
+      final headers = {
+        ..._headers,
+        if (githubToken != null && githubToken.trim().isNotEmpty)
+          'X-GitHub-Token': githubToken.trim(),
+      };
+      final res = await http.post(
+        Uri.parse('$baseUrl/api/v1/github/clone'),
+        headers: headers,
+        body: jsonEncode({
+          'clone_url': cloneUrl,
+          'name': name,
+        }),
+      ).timeout(const Duration(seconds: 60));
+
+      final body = jsonDecode(res.body) as Map<String, dynamic>;
+      if (res.statusCode == 200) {
+        return {'success': true, 'data': body};
+      }
+      return {
+        'success': false,
+        'error': body['error'] ?? 'HTTP ${res.statusCode}',
+      };
+    } catch (e) {
+      return {'success': false, 'error': e.toString()};
+    }
+  }
 }

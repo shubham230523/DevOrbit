@@ -15,7 +15,7 @@ enum ConnectionStatus {
 class ConnectionManager extends ChangeNotifier {
   ConnectionStatus _status = ConnectionStatus.disconnected;
   ConnectionMode _mode = ConnectionMode.lan;
-  String _activeHostAddress = '192.168.1.100:8082';
+  String _activeHostAddress = '10.0.2.2:8081';
   String? _sessionToken;
   Timer? _heartbeatTimer;
 

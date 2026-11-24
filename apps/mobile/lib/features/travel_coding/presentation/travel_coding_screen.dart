@@ -8,11 +8,15 @@ import 'widgets/approval_dialog.dart';
 class TravelCodingScreen extends StatefulWidget {
   final String hostBaseUrl;
   final String? sessionToken;
+  final String? selectedWorkspacePath;
+  final bool isActive;
 
   const TravelCodingScreen({
     super.key,
     this.hostBaseUrl = 'http://10.0.2.2:8082',
     this.sessionToken,
+    this.selectedWorkspacePath,
+    this.isActive = true,
   });
 
   @override
@@ -31,6 +35,8 @@ class _TravelCodingScreenState extends State<TravelCodingScreen> {
   Map<String, dynamic>? _activeTask;
   Timer? _pollingTimer;
   bool _isSubmitting = false;
+  bool _isLoadingWorkspaces = false;
+  String? _workspaceError;
   String? _errorMessage;
 
   @override
@@ -42,7 +48,34 @@ class _TravelCodingScreenState extends State<TravelCodingScreen> {
     _restoreActiveTask();
   }
 
+  @override
+  void didUpdateWidget(covariant TravelCodingScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.selectedWorkspacePath != null &&
+        widget.selectedWorkspacePath != oldWidget.selectedWorkspacePath) {
+      final hasIt = _workspaces.any((ws) => ws['root_path'] == widget.selectedWorkspacePath);
+      if (hasIt) {
+        setState(() {
+          _selectedWorkspaceId = widget.selectedWorkspacePath;
+        });
+      } else {
+        _initHostProjects();
+      }
+      return;
+    }
+    if (widget.isActive && !oldWidget.isActive && _workspaces.isEmpty && !_isLoadingWorkspaces) {
+      _initHostProjects();
+    }
+  }
+
   Future<void> _initHostProjects() async {
+    if (mounted) {
+      setState(() {
+        _isLoadingWorkspaces = true;
+        _workspaceError = null;
+      });
+    }
+
     final session = await _secureStorage.getPairedSession();
     final token = session?['token'] ?? widget.sessionToken;
 
@@ -70,12 +103,27 @@ class _TravelCodingScreenState extends State<TravelCodingScreen> {
         setState(() {
           _agentClient = AgentApiClient(baseUrl: url, sessionToken: token);
           _workspaces = list;
+          _isLoadingWorkspaces = false;
+          _workspaceError = null;
           if (list.isNotEmpty) {
-            _selectedWorkspaceId = list.first['root_path'];
+            final requested = widget.selectedWorkspacePath;
+            if (requested != null && list.any((ws) => ws['root_path'] == requested)) {
+              _selectedWorkspaceId = requested;
+            } else if (_selectedWorkspaceId == null ||
+                !list.any((ws) => ws['root_path'] == _selectedWorkspaceId)) {
+              _selectedWorkspaceId = list.first['root_path'];
+            }
           }
         });
         return;
       }
+    }
+
+    if (mounted) {
+      setState(() {
+        _isLoadingWorkspaces = false;
+        _workspaceError = 'Host unreachable (tap refresh)';
+      });
     }
   }
 
@@ -249,9 +297,16 @@ class _TravelCodingScreenState extends State<TravelCodingScreen> {
                 const Icon(Icons.folder_open, color: Colors.amber, size: 20),
                 const SizedBox(width: 8),
                 Expanded(
-                  child: _workspaces.isEmpty
+                  child: _isLoadingWorkspaces
                       ? const Text('Loading host workspaces...', style: TextStyle(color: Colors.grey))
-                      : DropdownButton<String>(
+                      : _workspaces.isEmpty
+                          ? Text(
+                              _workspaceError ?? 'No host workspaces found',
+                              style: TextStyle(
+                                color: _workspaceError != null ? Colors.redAccent : Colors.grey,
+                              ),
+                            )
+                          : DropdownButton<String>(
                           value: _selectedWorkspaceId,
                           isExpanded: true,
                           underline: const SizedBox(),

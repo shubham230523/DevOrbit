@@ -50,14 +50,15 @@ go run ./cmd/host-bridge
 ```
 *(Listening on `:8082`)*
 
-### Step C: Enable USB / ADB Forwarding (For USB testing)
-If testing on a physical phone connected over USB, run this command once in terminal:
-```bash
-adb reverse tcp:8081 tcp:8081; adb reverse tcp:8082 tcp:8082
-```
-*(This allows `ws://127.0.0.1:8081` on your phone to connect directly to the broker over USB).*
-   ./host-bridge
-   ```
+### Step C: Network / USB Connection (Automatic LAN vs USB `adb reverse`)
+- **Same Wi-Fi / LAN (Recommended — No `adb reverse` needed)**:
+  When your phone and computer are on the same Wi-Fi network, Host Bridge and DevOrbit Mobile automatically resolve your computer's LAN IP for both pairing (`:8082`) and the Connection Broker (`:8081`). Just make sure Windows Firewall allows inbound TCP on ports `8081` and `8082` on your Private network.
+- **USB-Only Testing (`ws://127.0.0.1:8081`)**:
+  If you are connecting over USB via `127.0.0.1`, run this command in terminal:
+  ```bash
+  adb reverse tcp:8081 tcp:8081; adb reverse tcp:8082 tcp:8082
+  ```
+  *(This forwards `127.0.0.1:8081` and `127.0.0.1:8082` on your phone to your PC over USB. Note that `adb reverse` resets whenever the USB cable is unplugged, the phone reboots, or ADB restarts.)*
 
 > **Console Output & Visual Terminal QR Code**:
 > When the Host Bridge starts, it renders a **visual 2D QR Code image** directly in your terminal using Unicode block characters, as well as the JSON payload:

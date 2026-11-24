@@ -46,6 +46,7 @@ class MainNavigationScreen extends StatefulWidget {
 class _MainNavigationScreenState extends State<MainNavigationScreen> {
   int _selectedIndex = 0;
   String? _selectedFilePath;
+  String? _selectedWorkspaceForAi;
 
   static const List<String> _titles = [
     'DevOrbit Dashboard',
@@ -66,8 +67,18 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
         index: _selectedIndex,
         children: [
           const DashboardScreen(),
-          const TravelCodingScreen(),
+          TravelCodingScreen(
+            isActive: _selectedIndex == 1,
+            selectedWorkspacePath: _selectedWorkspaceForAi,
+          ),
           ProjectExplorerScreen(
+            isActive: _selectedIndex == 2,
+            onOpenInTravelAi: (workspacePath) {
+              setState(() {
+                _selectedWorkspaceForAi = workspacePath;
+                _selectedIndex = 1;
+              });
+            },
             onFileSelected: (path) {
               setState(() {
                 _selectedFilePath = path;

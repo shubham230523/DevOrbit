@@ -13,6 +13,7 @@ class SettingsScreen extends StatefulWidget {
 class _SettingsScreenState extends State<SettingsScreen> {
   bool _requireBiometrics = true;
   bool _requireAiConfirmation = true;
+  bool _hasGitHubToken = false;
   late final SecureStorageService _storage;
 
   @override
@@ -25,10 +26,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Future<void> _loadSettings() async {
     final bioVal = await _storage.read('setting_biometrics');
     final aiVal = await _storage.read('setting_ai_confirmation');
+    final ghPat = await _storage.read('github_pat');
     if (mounted) {
       setState(() {
         if (bioVal != null) _requireBiometrics = bioVal == 'true';
         if (aiVal != null) _requireAiConfirmation = aiVal == 'true';
+        _hasGitHubToken = ghPat != null && ghPat.trim().isNotEmpty;
       });
     }
   }
@@ -45,6 +48,83 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _requireAiConfirmation = val;
     });
     await _storage.write('setting_ai_confirmation', val.toString());
+  }
+
+  Future<void> _configureGitHubToken() async {
+    final existing = await _storage.read('github_pat') ?? '';
+    final controller = TextEditingController(text: existing);
+    if (!mounted) return;
+
+    final action = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('GitHub Personal Access Token'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Enter a GitHub PAT (with "repo" scope) to list and clone both public and private repositories. Optional if DEVORBIT_GITHUB_TOKEN is set on your host PC.',
+              style: TextStyle(fontSize: 12, color: Colors.grey),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: controller,
+              obscureText: true,
+              decoration: const InputDecoration(
+                labelText: 'GitHub PAT (ghp_... or github_pat_...)',
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          if (_hasGitHubToken)
+            TextButton(
+              onPressed: () => Navigator.pop(context, 'clear'),
+              style: TextButton.styleFrom(foregroundColor: Colors.redAccent),
+              child: const Text('Clear'),
+            ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, 'cancel'),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, 'save'),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+
+    if (!mounted) return;
+    if (action == 'save') {
+      final token = controller.text.trim();
+      await _storage.write('github_pat', token);
+      if (mounted) {
+        setState(() {
+          _hasGitHubToken = token.isNotEmpty;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(token.isNotEmpty
+                ? 'GitHub PAT saved in secure storage.'
+                : 'GitHub PAT cleared.'),
+          ),
+        );
+      }
+    } else if (action == 'clear') {
+      await _storage.write('github_pat', '');
+      if (mounted) {
+        setState(() {
+          _hasGitHubToken = false;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('GitHub PAT cleared from secure storage.')),
+        );
+      }
+    }
+    controller.dispose();
   }
 
   Future<void> _clearAllStorage() async {
@@ -97,6 +177,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
           subtitle: const Text('Prompt before file edits, creations, or shell commands'),
           value: _requireAiConfirmation,
           onChanged: _toggleAiConfirmation,
+        ),
+        const Divider(),
+        ListTile(
+          leading: const Icon(Icons.code, color: Colors.purpleAccent),
+          title: const Text('GitHub Personal Access Token'),
+          subtitle: Text(
+            _hasGitHubToken
+                ? 'Configured (public & private repos enabled)'
+                : 'Tap to add GitHub PAT for private & public repos',
+          ),
+          trailing: Icon(
+            _hasGitHubToken ? Icons.check_circle : Icons.chevron_right,
+            color: _hasGitHubToken ? Colors.green : Colors.grey,
+          ),
+          onTap: _configureGitHubToken,
         ),
         const Divider(),
         ListTile(

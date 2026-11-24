@@ -44,6 +44,8 @@ type Server struct {
 	trustedProxies     []string
 	isProduction       bool
 	aiRouter           *router.AIRouter
+	githubAPIBaseURL   string
+	githubCloneBaseDir string
 	muxOnce            sync.Once
 	cachedMux          *http.ServeMux
 }
