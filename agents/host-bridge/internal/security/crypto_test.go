@@ -319,4 +319,47 @@ func TestE2ESession_SlidingWindowAndAdversarialReplay(t *testing.T) {
 	if err != ErrExpiredSessionKey {
 		t.Errorf("Expected ErrExpiredSessionKey after Destroy, got: %v", err)
 	}
+
+	_, err = destructSess.Encrypt(DirClientToHost, []byte("after destroy"), 101, ts)
+	if err != ErrExpiredSessionKey {
+		t.Errorf("Expected ErrExpiredSessionKey for Encrypt after Destroy, got: %v", err)
+	}
+}
+
+func TestE2ESession_ConcurrentEncryptAndDestroy(t *testing.T) {
+	session, err := NewE2ESession("sess-800", "device-phone-01", "shared-master-secret-32-bytes", 1*time.Hour)
+	if err != nil {
+		t.Fatalf("Failed to create session: %v", err)
+	}
+
+	ts := time.Now().UnixNano()
+	var wg sync.WaitGroup
+	startBarrier := make(chan struct{})
+
+	// Launch concurrent Encrypt routines
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(seq int64) {
+			defer wg.Done()
+			<-startBarrier
+			_, _ = session.Encrypt(DirClientToHost, []byte("concurrent payload"), seq, ts)
+		}(int64(i + 1))
+	}
+
+	// Launch concurrent Destroy
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-startBarrier
+		session.Destroy()
+	}()
+
+	close(startBarrier)
+	wg.Wait()
+
+	// Post-destruction attempt must fail cleanly
+	_, err = session.Encrypt(DirClientToHost, []byte("post destroy"), 999, ts)
+	if err != ErrExpiredSessionKey {
+		t.Errorf("Expected ErrExpiredSessionKey after concurrent destroy, got: %v", err)
+	}
 }

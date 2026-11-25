@@ -58,6 +58,11 @@ func (m *ApprovalManager) CreateProposal(
 	token := fmt.Sprintf("appr-%s", hex.EncodeToString(tokenBytes))
 
 	now := time.Now().UTC()
+	var argsCopy []string
+	if args != nil {
+		argsCopy = append([]string(nil), args...)
+	}
+
 	proposal := &ApprovalProposal{
 		Token:          token,
 		TaskID:         taskID,
@@ -68,7 +73,7 @@ func (m *ApprovalManager) CreateProposal(
 		TargetContent:  targetContent,
 		Replacement:    replacement,
 		Command:        command,
-		Args:           args,
+		Args:           argsCopy,
 		Reason:         reason,
 		CreatedAt:      now,
 		ExpiresAt:      now.Add(ttl),

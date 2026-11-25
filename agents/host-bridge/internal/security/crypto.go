@@ -119,12 +119,19 @@ func (s *E2ESession) Encrypt(dir Direction, plainText []byte, seqNum int64, time
 		return "", ErrExpiredSessionKey
 	}
 
+	s.mu.Lock()
+	if isZeroKey(s.ClientToHostKey) || isZeroKey(s.HostToClientKey) {
+		s.mu.Unlock()
+		return "", ErrExpiredSessionKey
+	}
+
 	var key []byte
 	if dir == DirHostToClient {
-		key = s.HostToClientKey
+		key = append([]byte(nil), s.HostToClientKey...)
 	} else {
-		key = s.ClientToHostKey
+		key = append([]byte(nil), s.ClientToHostKey...)
 	}
+	s.mu.Unlock()
 
 	block, err := aes.NewCipher(key)
 	if err != nil {

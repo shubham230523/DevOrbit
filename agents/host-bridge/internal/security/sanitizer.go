@@ -3,6 +3,7 @@ package security
 import (
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -125,17 +126,26 @@ func evalSymlinksDeepest(path string) (string, error) {
 }
 
 func (j *WorkspaceJail) isSubpath(target, root string) bool {
-	targetFold := strings.ToLower(filepath.Clean(target))
-	rootFold := strings.ToLower(filepath.Clean(root))
+	targetClean := filepath.Clean(target)
+	rootClean := filepath.Clean(root)
 
-	if targetFold == rootFold {
+	var targetCmp, rootCmp string
+	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+		targetCmp = strings.ToLower(targetClean)
+		rootCmp = strings.ToLower(rootClean)
+	} else {
+		targetCmp = targetClean
+		rootCmp = rootClean
+	}
+
+	if targetCmp == rootCmp {
 		return true
 	}
 
-	prefix := rootFold
+	prefix := rootCmp
 	if !strings.HasSuffix(prefix, string(filepath.Separator)) {
 		prefix += string(filepath.Separator)
 	}
 
-	return strings.HasPrefix(targetFold, prefix)
+	return strings.HasPrefix(targetCmp, prefix)
 }
