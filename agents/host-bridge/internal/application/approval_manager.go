@@ -80,7 +80,7 @@ func (m *ApprovalManager) CreateProposal(
 }
 
 func (m *ApprovalManager) ConsumeApproval(
-	token, taskID, workspaceID, toolName, targetPath, command string,
+	token, taskID, workspaceID, toolName, targetPath, command string, args []string, targetContent, replacement string,
 ) (*ApprovalProposal, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -95,7 +95,7 @@ func (m *ApprovalManager) ConsumeApproval(
 		return nil, ErrApprovalExpired
 	}
 
-	// Validate exact binding: task, workspace, tool, path/command
+	// Validate exact binding: task, workspace, tool, path, command, args, targetContent, replacement
 	if p.TaskID != taskID || p.WorkspaceID != workspaceID || p.ToolName != toolName {
 		return nil, ErrApprovalMismatch
 	}
@@ -108,6 +108,20 @@ func (m *ApprovalManager) ConsumeApproval(
 		return nil, ErrApprovalMismatch
 	}
 
+	if len(args) > 0 || len(p.Args) > 0 {
+		if !equalStringSlices(p.Args, args) {
+			return nil, ErrApprovalMismatch
+		}
+	}
+
+	if targetContent != "" && p.TargetContent != targetContent {
+		return nil, ErrApprovalMismatch
+	}
+
+	if replacement != "" && p.Replacement != replacement {
+		return nil, ErrApprovalMismatch
+	}
+
 	// Constant-time token verification
 	if subtle.ConstantTimeCompare([]byte(token), []byte(p.Token)) != 1 {
 		return nil, ErrApprovalMismatch
@@ -115,4 +129,16 @@ func (m *ApprovalManager) ConsumeApproval(
 
 	p.Consumed = true
 	return p, nil
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

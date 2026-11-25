@@ -118,7 +118,7 @@ func (e *AgentToolExecutor) ExecuteTool(
 
 		if approvalToken == "" {
 			proposal, err := e.approvalMgr.CreateProposal(
-				taskID, workspaceID, toolName, relPath, "", "", content, "", nil,
+				taskID, workspaceID, toolName, relPath, "", content, "", "", nil,
 				fmt.Sprintf("Create new file '%s'", relPath), 10*time.Minute,
 			)
 			if err != nil {
@@ -127,7 +127,7 @@ func (e *AgentToolExecutor) ExecuteTool(
 			return nil, proposal, ErrApprovalRequired
 		}
 
-		_, err := e.approvalMgr.ConsumeApproval(approvalToken, taskID, workspaceID, toolName, relPath, "")
+		_, err := e.approvalMgr.ConsumeApproval(approvalToken, taskID, workspaceID, toolName, relPath, "", nil, content, "")
 		if err != nil {
 			return nil, nil, err
 		}
@@ -169,7 +169,7 @@ func (e *AgentToolExecutor) ExecuteTool(
 			return nil, proposal, ErrApprovalRequired
 		}
 
-		proposal, err := e.approvalMgr.ConsumeApproval(approvalToken, taskID, workspaceID, toolName, relPath, "")
+		proposal, err := e.approvalMgr.ConsumeApproval(approvalToken, taskID, workspaceID, toolName, relPath, "", nil, target, replacement)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -214,7 +214,7 @@ func (e *AgentToolExecutor) ExecuteTool(
 			return nil, proposal, ErrApprovalRequired
 		}
 
-		_, err := e.approvalMgr.ConsumeApproval(approvalToken, taskID, workspaceID, toolName, relPath, "")
+		_, err := e.approvalMgr.ConsumeApproval(approvalToken, taskID, workspaceID, toolName, relPath, "", nil, "", "")
 		if err != nil {
 			return nil, nil, err
 		}
@@ -249,7 +249,7 @@ func (e *AgentToolExecutor) ExecuteTool(
 			return nil, proposal, ErrApprovalRequired
 		}
 
-		_, err := e.approvalMgr.ConsumeApproval(approvalToken, taskID, workspaceID, toolName, "", cmdStr)
+		_, err := e.approvalMgr.ConsumeApproval(approvalToken, taskID, workspaceID, toolName, "", cmdStr, cmdArgs, "", "")
 		if err != nil {
 			return nil, nil, err
 		}

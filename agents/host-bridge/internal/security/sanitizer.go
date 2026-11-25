@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"devorbit.net/agents/host-bridge/internal/domain"
 )
 
 type WorkspaceJail struct {
+	mu           sync.RWMutex
 	allowedRoots map[string]string // Key: workspace ID / name, Value: cleaned absolute root path
 }
 
@@ -36,17 +38,23 @@ func (j *WorkspaceJail) AddRoot(id, rootPath string) string {
 	if err != nil {
 		eval = clean
 	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
 	j.allowedRoots[id] = eval
 	j.allowedRoots[eval] = eval
 	return eval
 }
 
 func (j *WorkspaceJail) GetRoot(workspaceIDorPath string) (string, bool) {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
 	root, found := j.allowedRoots[workspaceIDorPath]
 	return root, found
 }
 
 func (j *WorkspaceJail) ListAllowedRoots() map[string]string {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
 	result := make(map[string]string)
 	for k, v := range j.allowedRoots {
 		result[k] = v
@@ -55,6 +63,7 @@ func (j *WorkspaceJail) ListAllowedRoots() map[string]string {
 }
 
 func (j *WorkspaceJail) ResolveAndValidate(workspaceIDorPath, relativeOrAbsPath string) (string, error) {
+	j.mu.RLock()
 	rootPath, found := j.allowedRoots[workspaceIDorPath]
 	if !found {
 		// Try resolving if passed as a root path directly
@@ -67,6 +76,7 @@ func (j *WorkspaceJail) ResolveAndValidate(workspaceIDorPath, relativeOrAbsPath 
 			}
 		}
 	}
+	j.mu.RUnlock()
 
 	if !found {
 		return "", fmt.Errorf("%w: workspace '%s' not found in allowlist", domain.ErrAccessDenied, workspaceIDorPath)
@@ -80,7 +90,7 @@ func (j *WorkspaceJail) ResolveAndValidate(workspaceIDorPath, relativeOrAbsPath 
 	}
 
 	cleanTarget := filepath.Clean(targetPath)
-	evalTarget, err := filepath.EvalSymlinks(cleanTarget)
+	evalTarget, err := evalSymlinksDeepest(cleanTarget)
 	if err != nil {
 		evalTarget = cleanTarget
 	}
@@ -90,6 +100,28 @@ func (j *WorkspaceJail) ResolveAndValidate(workspaceIDorPath, relativeOrAbsPath 
 	}
 
 	return evalTarget, nil
+}
+
+func evalSymlinksDeepest(path string) (string, error) {
+	clean := filepath.Clean(path)
+	eval, err := filepath.EvalSymlinks(clean)
+	if err == nil {
+		return eval, nil
+	}
+
+	dir := filepath.Dir(clean)
+	base := filepath.Base(clean)
+
+	if dir == clean || dir == "." {
+		return clean, nil
+	}
+
+	evalDir, err := evalSymlinksDeepest(dir)
+	if err != nil {
+		return clean, nil
+	}
+
+	return filepath.Join(evalDir, base), nil
 }
 
 func (j *WorkspaceJail) isSubpath(target, root string) bool {

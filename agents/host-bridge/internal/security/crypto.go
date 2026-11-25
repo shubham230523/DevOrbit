@@ -160,8 +160,15 @@ func (s *E2ESession) Decrypt(dir Direction, cipherTextHex string, seqNum int64, 
 	s.lastSeqNum = seqNum
 	s.mu.Unlock()
 
+	rollbackSeq := func() {
+		s.mu.Lock()
+		delete(s.seenSeqNums, seqNum)
+		s.mu.Unlock()
+	}
+
 	cipherText, err := hex.DecodeString(cipherTextHex)
 	if err != nil {
+		rollbackSeq()
 		return nil, err
 	}
 
@@ -174,16 +181,19 @@ func (s *E2ESession) Decrypt(dir Direction, cipherTextHex string, seqNum int64, 
 
 	block, err := aes.NewCipher(key)
 	if err != nil {
+		rollbackSeq()
 		return nil, err
 	}
 
 	aesGCM, err := cipher.NewGCM(block)
 	if err != nil {
+		rollbackSeq()
 		return nil, err
 	}
 
 	nonceSize := aesGCM.NonceSize()
 	if len(cipherText) < nonceSize {
+		rollbackSeq()
 		return nil, errors.New("ciphertext too short")
 	}
 
@@ -192,8 +202,20 @@ func (s *E2ESession) Decrypt(dir Direction, cipherTextHex string, seqNum int64, 
 
 	plainText, err := aesGCM.Open(nil, nonce, actualCipherText, aad)
 	if err != nil {
+		rollbackSeq()
 		return nil, ErrTamperedPayload
 	}
+
+	s.mu.Lock()
+	if len(s.seenSeqNums) > 2000 {
+		cutoff := s.lastSeqNum - 1000
+		for k := range s.seenSeqNums {
+			if k < cutoff {
+				delete(s.seenSeqNums, k)
+			}
+		}
+	}
+	s.mu.Unlock()
 
 	return plainText, nil
 }

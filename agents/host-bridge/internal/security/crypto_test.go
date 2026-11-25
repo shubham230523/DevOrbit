@@ -204,3 +204,40 @@ func TestE2ESession_ExpiredKeyDestruction(t *testing.T) {
 		}
 	}
 }
+
+func TestE2ESession_SequencePruningAndFailureRollback(t *testing.T) {
+	session, err := NewE2ESession("sess-500", "device-phone-01", "shared-master-secret-32-bytes", 1*time.Hour)
+	if err != nil {
+		t.Fatalf("Failed to create session: %v", err)
+	}
+
+	// Test 1: Failed decryption rolls back sequence number so it can be retried
+	invalidCipherHex := "00112233445566778899aabbccddeeff00112233445566778899aabb"
+	_, err = session.Decrypt(DirClientToHost, invalidCipherHex, 42, time.Now().UnixNano())
+	if err == nil {
+		t.Errorf("Expected decryption error for invalid ciphertext")
+	}
+
+	// Encrypt a valid frame with seqNum 42 and verify decryption succeeds
+	plain := []byte("Valid Retry")
+	ts := time.Now().UnixNano()
+	validCipherHex, _ := session.Encrypt(DirClientToHost, plain, 42, ts)
+	decrypted, err := session.Decrypt(DirClientToHost, validCipherHex, 42, ts)
+	if err != nil || string(decrypted) != "Valid Retry" {
+		t.Fatalf("Failed to decrypt valid retry after failed decryption: %v", err)
+	}
+
+	// Test 2: Pruning sequence numbers over 2000 limit
+	for seq := int64(43); seq <= 2500; seq++ {
+		cHex, _ := session.Encrypt(DirClientToHost, []byte("test"), seq, ts)
+		_, _ = session.Decrypt(DirClientToHost, cHex, seq, ts)
+	}
+
+	session.mu.Lock()
+	seenCount := len(session.seenSeqNums)
+	session.mu.Unlock()
+
+	if seenCount > 1500 {
+		t.Errorf("Expected seenSeqNums to be pruned below 1500, but count is %d", seenCount)
+	}
+}

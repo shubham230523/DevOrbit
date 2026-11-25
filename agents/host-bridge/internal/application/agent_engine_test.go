@@ -162,3 +162,78 @@ func TestAgentEngine_MultiTurnTaskExecution(t *testing.T) {
 		t.Errorf("Expected TaskEvents to be emitted during task lifecycle")
 	}
 }
+
+func TestApprovalManager_ArgumentAndPayloadBindingEnforcement(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "devorbit_approval_binding_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	jail := security.NewWorkspaceJail([]string{tempDir})
+	policy := security.NewDefaultCommandPolicy()
+
+	storage := filesystem.NewStorageEngine(jail, 10*1024*1024)
+	procRunner := process.NewProcessRunner(policy, jail)
+	gitClient := git.NewGitClient(jail)
+	adbClient := adb.NewADBClient("adb")
+
+	wsSvc := NewWorkspaceService(jail)
+	fsSvc := NewFilesystemService(storage)
+	psSvc := NewProcessService(procRunner)
+	gsSvc := NewGitService(gitClient)
+	dsSvc := NewDeviceService(adbClient)
+
+	approvalMgr := NewApprovalManager()
+	executor := NewAgentToolExecutor(wsSvc, fsSvc, psSvc, gsSvc, dsSvc, approvalMgr)
+
+	// Test 1: Command argument tampering
+	safeCmdCall := &router.FunctionCall{
+		Name: router.ToolExecuteCommand,
+		Arguments: map[string]any{
+			"command": "git",
+			"args":    []any{"status"},
+		},
+	}
+	_, proposal, err := executor.ExecuteTool(context.Background(), "task-sec-1", tempDir, safeCmdCall, "")
+	if err != ErrApprovalRequired || proposal == nil {
+		t.Fatalf("Expected ErrApprovalRequired, got err: %v", err)
+	}
+
+	tamperedCmdCall := &router.FunctionCall{
+		Name: router.ToolExecuteCommand,
+		Arguments: map[string]any{
+			"command": "git",
+			"args":    []any{"push", "--force"},
+		},
+	}
+	_, _, err = executor.ExecuteTool(context.Background(), "task-sec-1", tempDir, tamperedCmdCall, proposal.Token)
+	if err != ErrApprovalMismatch {
+		t.Errorf("Security flaw! Tampered command arguments were permitted under approved token, got err: %v", err)
+	}
+
+	// Test 2: File content payload tampering
+	safeCreateCall := &router.FunctionCall{
+		Name: router.ToolCreateFile,
+		Arguments: map[string]any{
+			"path":    "safe.txt",
+			"content": "safe content",
+		},
+	}
+	_, proposal2, err := executor.ExecuteTool(context.Background(), "task-sec-2", tempDir, safeCreateCall, "")
+	if err != ErrApprovalRequired || proposal2 == nil {
+		t.Fatalf("Expected ErrApprovalRequired, got err: %v", err)
+	}
+
+	tamperedCreateCall := &router.FunctionCall{
+		Name: router.ToolCreateFile,
+		Arguments: map[string]any{
+			"path":    "safe.txt",
+			"content": "MALICIOUS CONTENT",
+		},
+	}
+	_, _, err = executor.ExecuteTool(context.Background(), "task-sec-2", tempDir, tamperedCreateCall, proposal2.Token)
+	if err != ErrApprovalMismatch {
+		t.Errorf("Security flaw! Tampered file content was permitted under approved token, got err: %v", err)
+	}
+}

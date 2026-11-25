@@ -292,6 +292,8 @@ class BrokerWebSocketClient {
     _pendingRequests.clear();
   }
 
+  Future<void>? _sendQueue;
+
   Future<ApplicationResponseEnvelope> sendRequest({
     required String method,
     required String path,
@@ -303,44 +305,66 @@ class BrokerWebSocketClient {
       throw StateError('Broker WebSocket is not connected or authenticated');
     }
 
-    _sequenceNum++;
-    final requestId = 'req_${_sequenceNum}_${DateTime.now().millisecondsSinceEpoch}';
-    final timestamp = DateTime.now().microsecondsSinceEpoch;
-
-    final appReq = {
-      'v': '1.2',
-      'session_id': sessionId,
-      'request_id': requestId,
-      'method': method,
-      'path': path,
-      if (headers != null) 'headers': headers,
-      'body': body ?? '',
-      'seq_num': _sequenceNum,
-      'timestamp': timestamp,
-    };
-
-    final plainJson = jsonEncode(appReq);
-
-    final cipherHex = await _e2eSession!.encrypt(
-      direction: Direction.clientToHost,
-      plainText: plainJson,
-      seqNum: _sequenceNum,
-      timestamp: timestamp,
-    );
-
-    final frameEnvelope = {
-      'v': '1.2',
-      'session_id': sessionId,
-      'type': 'data',
-      'encrypted_payload': cipherHex,
-      'seq_num': _sequenceNum,
-      'timestamp': timestamp,
-    };
-
     final completer = Completer<ApplicationResponseEnvelope>();
-    _pendingRequests[requestId] = completer;
+    late String requestId;
 
-    _channel!.sink.add(jsonEncode(frameEnvelope));
+    final previousTask = _sendQueue;
+    final taskCompleter = Completer<void>();
+    _sendQueue = taskCompleter.future;
+
+    try {
+      if (previousTask != null) {
+        await previousTask;
+      }
+
+      if (_state != BrokerConnectionState.authenticatedBrokerSessionActive || _channel == null || _e2eSession == null) {
+        throw StateError('Broker WebSocket is not connected or authenticated');
+      }
+
+      _sequenceNum++;
+      final currentSeq = _sequenceNum;
+      requestId = 'req_${currentSeq}_${DateTime.now().millisecondsSinceEpoch}';
+      final timestamp = DateTime.now().microsecondsSinceEpoch;
+
+      final appReq = {
+        'v': '1.2',
+        'session_id': sessionId,
+        'request_id': requestId,
+        'method': method,
+        'path': path,
+        if (headers != null) 'headers': headers,
+        'body': body ?? '',
+        'seq_num': currentSeq,
+        'timestamp': timestamp,
+      };
+
+      final plainJson = jsonEncode(appReq);
+
+      final cipherHex = await _e2eSession!.encrypt(
+        direction: Direction.clientToHost,
+        plainText: plainJson,
+        seqNum: currentSeq,
+        timestamp: timestamp,
+      );
+
+      final frameEnvelope = {
+        'v': '1.2',
+        'session_id': sessionId,
+        'type': 'data',
+        'encrypted_payload': cipherHex,
+        'seq_num': currentSeq,
+        'timestamp': timestamp,
+      };
+
+      _pendingRequests[requestId] = completer;
+      _channel!.sink.add(jsonEncode(frameEnvelope));
+    } catch (e) {
+      if (!completer.isCompleted) {
+        completer.completeError(e);
+      }
+    } finally {
+      taskCompleter.complete();
+    }
 
     return completer.future.timeout(
       timeout,

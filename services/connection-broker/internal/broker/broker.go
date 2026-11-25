@@ -322,7 +322,9 @@ func (b *Broker) RevokeDevice(machineID, deviceID string) {
 					Status:          "revoked",
 					Timestamp:       time.Now().UnixMicro(),
 				}
+				sess.mu.Lock()
 				_ = sess.ClientConn.WriteJSON(revokedFrame)
+				sess.mu.Unlock()
 			}
 			b.closeSessionLocked(sess.ID)
 		}
@@ -383,7 +385,9 @@ func (b *Broker) RegisterHostConnection(machineID, sessionID, token string, conn
 			Status:          "ready",
 			Timestamp:       time.Now().UnixMicro(),
 		}
+		sess.mu.Lock()
 		_ = sess.ClientConn.WriteJSON(readyFrame)
+		sess.mu.Unlock()
 	}
 
 	return sess, isReady, nil
@@ -433,6 +437,7 @@ func (b *Broker) RegisterClientConnection(machineID, deviceID, sessionID, token 
 	sess.ClientConn = conn
 
 	isReady := false
+	sess.mu.Lock()
 	if sess.HostConn != nil {
 		isReady = true
 		readyFrame := &FrameEnvelope{
@@ -453,6 +458,7 @@ func (b *Broker) RegisterClientConnection(machineID, deviceID, sessionID, token 
 		}
 		_ = conn.WriteJSON(pendingFrame)
 	}
+	sess.mu.Unlock()
 
 	return sess, isReady, nil
 }
@@ -531,7 +537,9 @@ func (b *Broker) HandleHostWebSocket(w http.ResponseWriter, r *http.Request) {
 					Status:          "waiting_for_host",
 					Timestamp:       time.Now().UnixMicro(),
 				}
+				s.mu.Lock()
 				_ = s.ClientConn.WriteJSON(disconnectFrame)
+				s.mu.Unlock()
 			} else {
 				b.closeSessionLocked(sess.ID)
 			}
