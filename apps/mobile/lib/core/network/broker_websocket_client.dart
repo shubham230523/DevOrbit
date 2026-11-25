@@ -86,7 +86,7 @@ class BrokerWebSocketClient {
   });
 
   void _updateState(BrokerConnectionState newState) {
-    if (_state != newState) {
+    if (_state != newState && !_stateController.isClosed) {
       _state = newState;
       _stateController.add(_state);
     }

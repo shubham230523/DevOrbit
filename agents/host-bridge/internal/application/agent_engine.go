@@ -170,6 +170,68 @@ func (e *GeminiAgentEngine) RunTask(ctx context.Context, taskID string, approval
 	tools := router.GetStageCToolDeclarations()
 	maxTurns := 15
 
+	task.mu.Lock()
+	pendingTurn := task.PendingTurn
+	task.mu.Unlock()
+
+	if pendingTurn != nil && approvalToken != "" {
+		e.emitEvent(task, EventToolRequested, fmt.Sprintf("Resuming pending turn with approval for %d tool calls", len(pendingTurn.FunctionCalls)), map[string]any{
+			"function_calls": pendingTurn.FunctionCalls,
+		})
+
+		toolResponses := make([]router.FunctionResponse, 0, len(pendingTurn.FunctionCalls))
+		for _, fc := range pendingTurn.FunctionCalls {
+			e.emitEvent(task, EventToolExecutionStarted, fmt.Sprintf("Executing approved tool '%s'", fc.Name), map[string]any{
+				"tool": fc.Name,
+				"args": fc.Arguments,
+			})
+
+			resMap, proposal, err := e.toolExecutor.ExecuteTool(taskCtx, task.ID, task.WorkspaceID, &fc, approvalToken)
+			if err != nil {
+				if errors.Is(err, ErrApprovalRequired) && proposal != nil {
+					task.mu.Lock()
+					task.Status = "approval_required"
+					task.ApprovalToken = proposal.Token
+					task.PendingTurn = pendingTurn
+					task.mu.Unlock()
+
+					e.emitEvent(task, EventApprovalRequired, fmt.Sprintf("Tool '%s' requires user approval", fc.Name), map[string]any{
+						"proposal": proposal,
+					})
+					return nil
+				}
+
+				log.Printf("Approved tool '%s' execution error: %v", fc.Name, err)
+				resMap = map[string]any{"error": err.Error()}
+			}
+
+			e.emitEvent(task, EventToolExecutionCompleted, fmt.Sprintf("Approved tool '%s' completed", fc.Name), map[string]any{
+				"tool":   fc.Name,
+				"result": resMap,
+			})
+
+			toolResponses = append(toolResponses, router.FunctionResponse{
+				Name:     fc.Name,
+				Response: resMap,
+			})
+		}
+
+		task.mu.Lock()
+		task.Messages = append(task.Messages, router.Message{
+			Role:          "model",
+			FunctionCalls: pendingTurn.FunctionCalls,
+		})
+		task.Messages = append(task.Messages, router.Message{
+			Role:              "tool",
+			FunctionResponses: toolResponses,
+		})
+		task.PendingTurn = nil
+		task.ApprovalToken = ""
+		task.mu.Unlock()
+
+		approvalToken = ""
+	}
+
 	for turn := 1; turn <= maxTurns; turn++ {
 		select {
 		case <-taskCtx.Done():
