@@ -100,3 +100,46 @@ func TestWorkspaceJail_SymlinkEscapeNonExistentTarget(t *testing.T) {
 		t.Errorf("Security flaw! Symlink escape via parent directory on non-existent target was permitted")
 	}
 }
+
+func TestWorkspaceJail_NestedSymlinksAndCaseHandling(t *testing.T) {
+	tempJail, err := os.MkdirTemp("", "devorbit_jail_nested_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempJail)
+
+	subDir := filepath.Join(tempJail, "sub")
+	_ = os.MkdirAll(subDir, 0755)
+
+	jail := NewWorkspaceJail([]string{tempJail})
+
+	// Case sensitivity / slash normalization test
+	relPath := "SUB/../sub/./file.txt"
+	resolved, err := jail.ResolveAndValidate(tempJail, relPath)
+	if err != nil {
+		t.Fatalf("Expected valid normalized relative path to resolve, got: %v", err)
+	}
+	if resolved == "" {
+		t.Errorf("Expected non-empty resolved path")
+	}
+
+	// Workspace root addition & resolution test
+	dynRoot, err := os.MkdirTemp("", "devorbit_jail_dyn_*")
+	if err != nil {
+		t.Fatalf("Failed to create dyn temp dir: %v", err)
+	}
+	defer os.RemoveAll(dynRoot)
+
+	added := jail.AddRoot("ws-dyn-99", dynRoot)
+	if added == "" {
+		t.Errorf("AddRoot returned empty string")
+	}
+
+	resDyn, err := jail.ResolveAndValidate("ws-dyn-99", "file.txt")
+	if err != nil {
+		t.Fatalf("Failed to resolve path under dynamically added root: %v", err)
+	}
+	if resDyn == "" {
+		t.Errorf("Expected non-empty resolution under dynamic root")
+	}
+}

@@ -127,7 +127,7 @@ func (e *AgentToolExecutor) ExecuteTool(
 			return nil, proposal, ErrApprovalRequired
 		}
 
-		_, err := e.approvalMgr.ConsumeApproval(approvalToken, taskID, workspaceID, toolName, relPath, "", nil, content, "")
+		_, err := e.approvalMgr.ConsumeApproval(approvalToken, taskID, workspaceID, toolName, relPath, "", "", nil, content, "")
 		if err != nil {
 			return nil, nil, err
 		}
@@ -169,7 +169,7 @@ func (e *AgentToolExecutor) ExecuteTool(
 			return nil, proposal, ErrApprovalRequired
 		}
 
-		proposal, err := e.approvalMgr.ConsumeApproval(approvalToken, taskID, workspaceID, toolName, relPath, "", nil, target, replacement)
+		proposal, err := e.approvalMgr.ConsumeApproval(approvalToken, taskID, workspaceID, toolName, relPath, existing.SHA256Hash, "", nil, target, replacement)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -214,7 +214,7 @@ func (e *AgentToolExecutor) ExecuteTool(
 			return nil, proposal, ErrApprovalRequired
 		}
 
-		_, err := e.approvalMgr.ConsumeApproval(approvalToken, taskID, workspaceID, toolName, relPath, "", nil, "", "")
+		_, err := e.approvalMgr.ConsumeApproval(approvalToken, taskID, workspaceID, toolName, relPath, "", "", nil, "", "")
 		if err != nil {
 			return nil, nil, err
 		}
@@ -249,7 +249,7 @@ func (e *AgentToolExecutor) ExecuteTool(
 			return nil, proposal, ErrApprovalRequired
 		}
 
-		_, err := e.approvalMgr.ConsumeApproval(approvalToken, taskID, workspaceID, toolName, "", cmdStr, cmdArgs, "", "")
+		_, err := e.approvalMgr.ConsumeApproval(approvalToken, taskID, workspaceID, toolName, "", "", cmdStr, cmdArgs, "", "")
 		if err != nil {
 			return nil, nil, err
 		}

@@ -80,7 +80,7 @@ func (m *ApprovalManager) CreateProposal(
 }
 
 func (m *ApprovalManager) ConsumeApproval(
-	token, taskID, workspaceID, toolName, targetPath, command string, args []string, targetContent, replacement string,
+	token, taskID, workspaceID, toolName, targetPath, expectedSHA256, command string, args []string, targetContent, replacement string,
 ) (*ApprovalProposal, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -95,30 +95,32 @@ func (m *ApprovalManager) ConsumeApproval(
 		return nil, ErrApprovalExpired
 	}
 
-	// Validate exact binding: task, workspace, tool, path, command, args, targetContent, replacement
+	// Validate exact binding for ALL fields unconditionally
 	if p.TaskID != taskID || p.WorkspaceID != workspaceID || p.ToolName != toolName {
 		return nil, ErrApprovalMismatch
 	}
 
-	if targetPath != "" && p.TargetPath != targetPath {
+	if p.TargetPath != targetPath {
 		return nil, ErrApprovalMismatch
 	}
 
-	if command != "" && p.Command != command {
+	if p.ExpectedSHA256 != expectedSHA256 {
 		return nil, ErrApprovalMismatch
 	}
 
-	if len(args) > 0 || len(p.Args) > 0 {
-		if !equalStringSlices(p.Args, args) {
-			return nil, ErrApprovalMismatch
-		}
-	}
-
-	if targetContent != "" && p.TargetContent != targetContent {
+	if p.Command != command {
 		return nil, ErrApprovalMismatch
 	}
 
-	if replacement != "" && p.Replacement != replacement {
+	if !equalStringSlices(p.Args, args) {
+		return nil, ErrApprovalMismatch
+	}
+
+	if p.TargetContent != targetContent {
+		return nil, ErrApprovalMismatch
+	}
+
+	if p.Replacement != replacement {
 		return nil, ErrApprovalMismatch
 	}
 
@@ -132,6 +134,9 @@ func (m *ApprovalManager) ConsumeApproval(
 }
 
 func equalStringSlices(a, b []string) bool {
+	if a == nil && b == nil {
+		return true
+	}
 	if len(a) != len(b) {
 		return false
 	}

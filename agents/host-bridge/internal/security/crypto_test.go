@@ -5,6 +5,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/hex"
+	"sync"
 	"testing"
 	"time"
 )
@@ -237,7 +238,85 @@ func TestE2ESession_SequencePruningAndFailureRollback(t *testing.T) {
 	seenCount := len(session.seenSeqNums)
 	session.mu.Unlock()
 
-	if seenCount > 1500 {
-		t.Errorf("Expected seenSeqNums to be pruned below 1500, but count is %d", seenCount)
+	if seenCount > 1050 {
+		t.Errorf("Expected seenSeqNums to be pruned below 1050, but count is %d", seenCount)
+	}
+
+	// Test 3: Replay after pruning MUST FAIL
+	prunedSeq := int64(10) // Well below lastSeqNum (2500) - 1000
+	prunedCipherHex, _ := session.Encrypt(DirClientToHost, []byte("Replay Pruned"), prunedSeq, ts)
+	_, err = session.Decrypt(DirClientToHost, prunedCipherHex, prunedSeq, ts)
+	if err != ErrReplayedFrame {
+		t.Errorf("Security flaw! Replaying a pruned sequence number passed, expected ErrReplayedFrame, got: %v", err)
+	}
+}
+
+func TestE2ESession_SlidingWindowAndAdversarialReplay(t *testing.T) {
+	session, err := NewE2ESession("sess-600", "device-phone-01", "shared-master-secret-32-bytes", 1*time.Hour)
+	if err != nil {
+		t.Fatalf("Failed to create session: %v", err)
+	}
+
+	ts := time.Now().UnixNano()
+
+	// 1. Boundary conditions: seqNum <= 0 must fail
+	zeroCipher, _ := session.Encrypt(DirClientToHost, []byte("zero"), 0, ts)
+	_, err = session.Decrypt(DirClientToHost, zeroCipher, 0, ts)
+	if err != ErrReplayedFrame {
+		t.Errorf("Expected ErrReplayedFrame for seqNum 0, got: %v", err)
+	}
+
+	negCipher, _ := session.Encrypt(DirClientToHost, []byte("neg"), -5, ts)
+	_, err = session.Decrypt(DirClientToHost, negCipher, -5, ts)
+	if err != ErrReplayedFrame {
+		t.Errorf("Expected ErrReplayedFrame for negative seqNum, got: %v", err)
+	}
+
+	// 2. Out-of-order delivery within window: sequence 10 then sequence 5
+	c10, _ := session.Encrypt(DirClientToHost, []byte("frame 10"), 10, ts)
+	c5, _ := session.Encrypt(DirClientToHost, []byte("frame 5"), 5, ts)
+
+	_, err = session.Decrypt(DirClientToHost, c10, 10, ts)
+	if err != nil {
+		t.Fatalf("Failed to decrypt frame 10: %v", err)
+	}
+
+	dec5, err := session.Decrypt(DirClientToHost, c5, 5, ts)
+	if err != nil || string(dec5) != "frame 5" {
+		t.Fatalf("Failed to decrypt valid out-of-order frame 5: %v", err)
+	}
+
+	// 3. Duplicate concurrent frames
+	c20, _ := session.Encrypt(DirClientToHost, []byte("frame 20"), 20, ts)
+	var wg sync.WaitGroup
+	successes := 0
+	var mu sync.Mutex
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, dErr := session.Decrypt(DirClientToHost, c20, 20, ts)
+			if dErr == nil {
+				mu.Lock()
+				successes++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+
+	if successes != 1 {
+		t.Errorf("Security flaw! Concurrent duplicate frame decryption succeeded %d times, expected exactly 1", successes)
+	}
+
+	// 4. Session destruction during concurrent operations
+	destructSess, _ := NewE2ESession("sess-700", "device-phone-01", "shared-master-secret-32-bytes", 1*time.Hour)
+	cD, _ := destructSess.Encrypt(DirClientToHost, []byte("destruct"), 100, ts)
+
+	destructSess.Destroy()
+	_, err = destructSess.Decrypt(DirClientToHost, cD, 100, ts)
+	if err != ErrExpiredSessionKey {
+		t.Errorf("Expected ErrExpiredSessionKey after Destroy, got: %v", err)
 	}
 }

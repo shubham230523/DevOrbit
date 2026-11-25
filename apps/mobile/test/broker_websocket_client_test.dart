@@ -234,4 +234,53 @@ void main() {
     await serverSocket.close();
     await server.close();
   });
+
+  test('sendRequest enforces queue serialization and handles timeouts cleanly', () async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final port = server.port;
+    final socketCompleter = Completer<WebSocket>();
+
+    server.listen((HttpRequest req) async {
+      if (req.uri.path == '/ws/client') {
+        final ws = await WebSocketTransformer.upgrade(req);
+        if (!socketCompleter.isCompleted) {
+          socketCompleter.complete(ws);
+        }
+      }
+    });
+
+    final client = BrokerWebSocketClient(
+      brokerUrl: 'ws://127.0.0.1:$port',
+      machineId: 'mach-queue-01',
+      deviceId: 'dev-queue-01',
+      sessionId: 'sess-queue-01',
+      token: 'token-queue-32b',
+      masterSecret: 'master-secret-value-32-bytes-ok!',
+    );
+
+    await client.connect();
+    final serverSocket = await socketCompleter.future;
+
+    // Transition state to session_ready
+    serverSocket.add(jsonEncode({'type': 'session_ready', 'session_id': 'sess-queue-01'}));
+    await Future.delayed(const Duration(milliseconds: 50));
+
+    expect(client.state, equals(BrokerConnectionState.authenticatedBrokerSessionActive));
+
+    // Calling sendRequest when connected, expecting short timeout failure when server doesn't respond
+    expect(
+      () async => await client.sendRequest(
+        method: 'GET',
+        path: '/test/ping',
+        timeout: const Duration(milliseconds: 100),
+      ),
+      throwsA(isA<TimeoutException>()),
+    );
+
+    await Future.delayed(const Duration(milliseconds: 200));
+
+    client.dispose();
+    await serverSocket.close();
+    await server.close();
+  });
 }

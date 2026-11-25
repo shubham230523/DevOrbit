@@ -146,54 +146,73 @@ func (s *E2ESession) Encrypt(dir Direction, plainText []byte, seqNum int64, time
 	return hex.EncodeToString(cipherText), nil
 }
 
+const ReplayWindowSize int64 = 1000
+
+func isZeroKey(k []byte) bool {
+	if len(k) == 0 {
+		return true
+	}
+	for _, b := range k {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *E2ESession) Decrypt(dir Direction, cipherTextHex string, seqNum int64, timestamp int64) ([]byte, error) {
 	if s.IsExpired() {
 		return nil, ErrExpiredSessionKey
 	}
 
 	s.mu.Lock()
-	if s.seenSeqNums[seqNum] || seqNum <= 0 {
+	if isZeroKey(s.ClientToHostKey) || isZeroKey(s.HostToClientKey) {
+		s.mu.Unlock()
+		return nil, ErrExpiredSessionKey
+	}
+
+	// 1. Check bounds and sliding window before decryption
+	if seqNum <= 0 {
 		s.mu.Unlock()
 		return nil, ErrReplayedFrame
 	}
-	s.seenSeqNums[seqNum] = true
-	s.lastSeqNum = seqNum
-	s.mu.Unlock()
 
-	rollbackSeq := func() {
-		s.mu.Lock()
-		delete(s.seenSeqNums, seqNum)
+	if s.lastSeqNum > ReplayWindowSize && seqNum <= (s.lastSeqNum-ReplayWindowSize) {
 		s.mu.Unlock()
+		return nil, ErrReplayedFrame
 	}
 
-	cipherText, err := hex.DecodeString(cipherTextHex)
-	if err != nil {
-		rollbackSeq()
-		return nil, err
+	if s.seenSeqNums[seqNum] {
+		s.mu.Unlock()
+		return nil, ErrReplayedFrame
 	}
 
 	var key []byte
 	if dir == DirClientToHost {
-		key = s.ClientToHostKey
+		key = append([]byte(nil), s.ClientToHostKey...)
 	} else {
-		key = s.HostToClientKey
+		key = append([]byte(nil), s.HostToClientKey...)
+	}
+	s.mu.Unlock()
+
+	// 2. Authenticate & Decrypt (AES-GCM tag verification) BEFORE committing replay state
+	cipherText, err := hex.DecodeString(cipherTextHex)
+	if err != nil {
+		return nil, err
 	}
 
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		rollbackSeq()
 		return nil, err
 	}
 
 	aesGCM, err := cipher.NewGCM(block)
 	if err != nil {
-		rollbackSeq()
 		return nil, err
 	}
 
 	nonceSize := aesGCM.NonceSize()
 	if len(cipherText) < nonceSize {
-		rollbackSeq()
 		return nil, errors.New("ciphertext too short")
 	}
 
@@ -202,20 +221,40 @@ func (s *E2ESession) Decrypt(dir Direction, cipherTextHex string, seqNum int64, 
 
 	plainText, err := aesGCM.Open(nil, nonce, actualCipherText, aad)
 	if err != nil {
-		rollbackSeq()
+		// Failed authentication! Replay state remains completely untouched.
 		return nil, ErrTamperedPayload
 	}
 
+	// 3. Atomically commit sequence number to sliding replay window AFTER successful authentication
 	s.mu.Lock()
-	if len(s.seenSeqNums) > 2000 {
-		cutoff := s.lastSeqNum - 1000
+	defer s.mu.Unlock()
+
+	if isZeroKey(s.ClientToHostKey) || isZeroKey(s.HostToClientKey) {
+		return nil, ErrExpiredSessionKey
+	}
+
+	if s.seenSeqNums[seqNum] {
+		return nil, ErrReplayedFrame
+	}
+
+	if s.lastSeqNum > ReplayWindowSize && seqNum <= (s.lastSeqNum-ReplayWindowSize) {
+		return nil, ErrReplayedFrame
+	}
+
+	s.seenSeqNums[seqNum] = true
+	if seqNum > s.lastSeqNum {
+		s.lastSeqNum = seqNum
+	}
+
+	// Prune sequence numbers older than sliding window bound
+	if s.lastSeqNum > ReplayWindowSize {
+		cutoff := s.lastSeqNum - ReplayWindowSize
 		for k := range s.seenSeqNums {
-			if k < cutoff {
+			if k <= cutoff {
 				delete(s.seenSeqNums, k)
 			}
 		}
 	}
-	s.mu.Unlock()
 
 	return plainText, nil
 }

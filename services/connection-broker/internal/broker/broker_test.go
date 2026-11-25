@@ -539,3 +539,71 @@ func TestBroker_BoundedTTLAndIdentityHardening(t *testing.T) {
 		t.Fatalf("Expected HTTP 409 Conflict for conflicting client token on existing session, got %d", resp.StatusCode)
 	}
 }
+
+func TestBroker_ConcurrentRelayAndLifecycleStress(t *testing.T) {
+	b := NewBroker()
+	machineID := "mach-stress-01"
+	deviceID := "dev-stress-01"
+	sessionID := "sess-stress-01"
+	hostToken := "host-stress-token-32b"
+	clientToken := "client-stress-token-32b"
+
+	b.AuthorizeHost(machineID, hostToken)
+	b.AuthorizeDevice(machineID, deviceID, sessionID, clientToken)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws/host", b.HandleHostWebSocket)
+	mux.HandleFunc("/ws/client", b.HandleClientWebSocket)
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	wsURL := strings.Replace(server.URL, "http://", "ws://", 1)
+
+	cleanHostURL := fmt.Sprintf("%s/ws/host?machine_id=%s&session_id=%s", wsURL, machineID, sessionID)
+	cleanClientURL := fmt.Sprintf("%s/ws/client?machine_id=%s&device_id=%s&session_id=%s", wsURL, machineID, deviceID, sessionID)
+
+	hostConn, _, err := websocket.DefaultDialer.Dial(cleanHostURL, http.Header{"Authorization": []string{"Bearer " + hostToken}})
+	if err != nil {
+		t.Fatalf("Host connection failed: %v", err)
+	}
+	defer hostConn.Close()
+
+	clientConn, _, err := websocket.DefaultDialer.Dial(cleanClientURL, http.Header{"Authorization": []string{"Bearer " + clientToken}})
+	if err != nil {
+		t.Fatalf("Client connection failed: %v", err)
+	}
+	defer clientConn.Close()
+
+	// Drain session_ready frame
+	var ackFrame FrameEnvelope
+	_ = clientConn.ReadJSON(&ackFrame)
+
+	// Launch concurrent frame relays while triggering revocation/disconnections
+	done := make(chan bool)
+	for i := 0; i < 5; i++ {
+		go func(id int) {
+			for j := 0; j < 50; j++ {
+				frame := &FrameEnvelope{
+					ProtocolVersion: "1.2",
+					SessionID:       sessionID,
+					Type:            "data",
+					Timestamp:       time.Now().UnixMicro(),
+				}
+				_ = b.RelayFrameFromClientToHost(sessionID, frame)
+				_ = b.RelayFrameFromHostToClient(sessionID, frame)
+			}
+			done <- true
+		}(i)
+	}
+
+	// Trigger concurrent revocation and registration actions
+	go func() {
+		time.Sleep(5 * time.Millisecond)
+		b.RevokeDevice(machineID, deviceID)
+	}()
+
+	for i := 0; i < 5; i++ {
+		<-done
+	}
+}

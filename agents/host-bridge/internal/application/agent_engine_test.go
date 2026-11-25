@@ -4,7 +4,9 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"devorbit.net/agents/ai-router/pkg/router"
 	"devorbit.net/agents/host-bridge/internal/infrastructure/adb"
@@ -235,5 +237,105 @@ func TestApprovalManager_ArgumentAndPayloadBindingEnforcement(t *testing.T) {
 	_, _, err = executor.ExecuteTool(context.Background(), "task-sec-2", tempDir, tamperedCreateCall, proposal2.Token)
 	if err != ErrApprovalMismatch {
 		t.Errorf("Security flaw! Tampered file content was permitted under approved token, got err: %v", err)
+	}
+}
+
+func TestApprovalManager_ExhaustiveAdversarialBinding(t *testing.T) {
+	mgr := NewApprovalManager()
+
+	// 1. Setup baseline proposal
+	prop, err := mgr.CreateProposal(
+		"task-100", "ws-100", "edit_file", "src/main.kt", "hash-12345",
+		"old_code()", "new_code()", "", nil, "reason", 10*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("Failed to create proposal: %v", err)
+	}
+
+	// Case A: Non-empty target content replaced with empty content -> MUST FAIL
+	_, err = mgr.ConsumeApproval(prop.Token, "task-100", "ws-100", "edit_file", "src/main.kt", "hash-12345", "", nil, "", "new_code()")
+	if err != ErrApprovalMismatch {
+		t.Errorf("Security flaw! Non-empty approved targetContent replaced with empty string passed, got: %v", err)
+	}
+
+	// Case B: Non-empty replacement replaced with empty replacement -> MUST FAIL
+	_, err = mgr.ConsumeApproval(prop.Token, "task-100", "ws-100", "edit_file", "src/main.kt", "hash-12345", "", nil, "old_code()", "")
+	if err != ErrApprovalMismatch {
+		t.Errorf("Security flaw! Non-empty approved replacement replaced with empty string passed, got: %v", err)
+	}
+
+	// Case C: Altered file path -> MUST FAIL
+	_, err = mgr.ConsumeApproval(prop.Token, "task-100", "ws-100", "edit_file", "src/OTHER.kt", "hash-12345", "", nil, "old_code()", "new_code()")
+	if err != ErrApprovalMismatch {
+		t.Errorf("Security flaw! Altered file path passed, got: %v", err)
+	}
+
+	// Case D: Altered original file hash -> MUST FAIL
+	_, err = mgr.ConsumeApproval(prop.Token, "task-100", "ws-100", "edit_file", "src/main.kt", "hash-WRONG", "", nil, "old_code()", "new_code()")
+	if err != ErrApprovalMismatch {
+		t.Errorf("Security flaw! Altered expected SHA256 passed, got: %v", err)
+	}
+
+	// Case E: Different task ID -> MUST FAIL
+	_, err = mgr.ConsumeApproval(prop.Token, "task-ATTACKER", "ws-100", "edit_file", "src/main.kt", "hash-12345", "", nil, "old_code()", "new_code()")
+	if err != ErrApprovalMismatch {
+		t.Errorf("Security flaw! Cross-task approval reuse passed, got: %v", err)
+	}
+
+	// Case F: Different workspace ID -> MUST FAIL
+	_, err = mgr.ConsumeApproval(prop.Token, "task-100", "ws-ATTACKER", "edit_file", "src/main.kt", "hash-12345", "", nil, "old_code()", "new_code()")
+	if err != ErrApprovalMismatch {
+		t.Errorf("Security flaw! Cross-workspace approval reuse passed, got: %v", err)
+	}
+
+	// Setup command proposal
+	cmdProp, _ := mgr.CreateProposal(
+		"task-200", "ws-200", "execute_command", "", "",
+		"", "", "git", []string{"status"}, "reason", 10*time.Minute,
+	)
+
+	// Case G: Non-empty command replaced with empty command -> MUST FAIL
+	_, err = mgr.ConsumeApproval(cmdProp.Token, "task-200", "ws-200", "execute_command", "", "", "", []string{"status"}, "", "")
+	if err != ErrApprovalMismatch {
+		t.Errorf("Security flaw! Non-empty approved command replaced with empty string passed, got: %v", err)
+	}
+
+	// Case H: Single-use enforcement & Token reuse -> First consume succeeds, second MUST FAIL
+	pValid, err := mgr.ConsumeApproval(cmdProp.Token, "task-200", "ws-200", "execute_command", "", "", "git", []string{"status"}, "", "")
+	if err != nil || pValid == nil {
+		t.Fatalf("Valid token consumption failed: %v", err)
+	}
+
+	_, err = mgr.ConsumeApproval(cmdProp.Token, "task-200", "ws-200", "execute_command", "", "", "git", []string{"status"}, "", "")
+	if err != ErrApprovalTokenNotFound {
+		t.Errorf("Security flaw! Token reuse permitted, got: %v", err)
+	}
+
+	// Case I: Concurrent token consumption -> Only 1 caller succeeds
+	concurrentProp, _ := mgr.CreateProposal(
+		"task-300", "ws-300", "delete_file", "temp.txt", "",
+		"", "", "", nil, "reason", 10*time.Minute,
+	)
+
+	successCount := 0
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, cErr := mgr.ConsumeApproval(concurrentProp.Token, "task-300", "ws-300", "delete_file", "temp.txt", "", "", nil, "", "")
+			if cErr == nil {
+				mu.Lock()
+				successCount++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+
+	if successCount != 1 {
+		t.Errorf("Security flaw! Concurrent consumption permitted %d successes, expected exactly 1", successCount)
 	}
 }
