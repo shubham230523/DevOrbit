@@ -119,8 +119,12 @@ func deepCopyValue(v any) any {
 		return append([]float64(nil), val...)
 	case []bool:
 		return append([]bool(nil), val...)
+	case string, bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
+		return val
 	default:
-		return v
+		// Convert non-JSON-primitive mutable values (channels, functions, complex struct pointers)
+		// to string representations to prevent mutable reference aliasing.
+		return fmt.Sprintf("%v", val)
 	}
 }
 
@@ -286,7 +290,7 @@ func (e *GeminiAgentEngine) emitEvent(task *AgentTask, evtType EventType, msg st
 		TaskID:    task.ID,
 		Type:      evtType,
 		Message:   msg,
-		Data:      data,
+		Data:      deepCopyMap(data),
 		Timestamp: time.Now().UTC().UnixMicro(),
 	}
 
@@ -303,7 +307,13 @@ func (e *GeminiAgentEngine) emitEvent(task *AgentTask, evtType EventType, msg st
 	e.mu.RUnlock()
 
 	for _, l := range listeners {
-		l(evt)
+		l(TaskEvent{
+			TaskID:    evt.TaskID,
+			Type:      evt.Type,
+			Message:   evt.Message,
+			Data:      deepCopyMap(evt.Data),
+			Timestamp: evt.Timestamp,
+		})
 	}
 }
 

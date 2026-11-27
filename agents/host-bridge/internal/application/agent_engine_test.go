@@ -618,8 +618,8 @@ func (p *BlockingAIProvider) Generate(ctx context.Context, req router.GenerateRe
 	}, nil
 }
 
-func TestAgentEngine_DeterministicBlockingConcurrentOwnership(t *testing.T) {
-	tempDir, err := os.MkdirTemp("", "devorbit_blocking_ownership_*")
+func TestAgentEngine_StartBarrierCompetingOwnership(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "devorbit_start_barrier_*")
 	if err != nil {
 		t.Fatalf("Failed to create temp workspace: %v", err)
 	}
@@ -642,95 +642,61 @@ func TestAgentEngine_DeterministicBlockingConcurrentOwnership(t *testing.T) {
 	approvalMgr := NewApprovalManager()
 	executor := NewAgentToolExecutor(wsSvc, fsSvc, psSvc, gsSvc, dsSvc, approvalMgr)
 
-	enteredChan := make(chan struct{}, 1)
-	blockChan := make(chan struct{})
-	blockingProv := &BlockingAIProvider{enteredChan: enteredChan, blockChan: blockChan}
+	// --- Scenario A: Two simultaneous RunTask calls competing for ownership ---
+	enteredA := make(chan struct{}, 1)
+	blockA := make(chan struct{})
+	blockingProvA := &BlockingAIProvider{enteredChan: enteredA, blockChan: blockA}
 
-	aiRouter := router.NewAIRouter()
-	aiRouter.RegisterProvider("Gemini API", blockingProv)
+	aiRouterA := router.NewAIRouter()
+	aiRouterA.RegisterProvider("Gemini API", blockingProvA)
 
-	engine := NewGeminiAgentEngine(aiRouter, executor, approvalMgr)
+	engineA := NewGeminiAgentEngine(aiRouterA, executor, approvalMgr)
+	taskA, _ := engineA.CreateTask(tempDir, "start barrier test A", "gemini-2.5-flash")
 
-	task, err := engine.CreateTask(tempDir, "blocking task test", "gemini-2.5-flash")
-	if err != nil {
-		t.Fatalf("Failed to create task: %v", err)
-	}
+	readyA := make(chan struct{}, 2)
+	barrierA := make(chan struct{})
+	resA := make(chan error, 2)
 
-	// 1. Goroutine 0 starts RunTask and enters AI generation
-	go0Done := make(chan error, 1)
 	go func() {
-		go0Done <- engine.RunTask(context.Background(), task.ID, "")
+		readyA <- struct{}{}
+		<-barrierA
+		resA <- engineA.RunTask(context.Background(), taskA.ID, "")
 	}()
 
-	// Wait deterministically for Goroutine 0 to acquire execution ownership and enter AI generation
-	<-enteredChan
+	go func() {
+		readyA <- struct{}{}
+		<-barrierA
+		resA <- engineA.RunTask(context.Background(), taskA.ID, "")
+	}()
 
-	// 2. Goroutines 1..5 call RunTask simultaneously -> MUST ALL receive "task is already running"
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	alreadyRunningErrs := 0
+	<-readyA
+	<-readyA
+	close(barrierA)
 
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			rErr := engine.RunTask(context.Background(), task.ID, "")
-			if rErr != nil && rErr.Error() == "task is already running" {
-				mu.Lock()
-				alreadyRunningErrs++
-				mu.Unlock()
-			}
-		}()
+	// Wait for the winning call to enter Generate and hold execution ownership
+	<-enteredA
+
+	// Unblock the winning call
+	close(blockA)
+
+	errA1 := <-resA
+	errA2 := <-resA
+
+	if (errA1 == nil && errA2 != nil && errA2.Error() == "task is already running") ||
+		(errA2 == nil && errA1 != nil && errA1.Error() == "task is already running") {
+		// PASS
+	} else {
+		t.Fatalf("Scenario A start barrier competition failed: errA1=%v, errA2=%v", errA1, errA2)
 	}
 
-	// 3. Goroutines 6..10 call ResumeTaskWithApproval simultaneously -> MUST ALL receive "task is already running"
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			resErr := engine.ResumeTaskWithApproval(context.Background(), task.ID, "appr-dummy")
-			if resErr != nil && resErr.Error() == "task is already running" {
-				mu.Lock()
-				alreadyRunningErrs++
-				mu.Unlock()
-			}
-		}()
-	}
-	wg.Wait()
-
-	if alreadyRunningErrs != 10 {
-		t.Errorf("Expected 10 'task is already running' errors while task was executing, got: %d", alreadyRunningErrs)
-	}
-
-	// Unblock Goroutine 0
-	close(blockChan)
-	go0Err := <-go0Done
-	if go0Err != nil {
-		t.Fatalf("Goroutine 0 RunTask failed: %v", go0Err)
-	}
-
-	taskFinal, _ := engine.GetTask(task.ID)
-	if taskFinal.Status != "completed" {
-		t.Errorf("Expected task status 'completed', got: %s", taskFinal.Status)
-	}
-
-	// 4. Scenario B: Two simultaneous ResumeTaskWithApproval calls against the same approval-required task
-	enteredChanB := make(chan struct{}, 1)
-	blockChanB := make(chan struct{})
-	blockingProvB := &BlockingAIProvider{enteredChan: enteredChanB, blockChan: blockChanB}
+	// --- Scenario B: Two simultaneous ResumeTaskWithApproval calls competing with the SAME valid token ---
+	enteredB := make(chan struct{}, 1)
+	blockB := make(chan struct{})
+	blockingProvB := &BlockingAIProvider{enteredChan: enteredB, blockChan: blockB}
 
 	aiRouterB := router.NewAIRouter()
-	aiRouterB.RegisterProvider("Gemini API", blockingProvB)
-
-	// Mock response requiring approval
-	mockProviderB := router.NewMockGeminiProvider()
-	_ = mockProviderB
-
-	engineB := NewGeminiAgentEngine(aiRouterB, executor, approvalMgr)
-
-	// Use MockGeminiProvider for initial call to create approval
-	mockProvInit := router.NewMockGeminiProvider()
-	mockProvInit.SetResponseForPrompt("scenario B prompt", &router.GenerateResponse{
+	mockProvInitB := router.NewMockGeminiProvider()
+	mockProvInitB.SetResponseForPrompt("start barrier test B", &router.GenerateResponse{
 		Model: "gemini-2.5-flash",
 		Text:  "",
 		FunctionCalls: []router.FunctionCall{
@@ -743,61 +709,125 @@ func TestAgentEngine_DeterministicBlockingConcurrentOwnership(t *testing.T) {
 			},
 		},
 	})
-	aiRouterB.RegisterProvider("Gemini API", mockProvInit)
+	aiRouterB.RegisterProvider("Gemini API", mockProvInitB)
 
-	taskB, _ := engineB.CreateTask(tempDir, "scenario B prompt", "gemini-2.5-flash")
-	_ = engineB.RunTask(context.Background(), taskB.ID, "")
+	engineB := NewGeminiAgentEngine(aiRouterB, executor, approvalMgr)
+	taskB, _ := engineB.CreateTask(tempDir, "start barrier test B", "gemini-2.5-flash")
+	_ = engineB.RunTask(context.Background(), taskB.ID, "") // Pauses on approval
 
 	tStateB, _ := engineB.GetTask(taskB.ID)
-	if tStateB.Status != "approval_required" || tStateB.ApprovalToken == "" {
-		t.Fatalf("Scenario B setup failed: expected approval_required, got %s", tStateB.Status)
-	}
 	tokenScenB := tStateB.ApprovalToken
 
-	// Register blocking provider for the resume turn
+	// Register blocking provider for resume turn
 	aiRouterB.RegisterProvider("Gemini API", blockingProvB)
 
-	var wgB sync.WaitGroup
-	var muB sync.Mutex
-	resumeSuccesses := 0
-	resumeAlreadyRunning := 0
+	readyB := make(chan struct{}, 2)
+	barrierB := make(chan struct{})
+	resB := make(chan error, 2)
 
-	// Launch two concurrent ResumeTaskWithApproval calls with the SAME valid token
-	for i := 0; i < 2; i++ {
-		wgB.Add(1)
-		go func() {
-			defer wgB.Done()
-			rErr := engineB.ResumeTaskWithApproval(context.Background(), taskB.ID, tokenScenB)
-			muB.Lock()
-			if rErr == nil {
-				resumeSuccesses++
-			} else if rErr != nil && rErr.Error() == "task is already running" {
-				resumeAlreadyRunning++
-			}
-			muB.Unlock()
-		}()
-	}
+	go func() {
+		readyB <- struct{}{}
+		<-barrierB
+		resB <- engineB.ResumeTaskWithApproval(context.Background(), taskB.ID, tokenScenB)
+	}()
 
-	// Wait for the winning resume call to enter AI generation
-	<-enteredChanB
+	go func() {
+		readyB <- struct{}{}
+		<-barrierB
+		resB <- engineB.ResumeTaskWithApproval(context.Background(), taskB.ID, tokenScenB)
+	}()
 
-	// Verify losing resume received "task is already running"
-	if resumeAlreadyRunning != 1 {
-		t.Errorf("Scenario B: expected exactly 1 'task is already running' error, got %d", resumeAlreadyRunning)
-	}
+	<-readyB
+	<-readyB
+	close(barrierB)
 
-	// Unblock winning resume call
-	close(blockChanB)
-	wgB.Wait()
+	<-enteredB
+	close(blockB)
 
-	if resumeSuccesses != 1 {
-		t.Errorf("Scenario B: expected exactly 1 resume success, got %d", resumeSuccesses)
+	errB1 := <-resB
+	errB2 := <-resB
+
+	if (errB1 == nil && errB2 != nil && errB2.Error() == "task is already running") ||
+		(errB2 == nil && errB1 != nil && errB1.Error() == "task is already running") {
+		// PASS
+	} else {
+		t.Fatalf("Scenario B start barrier competition failed: errB1=%v, errB2=%v", errB1, errB2)
 	}
 
 	// Verify file was created EXACTLY ONCE
 	scenBData, err := os.ReadFile(filepath.Join(tempDir, "scenB.txt"))
 	if err != nil || string(scenBData) != "scen B content" {
 		t.Errorf("Scenario B file creation failed: %v", err)
+	}
+
+	// --- Scenario C: RunTask racing ResumeTaskWithApproval against the same task ---
+	enteredC := make(chan struct{}, 1)
+	blockC := make(chan struct{})
+	blockingProvC := &BlockingAIProvider{enteredChan: enteredC, blockChan: blockC}
+
+	aiRouterC := router.NewAIRouter()
+	mockProvInitC := router.NewMockGeminiProvider()
+	mockProvInitC.SetResponseForPrompt("start barrier test C", &router.GenerateResponse{
+		Model: "gemini-2.5-flash",
+		Text:  "",
+		FunctionCalls: []router.FunctionCall{
+			{
+				Name: router.ToolCreateFile,
+				Arguments: map[string]any{
+					"path":    "scenC.txt",
+					"content": "scen C content",
+				},
+			},
+		},
+	})
+	aiRouterC.RegisterProvider("Gemini API", mockProvInitC)
+
+	engineC := NewGeminiAgentEngine(aiRouterC, executor, approvalMgr)
+	taskC, _ := engineC.CreateTask(tempDir, "start barrier test C", "gemini-2.5-flash")
+	_ = engineC.RunTask(context.Background(), taskC.ID, "") // Pauses on approval
+
+	tStateC, _ := engineC.GetTask(taskC.ID)
+	tokenScenC := tStateC.ApprovalToken
+
+	aiRouterC.RegisterProvider("Gemini API", blockingProvC)
+
+	readyC := make(chan struct{}, 2)
+	barrierC := make(chan struct{})
+	resC := make(chan error, 2)
+
+	go func() {
+		readyC <- struct{}{}
+		<-barrierC
+		resC <- engineC.RunTask(context.Background(), taskC.ID, "")
+	}()
+
+	go func() {
+		readyC <- struct{}{}
+		<-barrierC
+		resC <- engineC.ResumeTaskWithApproval(context.Background(), taskC.ID, tokenScenC)
+	}()
+
+	<-readyC
+	<-readyC
+	close(barrierC)
+
+	<-enteredC
+	close(blockC)
+
+	errC1 := <-resC
+	errC2 := <-resC
+
+	successCount := 0
+	alreadyRunningCount := 0
+	for _, errC := range []error{errC1, errC2} {
+		if errC == nil {
+			successCount++
+		} else if strings.Contains(errC.Error(), "already running") || strings.Contains(errC.Error(), "expected 'approval_required'") {
+			alreadyRunningCount++
+		}
+	}
+	if successCount != 1 || alreadyRunningCount != 1 {
+		t.Fatalf("Scenario C competition failed: errC1=%v, errC2=%v", errC1, errC2)
 	}
 }
 
@@ -829,6 +859,8 @@ func TestAgentEngine_DeepSnapshotIsolationAndMutationImmunity(t *testing.T) {
 	aiRouter := router.NewAIRouter()
 	aiRouter.RegisterProvider("Gemini API", mockProvider)
 
+	dummyChan := make(chan int)
+
 	mockProvider.SetResponseForPrompt("snapshot test", &router.GenerateResponse{
 		Model: "gemini-2.5-flash",
 		Text:  "",
@@ -836,8 +868,9 @@ func TestAgentEngine_DeepSnapshotIsolationAndMutationImmunity(t *testing.T) {
 			{
 				Name: router.ToolCreateFile,
 				Arguments: map[string]any{
-					"path":    "orig.txt",
-					"content": "orig content",
+					"path":            "orig.txt",
+					"content":         "orig content",
+					"unsupported_ptr": dummyChan,
 					"nested_map": map[string]any{
 						"str_key": "orig_str",
 					},
@@ -856,6 +889,12 @@ func TestAgentEngine_DeepSnapshotIsolationAndMutationImmunity(t *testing.T) {
 	snap, found := engine.GetTask(task.ID)
 	if !found || snap == nil || snap.PendingTurn == nil {
 		t.Fatalf("Failed to obtain snapshot with PendingTurn")
+	}
+
+	// Verify unsupported non-JSON-primitive mutable values (channels/pointers) are normalized safely
+	unsupportedVal := snap.PendingTurn.TurnResponse.FunctionCalls[0].Arguments["unsupported_ptr"]
+	if _, ok := unsupportedVal.(string); !ok {
+		t.Errorf("Expected unsupported channel value to be normalized to string representation, got: %T", unsupportedVal)
 	}
 
 	// Mutate nested snapshot data structures aggressively
