@@ -62,8 +62,62 @@ type AgentTask struct {
 	ErrorText     string            `json:"error_text,omitempty"`
 	CreatedAt     time.Time         `json:"created_at"`
 	UpdatedAt     time.Time         `json:"updated_at"`
+	executing     bool
 	mu            sync.Mutex
 	cancelFn      context.CancelFunc
+}
+
+func (t *AgentTask) Snapshot() *AgentTask {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	messagesCopy := make([]router.Message, len(t.Messages))
+	copy(messagesCopy, t.Messages)
+
+	eventsCopy := make([]TaskEvent, len(t.Events))
+	copy(eventsCopy, t.Events)
+
+	var pendingCopy *PendingTurnState
+	if t.PendingTurn != nil {
+		callStatesCopy := make([]FunctionCallState, len(t.PendingTurn.CallStates))
+		for i, cs := range t.PendingTurn.CallStates {
+			var respCopy map[string]any
+			if cs.Response != nil {
+				respCopy = make(map[string]any, len(cs.Response))
+				for k, v := range cs.Response {
+					respCopy[k] = v
+				}
+			}
+			callStatesCopy[i] = FunctionCallState{
+				Index:        cs.Index,
+				FunctionCall: cs.FunctionCall,
+				Executed:     cs.Executed,
+				Response:     respCopy,
+				PendingToken: cs.PendingToken,
+			}
+		}
+		pendingCopy = &PendingTurnState{
+			TurnResponse: t.PendingTurn.TurnResponse,
+			CallStates:   callStatesCopy,
+		}
+	}
+
+	return &AgentTask{
+		ID:            t.ID,
+		WorkspaceID:   t.WorkspaceID,
+		Prompt:        t.Prompt,
+		ModelID:       t.ModelID,
+		Status:        t.Status,
+		Messages:      messagesCopy,
+		Events:        eventsCopy,
+		PendingTurn:   pendingCopy,
+		ApprovalToken: t.ApprovalToken,
+		ResultText:    t.ResultText,
+		ErrorText:     t.ErrorText,
+		CreatedAt:     t.CreatedAt,
+		UpdatedAt:     t.UpdatedAt,
+		executing:     t.executing,
+	}
 }
 
 type GeminiAgentEngine struct {
@@ -291,6 +345,14 @@ func (e *GeminiAgentEngine) executePendingTurn(ctx context.Context, task *AgentT
 }
 
 func (e *GeminiAgentEngine) RunTask(ctx context.Context, taskID string, approvalToken string) error {
+	return e.runTaskInternal(ctx, taskID, approvalToken, "start")
+}
+
+func (e *GeminiAgentEngine) ResumeTaskWithApproval(ctx context.Context, taskID, approvalToken string) error {
+	return e.runTaskInternal(ctx, taskID, approvalToken, "resume")
+}
+
+func (e *GeminiAgentEngine) runTaskInternal(ctx context.Context, taskID string, approvalToken string, mode string) error {
 	e.mu.RLock()
 	task, found := e.activeTasks[taskID]
 	e.mu.RUnlock()
@@ -300,10 +362,31 @@ func (e *GeminiAgentEngine) RunTask(ctx context.Context, taskID string, approval
 	}
 
 	taskCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+
 	task.mu.Lock()
+	if task.executing {
+		task.mu.Unlock()
+		cancel()
+		return errors.New("task is already running")
+	}
+
+	if mode == "resume" && task.Status != "approval_required" {
+		task.mu.Unlock()
+		cancel()
+		return fmt.Errorf("task status is '%s', expected 'approval_required'", task.Status)
+	}
+
+	task.executing = true
 	task.cancelFn = cancel
 	task.Status = "running"
 	task.mu.Unlock()
+
+	defer func() {
+		task.mu.Lock()
+		task.executing = false
+		task.mu.Unlock()
+		cancel()
+	}()
 
 	e.emitEvent(task, EventTaskStarted, fmt.Sprintf("Task '%s' started", taskID), map[string]any{
 		"workspace_id": task.WorkspaceID,
@@ -316,6 +399,11 @@ func (e *GeminiAgentEngine) RunTask(ctx context.Context, taskID string, approval
 	// Process pending turn if task was resumed from an approval state
 	completed, err := e.executePendingTurn(taskCtx, task, approvalToken)
 	if err != nil || !completed {
+		if err != nil && (errors.Is(err, ErrApprovalMismatch) || errors.Is(err, ErrApprovalTokenNotFound) || errors.Is(err, ErrApprovalExpired)) {
+			task.mu.Lock()
+			task.Status = "approval_required"
+			task.mu.Unlock()
+		}
 		return err
 	}
 
@@ -323,7 +411,9 @@ func (e *GeminiAgentEngine) RunTask(ctx context.Context, taskID string, approval
 		select {
 		case <-taskCtx.Done():
 			task.mu.Lock()
-			task.Status = "cancelled"
+			if task.Status != "cancelled" {
+				task.Status = "cancelled"
+			}
 			task.mu.Unlock()
 			e.emitEvent(task, EventTaskCancelled, "Task cancelled or timed out", nil)
 			return taskCtx.Err()
@@ -398,36 +488,6 @@ func (e *GeminiAgentEngine) RunTask(ctx context.Context, taskID string, approval
 	return fmt.Errorf("task exceeded maximum turn count (%d)", maxTurns)
 }
 
-func (e *GeminiAgentEngine) ResumeTaskWithApproval(ctx context.Context, taskID, approvalToken string) error {
-	e.mu.RLock()
-	task, found := e.activeTasks[taskID]
-	e.mu.RUnlock()
-
-	if !found {
-		return fmt.Errorf("task '%s' not found", taskID)
-	}
-
-	task.mu.Lock()
-	if task.Status == "running" {
-		task.mu.Unlock()
-		return errors.New("task is already running")
-	}
-	if task.Status != "approval_required" {
-		task.mu.Unlock()
-		return fmt.Errorf("task status is '%s', expected 'approval_required'", task.Status)
-	}
-	task.Status = "running"
-	task.mu.Unlock()
-
-	err := e.RunTask(ctx, taskID, approvalToken)
-	if err != nil && (errors.Is(err, ErrApprovalMismatch) || errors.Is(err, ErrApprovalTokenNotFound) || errors.Is(err, ErrApprovalExpired)) {
-		task.mu.Lock()
-		task.Status = "approval_required"
-		task.mu.Unlock()
-	}
-	return err
-}
-
 func (e *GeminiAgentEngine) CancelTask(taskID string) bool {
 	e.mu.RLock()
 	task, found := e.activeTasks[taskID]
@@ -450,7 +510,11 @@ func (e *GeminiAgentEngine) CancelTask(taskID string) bool {
 
 func (e *GeminiAgentEngine) GetTask(taskID string) (*AgentTask, bool) {
 	e.mu.RLock()
-	defer e.mu.RUnlock()
-	t, found := e.activeTasks[taskID]
-	return t, found
+	task, found := e.activeTasks[taskID]
+	e.mu.RUnlock()
+
+	if !found {
+		return nil, false
+	}
+	return task.Snapshot(), true
 }

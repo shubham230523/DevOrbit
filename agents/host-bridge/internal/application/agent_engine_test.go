@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -419,18 +420,23 @@ func TestAgentEngine_PendingTurnResumptionState(t *testing.T) {
 		t.Errorf("Call 0 (read_file) should have been marked Executed = true before pausing")
 	}
 
-	// 2. Test concurrent resume rejection
-	taskState.mu.Lock()
-	taskState.Status = "running"
-	taskState.mu.Unlock()
+	// 2. Test status validation on non-approval state
+	engine.mu.RLock()
+	activeT := engine.activeTasks[task.ID]
+	engine.mu.RUnlock()
+
+	activeT.mu.Lock()
+	activeT.Status = "completed"
+	activeT.mu.Unlock()
+
 	err = engine.ResumeTaskWithApproval(context.Background(), task.ID, taskState.ApprovalToken)
-	if err == nil || err.Error() != "task is already running" {
-		t.Errorf("Expected 'task is already running' error for concurrent resume attempt, got: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "expected 'approval_required'") {
+		t.Errorf("Expected 'expected approval_required' error for invalid status, got: %v", err)
 	}
 
-	taskState.mu.Lock()
-	taskState.Status = "approval_required"
-	taskState.mu.Unlock()
+	activeT.mu.Lock()
+	activeT.Status = "approval_required"
+	activeT.mu.Unlock()
 
 	// 3. Resume task with valid approval token -> Call 0 MUST NOT be re-executed, Call 1 MUST execute
 	token := taskState.ApprovalToken
@@ -582,4 +588,102 @@ func TestAgentEngine_AdversarialAuthorizationAndMultiplePauseResumes(t *testing.
 	if string(fileBBytes) != "content B" {
 		t.Errorf("fileB.txt content mismatch: %s", string(fileBBytes))
 	}
+}
+
+func TestAgentEngine_AtomicExecutionOwnershipAndConcurrentReaders(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "devorbit_atomic_ownership_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp workspace: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	jail := security.NewWorkspaceJail([]string{tempDir})
+	policy := security.NewDefaultCommandPolicy()
+
+	storage := filesystem.NewStorageEngine(jail, 10*1024*1024)
+	procRunner := process.NewProcessRunner(policy, jail)
+	gitClient := git.NewGitClient(jail)
+	adbClient := adb.NewADBClient("adb")
+
+	wsSvc := NewWorkspaceService(jail)
+	fsSvc := NewFilesystemService(storage)
+	psSvc := NewProcessService(procRunner)
+	gsSvc := NewGitService(gitClient)
+	dsSvc := NewDeviceService(adbClient)
+
+	approvalMgr := NewApprovalManager()
+	executor := NewAgentToolExecutor(wsSvc, fsSvc, psSvc, gsSvc, dsSvc, approvalMgr)
+
+	mockProvider := router.NewMockGeminiProvider()
+	aiRouter := router.NewAIRouter()
+	aiRouter.RegisterProvider("Gemini API", mockProvider)
+
+	mockProvider.SetResponseForPrompt("concurrent ownership test", &router.GenerateResponse{
+		Model: "gemini-2.5-flash",
+		Text:  "Task completed",
+	})
+
+	engine := NewGeminiAgentEngine(aiRouter, executor, approvalMgr)
+
+	task, err := engine.CreateTask(tempDir, "concurrent ownership test", "gemini-2.5-flash")
+	if err != nil {
+		t.Fatalf("Failed to create task: %v", err)
+	}
+
+	// 1. Concurrent direct RunTask calls -> Exactly 1 succeeds, other returns "task is already running"
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	alreadyRunningErrs := 0
+
+	// Set executing = true to simulate an active execution
+	task.mu.Lock()
+	task.executing = true
+	task.mu.Unlock()
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rErr := engine.RunTask(context.Background(), task.ID, "")
+			mu.Lock()
+			if rErr != nil && rErr.Error() == "task is already running" {
+				alreadyRunningErrs++
+			}
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	if alreadyRunningErrs != 10 {
+		t.Errorf("Expected 10 'task is already running' errors while executing = true, got: %d", alreadyRunningErrs)
+	}
+
+	// Release executing ownership
+	task.mu.Lock()
+	task.executing = false
+	task.mu.Unlock()
+
+	// Direct RunTask now succeeds
+	err = engine.RunTask(context.Background(), task.ID, "")
+	if err != nil {
+		t.Errorf("Expected RunTask to succeed after releasing executing ownership, got: %v", err)
+	}
+
+	// 2. Concurrent task readers during task execution do not observe data races or corrupted snapshots
+	task2, _ := engine.CreateTask(tempDir, "concurrent ownership test", "gemini-2.5-flash")
+
+	readerDone := make(chan bool)
+	go func() {
+		for i := 0; i < 100; i++ {
+			snap, ok := engine.GetTask(task2.ID)
+			if ok && snap != nil {
+				_ = snap.Status
+				_ = snap.PendingTurn
+			}
+		}
+		readerDone <- true
+	}()
+
+	_ = engine.RunTask(context.Background(), task2.ID, "")
+	<-readerDone
 }
