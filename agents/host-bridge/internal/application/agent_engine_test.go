@@ -713,6 +713,92 @@ func TestAgentEngine_DeterministicBlockingConcurrentOwnership(t *testing.T) {
 	if taskFinal.Status != "completed" {
 		t.Errorf("Expected task status 'completed', got: %s", taskFinal.Status)
 	}
+
+	// 4. Scenario B: Two simultaneous ResumeTaskWithApproval calls against the same approval-required task
+	enteredChanB := make(chan struct{}, 1)
+	blockChanB := make(chan struct{})
+	blockingProvB := &BlockingAIProvider{enteredChan: enteredChanB, blockChan: blockChanB}
+
+	aiRouterB := router.NewAIRouter()
+	aiRouterB.RegisterProvider("Gemini API", blockingProvB)
+
+	// Mock response requiring approval
+	mockProviderB := router.NewMockGeminiProvider()
+	_ = mockProviderB
+
+	engineB := NewGeminiAgentEngine(aiRouterB, executor, approvalMgr)
+
+	// Use MockGeminiProvider for initial call to create approval
+	mockProvInit := router.NewMockGeminiProvider()
+	mockProvInit.SetResponseForPrompt("scenario B prompt", &router.GenerateResponse{
+		Model: "gemini-2.5-flash",
+		Text:  "",
+		FunctionCalls: []router.FunctionCall{
+			{
+				Name: router.ToolCreateFile,
+				Arguments: map[string]any{
+					"path":    "scenB.txt",
+					"content": "scen B content",
+				},
+			},
+		},
+	})
+	aiRouterB.RegisterProvider("Gemini API", mockProvInit)
+
+	taskB, _ := engineB.CreateTask(tempDir, "scenario B prompt", "gemini-2.5-flash")
+	_ = engineB.RunTask(context.Background(), taskB.ID, "")
+
+	tStateB, _ := engineB.GetTask(taskB.ID)
+	if tStateB.Status != "approval_required" || tStateB.ApprovalToken == "" {
+		t.Fatalf("Scenario B setup failed: expected approval_required, got %s", tStateB.Status)
+	}
+	tokenScenB := tStateB.ApprovalToken
+
+	// Register blocking provider for the resume turn
+	aiRouterB.RegisterProvider("Gemini API", blockingProvB)
+
+	var wgB sync.WaitGroup
+	var muB sync.Mutex
+	resumeSuccesses := 0
+	resumeAlreadyRunning := 0
+
+	// Launch two concurrent ResumeTaskWithApproval calls with the SAME valid token
+	for i := 0; i < 2; i++ {
+		wgB.Add(1)
+		go func() {
+			defer wgB.Done()
+			rErr := engineB.ResumeTaskWithApproval(context.Background(), taskB.ID, tokenScenB)
+			muB.Lock()
+			if rErr == nil {
+				resumeSuccesses++
+			} else if rErr != nil && rErr.Error() == "task is already running" {
+				resumeAlreadyRunning++
+			}
+			muB.Unlock()
+		}()
+	}
+
+	// Wait for the winning resume call to enter AI generation
+	<-enteredChanB
+
+	// Verify losing resume received "task is already running"
+	if resumeAlreadyRunning != 1 {
+		t.Errorf("Scenario B: expected exactly 1 'task is already running' error, got %d", resumeAlreadyRunning)
+	}
+
+	// Unblock winning resume call
+	close(blockChanB)
+	wgB.Wait()
+
+	if resumeSuccesses != 1 {
+		t.Errorf("Scenario B: expected exactly 1 resume success, got %d", resumeSuccesses)
+	}
+
+	// Verify file was created EXACTLY ONCE
+	scenBData, err := os.ReadFile(filepath.Join(tempDir, "scenB.txt"))
+	if err != nil || string(scenBData) != "scen B content" {
+		t.Errorf("Scenario B file creation failed: %v", err)
+	}
 }
 
 func TestAgentEngine_DeepSnapshotIsolationAndMutationImmunity(t *testing.T) {
@@ -752,6 +838,10 @@ func TestAgentEngine_DeepSnapshotIsolationAndMutationImmunity(t *testing.T) {
 				Arguments: map[string]any{
 					"path":    "orig.txt",
 					"content": "orig content",
+					"nested_map": map[string]any{
+						"str_key": "orig_str",
+					},
+					"nested_slice": []any{"item1", "item2"},
 				},
 			},
 		},
