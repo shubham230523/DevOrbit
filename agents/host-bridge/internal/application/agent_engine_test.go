@@ -908,11 +908,11 @@ func TestAgentEngine_DeepSnapshotIsolationAndMutationImmunity(t *testing.T) {
 }
 
 type AdversarialMutatingExecutor struct {
-	invoked bool
+	invocationCount int
 }
 
 func (m *AdversarialMutatingExecutor) ExecuteTool(ctx context.Context, taskID, workspaceID string, call *router.FunctionCall, approvalToken string) (map[string]any, *ApprovalProposal, error) {
-	m.invoked = true
+	m.invocationCount++
 	// Aggressively mutate the received FunctionCall.Arguments through the real executor call path
 	if call != nil && call.Arguments != nil {
 		call.Arguments["path"] = "MUTATED_BY_EXECUTOR.txt"
@@ -925,7 +925,12 @@ func (m *AdversarialMutatingExecutor) ExecuteTool(ctx context.Context, taskID, w
 		call.Arguments["added_key"] = "ADDED_BY_EXECUTOR"
 		delete(call.Arguments, "original_key")
 	}
-	return map[string]any{"status": "ok"}, nil, nil
+
+	if call != nil && call.Name == "create_file_approval" && approvalToken == "" {
+		return nil, &ApprovalProposal{Token: "appr-mutating-test"}, ErrApprovalRequired
+	}
+
+	return map[string]any{"status": "ok", "executed_tool": call.Name}, nil, nil
 }
 
 func TestAgentEngine_RealExecutorBoundaryAdversarialMutation(t *testing.T) {
@@ -944,6 +949,9 @@ func TestAgentEngine_RealExecutorBoundaryAdversarialMutation(t *testing.T) {
 
 	engine := NewGeminiAgentEngine(aiRouter, mutatingExec, approvalMgr)
 
+	// Turn 1 requests 2 tool calls:
+	// Call 0: custom_tool (executes immediately)
+	// Call 1: create_file_approval (requires approval, so task pauses with active PendingTurn!)
 	mockProv.SetResponseForPrompt("real executor mutation test", &router.GenerateResponse{
 		Model: "gemini-2.5-flash",
 		Text:  "",
@@ -957,6 +965,17 @@ func TestAgentEngine_RealExecutorBoundaryAdversarialMutation(t *testing.T) {
 						"key": "original_nested_val",
 					},
 					"nested_slice": []any{"original_slice_item"},
+				},
+			},
+			{
+				Name: "create_file_approval",
+				Arguments: map[string]any{
+					"path":         "approval_path.txt",
+					"original_key": "approval_val",
+					"nested_map": map[string]any{
+						"key": "approval_nested_val",
+					},
+					"nested_slice": []any{"approval_slice_item"},
 				},
 			},
 		},
@@ -973,41 +992,69 @@ func TestAgentEngine_RealExecutorBoundaryAdversarialMutation(t *testing.T) {
 		t.Fatalf("RunTask failed: %v", err)
 	}
 
-	if !mutatingExec.invoked {
-		t.Fatalf("Expected MutatingMockToolExecutor to be invoked via ExecuteTool")
+	if mutatingExec.invocationCount != 2 {
+		t.Fatalf("Expected exactly 2 tool execution attempts (1 executed, 1 paused for approval), got: %d", mutatingExec.invocationCount)
 	}
 
-	// Fetch fresh live task state
+	// Fetch fresh live task state while paused on approval
 	engine.mu.RLock()
 	liveTask := engine.activeTasks[task.ID]
 	engine.mu.RUnlock()
 
-	// Verify relevant task.Messages (model turn function call arguments) were NOT mutated by executor!
-	if len(liveTask.Messages) < 2 {
-		t.Fatalf("Expected at least 2 messages in task, got: %d", len(liveTask.Messages))
+	liveTask.mu.Lock()
+	pt := liveTask.PendingTurn
+	if pt == nil {
+		liveTask.mu.Unlock()
+		t.Fatalf("Expected active PendingTurn while paused on approval")
 	}
 
-	modelMsg := liveTask.Messages[1]
-	if len(modelMsg.FunctionCalls) == 0 {
-		t.Fatalf("Expected function calls in model message")
+	// 1. Assert PendingTurn.CallStates[0].FunctionCall.Arguments remain UNMUTATED!
+	cs0Args := pt.CallStates[0].FunctionCall.Arguments
+	if cs0Args["path"] != "original_path.txt" || cs0Args["original_key"] != "original_val" {
+		t.Errorf("Mutation leak! PendingTurn.CallStates[0].FunctionCall.Arguments mutated: %v", cs0Args)
+	}
+	if nestedMap, ok := cs0Args["nested_map"].(map[string]any); !ok || nestedMap["key"] != "original_nested_val" {
+		t.Errorf("Mutation leak! PendingTurn.CallStates[0].FunctionCall.Arguments nested_map mutated: %v", nestedMap)
 	}
 
+	// 2. Assert PendingTurn.TurnResponse.FunctionCalls[0].Arguments remain UNMUTATED!
+	tr0Args := pt.TurnResponse.FunctionCalls[0].Arguments
+	if tr0Args["path"] != "original_path.txt" || tr0Args["original_key"] != "original_val" {
+		t.Errorf("Mutation leak! PendingTurn.TurnResponse.FunctionCalls[0].Arguments mutated: %v", tr0Args)
+	}
+
+	// 3. Assert PendingTurn.CallStates[0].Response contains normal tool result
+	if pt.CallStates[0].Response["status"] != "ok" {
+		t.Errorf("Tool result missing or invalid in CallStates[0].Response: %v", pt.CallStates[0].Response)
+	}
+	liveTask.mu.Unlock()
+
+	// Resume task with valid token to complete the turn
+	err = engine.ResumeTaskWithApproval(context.Background(), task.ID, "appr-mutating-test")
+	if err != nil {
+		t.Fatalf("ResumeTaskWithApproval failed: %v", err)
+	}
+
+	// Fetch live task after turn completion
+	engine.mu.RLock()
+	completedTask := engine.activeTasks[task.ID]
+	engine.mu.RUnlock()
+
+	// 4. Assert task.Messages[1] (model turn) FunctionCalls[0].Arguments remain UNMUTATED!
+	completedTask.mu.Lock()
+	if len(completedTask.Messages) < 2 {
+		completedTask.mu.Unlock()
+		t.Fatalf("Expected at least 2 messages in completed task")
+	}
+	modelMsg := completedTask.Messages[1]
 	origArgs := modelMsg.FunctionCalls[0].Arguments
-	if origArgs["path"] != "original_path.txt" {
-		t.Errorf("Mutation leak! Model message FunctionCall path argument was mutated: %v", origArgs["path"])
-	}
-	if origArgs["original_key"] != "original_val" {
-		t.Errorf("Mutation leak! Model message FunctionCall original_key was deleted or mutated")
+	if origArgs["path"] != "original_path.txt" || origArgs["original_key"] != "original_val" {
+		t.Errorf("Mutation leak! Model message FunctionCall arguments mutated: %v", origArgs)
 	}
 	if _, found := origArgs["added_key"]; found {
 		t.Errorf("Mutation leak! Model message FunctionCall received added_key")
 	}
-	if nestedMap, ok := origArgs["nested_map"].(map[string]any); !ok || nestedMap["key"] != "original_nested_val" {
-		t.Errorf("Mutation leak! Model message FunctionCall nested_map was mutated: %v", nestedMap)
-	}
-	if nestedSlice, ok := origArgs["nested_slice"].([]any); !ok || len(nestedSlice) == 0 || nestedSlice[0] != "original_slice_item" {
-		t.Errorf("Mutation leak! Model message FunctionCall nested_slice was mutated: %v", nestedSlice)
-	}
+	completedTask.mu.Unlock()
 }
 
 func TestAgentEngine_ExplicitUnsupportedTypeValidationContract(t *testing.T) {

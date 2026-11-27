@@ -115,9 +115,9 @@ func validateAndCopyValue(v any) (any, error) {
 	case []bool:
 		return append([]bool(nil), val...), nil
 	case []router.FunctionCall:
-		return deepCopyFunctionCalls(val), nil
+		return deepCopyFunctionCalls(val)
 	case router.FunctionCall:
-		return deepCopyFunctionCall(val), nil
+		return deepCopyFunctionCall(val)
 	case *ApprovalProposal:
 		if val == nil {
 			return nil, nil
@@ -159,90 +159,109 @@ func validateAndCopyMap(m map[string]any) (map[string]any, error) {
 	return cp, nil
 }
 
-func deepCopyMap(m map[string]any) map[string]any {
-	cp, err := validateAndCopyMap(m)
-	if err != nil {
-		log.Printf("[AgentEngine] Payload validation warning: %v", err)
-	}
-	return cp
+func deepCopyMap(m map[string]any) (map[string]any, error) {
+	return validateAndCopyMap(m)
 }
 
-func deepCopyValue(v any) any {
-	copiedVal, err := validateAndCopyValue(v)
-	if err != nil {
-		log.Printf("[AgentEngine] Payload value validation warning: %v", err)
-		return nil
-	}
-	return copiedVal
+func deepCopyValue(v any) (any, error) {
+	return validateAndCopyValue(v)
 }
 
-func deepCopyFunctionCall(fc router.FunctionCall) router.FunctionCall {
+func deepCopyFunctionCall(fc router.FunctionCall) (router.FunctionCall, error) {
+	argsCopy, err := validateAndCopyMap(fc.Arguments)
+	if err != nil {
+		return router.FunctionCall{}, err
+	}
 	return router.FunctionCall{
 		Name:      fc.Name,
-		Arguments: deepCopyMap(fc.Arguments),
-	}
+		Arguments: argsCopy,
+	}, nil
 }
 
-func deepCopyFunctionCalls(fcs []router.FunctionCall) []router.FunctionCall {
+func deepCopyFunctionCalls(fcs []router.FunctionCall) ([]router.FunctionCall, error) {
 	if fcs == nil {
-		return nil
+		return nil, nil
 	}
 	cp := make([]router.FunctionCall, len(fcs))
 	for i, fc := range fcs {
-		cp[i] = deepCopyFunctionCall(fc)
+		copiedFc, err := deepCopyFunctionCall(fc)
+		if err != nil {
+			return nil, err
+		}
+		cp[i] = copiedFc
 	}
-	return cp
+	return cp, nil
 }
 
-func deepCopyFunctionResponse(fr router.FunctionResponse) router.FunctionResponse {
+func deepCopyFunctionResponse(fr router.FunctionResponse) (router.FunctionResponse, error) {
+	respCopy, err := validateAndCopyMap(fr.Response)
+	if err != nil {
+		return router.FunctionResponse{}, err
+	}
 	return router.FunctionResponse{
 		Name:     fr.Name,
-		Response: deepCopyMap(fr.Response),
-	}
+		Response: respCopy,
+	}, nil
 }
 
-func deepCopyFunctionResponses(frs []router.FunctionResponse) []router.FunctionResponse {
+func deepCopyFunctionResponses(frs []router.FunctionResponse) ([]router.FunctionResponse, error) {
 	if frs == nil {
-		return nil
+		return nil, nil
 	}
 	cp := make([]router.FunctionResponse, len(frs))
 	for i, fr := range frs {
-		cp[i] = deepCopyFunctionResponse(fr)
+		copiedFr, err := deepCopyFunctionResponse(fr)
+		if err != nil {
+			return nil, err
+		}
+		cp[i] = copiedFr
 	}
-	return cp
+	return cp, nil
 }
 
-func deepCopyMessages(msgs []router.Message) []router.Message {
+func deepCopyMessages(msgs []router.Message) ([]router.Message, error) {
 	if msgs == nil {
-		return nil
+		return nil, nil
 	}
 	cp := make([]router.Message, len(msgs))
 	for i, msg := range msgs {
+		fcsCopy, err := deepCopyFunctionCalls(msg.FunctionCalls)
+		if err != nil {
+			return nil, err
+		}
+		frsCopy, err := deepCopyFunctionResponses(msg.FunctionResponses)
+		if err != nil {
+			return nil, err
+		}
 		cp[i] = router.Message{
 			Role:              msg.Role,
 			Content:           msg.Content,
-			FunctionCalls:     deepCopyFunctionCalls(msg.FunctionCalls),
-			FunctionResponses: deepCopyFunctionResponses(msg.FunctionResponses),
+			FunctionCalls:     fcsCopy,
+			FunctionResponses: frsCopy,
 		}
 	}
-	return cp
+	return cp, nil
 }
 
-func deepCopyEvents(evts []TaskEvent) []TaskEvent {
+func deepCopyEvents(evts []TaskEvent) ([]TaskEvent, error) {
 	if evts == nil {
-		return nil
+		return nil, nil
 	}
 	cp := make([]TaskEvent, len(evts))
 	for i, evt := range evts {
+		dataCopy, err := validateAndCopyMap(evt.Data)
+		if err != nil {
+			return nil, err
+		}
 		cp[i] = TaskEvent{
 			TaskID:    evt.TaskID,
 			Type:      evt.Type,
 			Message:   evt.Message,
-			Data:      deepCopyMap(evt.Data),
+			Data:      dataCopy,
 			Timestamp: evt.Timestamp,
 		}
 	}
-	return cp
+	return cp, nil
 }
 
 // Snapshot returns a thread-safe deep copy of the AgentTask and all its nested mutable data structures.
@@ -250,31 +269,52 @@ func deepCopyEvents(evts []TaskEvent) []TaskEvent {
 // 1. All live task state updates MUST acquire t.mu.Lock().
 // 2. External calls (AI model generation, tool execution) MUST NOT hold t.mu.
 // 3. Callers receiving a Snapshot cannot mutate internal live task state.
-func (t *AgentTask) Snapshot() *AgentTask {
+func (t *AgentTask) Snapshot() (*AgentTask, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	messagesCopy := deepCopyMessages(t.Messages)
-	eventsCopy := deepCopyEvents(t.Events)
+	messagesCopy, err := deepCopyMessages(t.Messages)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot messages copy failed: %w", err)
+	}
+
+	eventsCopy, err := deepCopyEvents(t.Events)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot events copy failed: %w", err)
+	}
 
 	var pendingCopy *PendingTurnState
 	if t.PendingTurn != nil {
 		callStatesCopy := make([]FunctionCallState, len(t.PendingTurn.CallStates))
 		for i, cs := range t.PendingTurn.CallStates {
+			copiedFc, err := deepCopyFunctionCall(cs.FunctionCall)
+			if err != nil {
+				return nil, fmt.Errorf("snapshot call state function call copy failed: %w", err)
+			}
+			respCopy, err := deepCopyMap(cs.Response)
+			if err != nil {
+				return nil, fmt.Errorf("snapshot call state response copy failed: %w", err)
+			}
 			callStatesCopy[i] = FunctionCallState{
 				Index:        cs.Index,
-				FunctionCall: deepCopyFunctionCall(cs.FunctionCall),
+				FunctionCall: copiedFc,
 				Executed:     cs.Executed,
-				Response:     deepCopyMap(cs.Response),
+				Response:     respCopy,
 				PendingToken: cs.PendingToken,
 			}
 		}
+
+		turnFcsCopy, err := deepCopyFunctionCalls(t.PendingTurn.TurnResponse.FunctionCalls)
+		if err != nil {
+			return nil, fmt.Errorf("snapshot pending turn function calls copy failed: %w", err)
+		}
+
 		pendingCopy = &PendingTurnState{
 			TurnResponse: router.GenerateResponse{
 				Model:         t.PendingTurn.TurnResponse.Model,
 				Text:          t.PendingTurn.TurnResponse.Text,
 				FinishReason:  t.PendingTurn.TurnResponse.FinishReason,
-				FunctionCalls: deepCopyFunctionCalls(t.PendingTurn.TurnResponse.FunctionCalls),
+				FunctionCalls: turnFcsCopy,
 			},
 			CallStates: callStatesCopy,
 		}
@@ -295,7 +335,7 @@ func (t *AgentTask) Snapshot() *AgentTask {
 		CreatedAt:     t.CreatedAt,
 		UpdatedAt:     t.UpdatedAt,
 		executing:     t.executing,
-	}
+	}, nil
 }
 
 type ToolExecutor interface {
@@ -337,12 +377,17 @@ func (e *GeminiAgentEngine) UnsubscribeEvents(id string) {
 	delete(e.eventListeners, id)
 }
 
-func (e *GeminiAgentEngine) emitEvent(task *AgentTask, evtType EventType, msg string, data map[string]any) {
+func (e *GeminiAgentEngine) emitEvent(task *AgentTask, evtType EventType, msg string, data map[string]any) error {
+	dataCopy, err := validateAndCopyMap(data)
+	if err != nil {
+		return fmt.Errorf("cannot emit event '%s': %w", evtType, err)
+	}
+
 	evt := TaskEvent{
 		TaskID:    task.ID,
 		Type:      evtType,
 		Message:   msg,
-		Data:      deepCopyMap(data),
+		Data:      dataCopy,
 		Timestamp: time.Now().UTC().UnixMicro(),
 	}
 
@@ -359,14 +404,16 @@ func (e *GeminiAgentEngine) emitEvent(task *AgentTask, evtType EventType, msg st
 	e.mu.RUnlock()
 
 	for _, l := range listeners {
+		listenerDataCopy, _ := validateAndCopyMap(evt.Data)
 		l(TaskEvent{
 			TaskID:    evt.TaskID,
 			Type:      evt.Type,
 			Message:   evt.Message,
-			Data:      deepCopyMap(evt.Data),
+			Data:      listenerDataCopy,
 			Timestamp: evt.Timestamp,
 		})
 	}
+	return nil
 }
 
 func (e *GeminiAgentEngine) CreateTask(workspaceID, prompt, modelID string) (*AgentTask, error) {
@@ -453,10 +500,14 @@ func (e *GeminiAgentEngine) executePendingTurn(ctx context.Context, task *AgentT
 		}
 
 		tok := approvalToken
-		callCopy := deepCopyFunctionCall(cs.FunctionCall)
+		callCopy, err := deepCopyFunctionCall(cs.FunctionCall)
+		if err != nil {
+			task.mu.Unlock()
+			return false, fmt.Errorf("failed to copy function call arguments for tool '%s': %w", cs.FunctionCall.Name, err)
+		}
 		task.mu.Unlock()
 
-		e.emitEvent(task, EventToolExecutionStarted, fmt.Sprintf("Executing tool '%s' (%d/%d)", callCopy.Name, i+1, len(pt.CallStates)), map[string]any{
+		_ = e.emitEvent(task, EventToolExecutionStarted, fmt.Sprintf("Executing tool '%s' (%d/%d)", callCopy.Name, i+1, len(pt.CallStates)), map[string]any{
 			"tool": callCopy.Name,
 			"args": callCopy.Arguments,
 		})
@@ -472,7 +523,7 @@ func (e *GeminiAgentEngine) executePendingTurn(ctx context.Context, task *AgentT
 				task.ApprovalToken = proposal.Token
 				task.mu.Unlock()
 
-				e.emitEvent(task, EventApprovalRequired, fmt.Sprintf("Tool '%s' requires user approval", callCopy.Name), map[string]any{
+				_ = e.emitEvent(task, EventApprovalRequired, fmt.Sprintf("Tool '%s' requires user approval", callCopy.Name), map[string]any{
 					"proposal": proposal,
 				})
 				return false, nil // Paused for approval
@@ -498,7 +549,7 @@ func (e *GeminiAgentEngine) executePendingTurn(ctx context.Context, task *AgentT
 		cs.PendingToken = ""
 		task.mu.Unlock()
 
-		e.emitEvent(task, EventToolExecutionCompleted, fmt.Sprintf("Tool '%s' completed", callCopy.Name), map[string]any{
+		_ = e.emitEvent(task, EventToolExecutionCompleted, fmt.Sprintf("Tool '%s' completed", callCopy.Name), map[string]any{
 			"tool":   callCopy.Name,
 			"result": resMap,
 		})
@@ -576,7 +627,7 @@ func (e *GeminiAgentEngine) runTaskInternal(ctx context.Context, taskID string, 
 		cancel()
 	}()
 
-	e.emitEvent(task, EventTaskStarted, fmt.Sprintf("Task '%s' started", taskID), map[string]any{
+	_ = e.emitEvent(task, EventTaskStarted, fmt.Sprintf("Task '%s' started", taskID), map[string]any{
 		"workspace_id": task.WorkspaceID,
 		"model_id":     task.ModelID,
 	})
@@ -603,12 +654,12 @@ func (e *GeminiAgentEngine) runTaskInternal(ctx context.Context, taskID string, 
 				task.Status = "cancelled"
 			}
 			task.mu.Unlock()
-			e.emitEvent(task, EventTaskCancelled, "Task cancelled or timed out", nil)
+			_ = e.emitEvent(task, EventTaskCancelled, "Task cancelled or timed out", nil)
 			return taskCtx.Err()
 		default:
 		}
 
-		e.emitEvent(task, EventGeminiProcessing, fmt.Sprintf("Turn %d: Consulting Gemini model %s", turn, task.ModelID), nil)
+		_ = e.emitEvent(task, EventGeminiProcessing, fmt.Sprintf("Turn %d: Consulting Gemini model %s", turn, task.ModelID), nil)
 
 		task.mu.Lock()
 		messagesCopy := make([]router.Message, len(task.Messages))
@@ -627,7 +678,7 @@ func (e *GeminiAgentEngine) runTaskInternal(ctx context.Context, taskID string, 
 			task.Status = "failed"
 			task.ErrorText = err.Error()
 			task.mu.Unlock()
-			e.emitEvent(task, EventTaskFailed, fmt.Sprintf("Gemini generation failed: %v", err), map[string]any{"error": err.Error()})
+			_ = e.emitEvent(task, EventTaskFailed, fmt.Sprintf("Gemini generation failed: %v", err), map[string]any{"error": err.Error()})
 			return err
 		}
 
@@ -641,13 +692,13 @@ func (e *GeminiAgentEngine) runTaskInternal(ctx context.Context, taskID string, 
 			})
 			task.mu.Unlock()
 
-			e.emitEvent(task, EventTaskCompleted, "Task completed successfully", map[string]any{
+			_ = e.emitEvent(task, EventTaskCompleted, "Task completed successfully", map[string]any{
 				"result_text": genResp.Text,
 			})
 			return nil
 		}
 
-		e.emitEvent(task, EventToolRequested, fmt.Sprintf("Gemini requested %d tool calls", len(genResp.FunctionCalls)), map[string]any{
+		_ = e.emitEvent(task, EventToolRequested, fmt.Sprintf("Gemini requested %d tool calls", len(genResp.FunctionCalls)), map[string]any{
 			"function_calls": genResp.FunctionCalls,
 		})
 
@@ -692,7 +743,7 @@ func (e *GeminiAgentEngine) CancelTask(taskID string) bool {
 	task.Status = "cancelled"
 	task.mu.Unlock()
 
-	e.emitEvent(task, EventTaskCancelled, fmt.Sprintf("Task '%s' cancelled by user", taskID), nil)
+	_ = e.emitEvent(task, EventTaskCancelled, fmt.Sprintf("Task '%s' cancelled by user", taskID), nil)
 	return true
 }
 
@@ -704,5 +755,10 @@ func (e *GeminiAgentEngine) GetTask(taskID string) (*AgentTask, bool) {
 	if !found {
 		return nil, false
 	}
-	return task.Snapshot(), true
+	snap, err := task.Snapshot()
+	if err != nil {
+		log.Printf("[AgentEngine] GetTask snapshot error for '%s': %v", taskID, err)
+		return nil, false
+	}
+	return snap, true
 }
