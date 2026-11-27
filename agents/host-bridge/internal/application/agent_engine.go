@@ -349,6 +349,7 @@ type GeminiAgentEngine struct {
 	approvalMgr    *ApprovalManager
 	activeTasks    map[string]*AgentTask
 	eventListeners map[string]func(evt TaskEvent)
+	eventHook      func(evtType EventType, data map[string]any) error
 }
 
 func NewGeminiAgentEngine(
@@ -365,6 +366,12 @@ func NewGeminiAgentEngine(
 	}
 }
 
+func (e *GeminiAgentEngine) SetEventHook(hook func(evtType EventType, data map[string]any) error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.eventHook = hook
+}
+
 func (e *GeminiAgentEngine) SubscribeEvents(id string, listener func(evt TaskEvent)) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -378,6 +385,17 @@ func (e *GeminiAgentEngine) UnsubscribeEvents(id string) {
 }
 
 func (e *GeminiAgentEngine) emitEvent(task *AgentTask, evtType EventType, msg string, data map[string]any) error {
+	e.mu.RLock()
+	hook := e.eventHook
+	e.mu.RUnlock()
+
+	if hook != nil {
+		if err := hook(evtType, data); err != nil {
+			log.Printf("[AgentEngine] Event hook rejected event '%s': %v", evtType, err)
+			return fmt.Errorf("event hook rejected event '%s': %w", evtType, err)
+		}
+	}
+
 	dataCopy, err := validateAndCopyMap(data)
 	if err != nil {
 		log.Printf("[AgentEngine] Payload validation error for event '%s': %v", evtType, err)
@@ -674,14 +692,15 @@ func (e *GeminiAgentEngine) runTaskInternal(ctx context.Context, taskID string, 
 			}
 			task.mu.Unlock()
 			if errEvt := e.emitEvent(task, EventTaskCancelled, "Task cancelled or timed out", nil); errEvt != nil {
-				log.Printf("[AgentEngine] Event emission warning: %v", errEvt)
+				log.Printf("[AgentEngine] Critical: Failed to emit EventTaskCancelled: %v", errEvt)
+				return fmt.Errorf("%w (event emission failed: %v)", taskCtx.Err(), errEvt)
 			}
 			return taskCtx.Err()
 		default:
 		}
 
 		if errEvt := e.emitEvent(task, EventGeminiProcessing, fmt.Sprintf("Turn %d: Consulting Gemini model %s", turn, task.ModelID), nil); errEvt != nil {
-			log.Printf("[AgentEngine] Event emission warning: %v", errEvt)
+			log.Printf("[AgentEngine] Observability event emission warning for '%s': %v", EventGeminiProcessing, errEvt)
 		}
 
 		task.mu.Lock()
@@ -697,12 +716,25 @@ func (e *GeminiAgentEngine) runTaskInternal(ctx context.Context, taskID string, 
 
 		genResp, err := e.aiRouter.Generate(taskCtx, genReq)
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || taskCtx.Err() != nil {
+				task.mu.Lock()
+				task.Status = "cancelled"
+				task.ErrorText = taskCtx.Err().Error()
+				task.mu.Unlock()
+				if errEvt := e.emitEvent(task, EventTaskCancelled, "Task cancelled or timed out", nil); errEvt != nil {
+					log.Printf("[AgentEngine] Critical: Failed to emit EventTaskCancelled: %v", errEvt)
+					return fmt.Errorf("%w (event emission failed: %v)", taskCtx.Err(), errEvt)
+				}
+				return taskCtx.Err()
+			}
+
 			task.mu.Lock()
 			task.Status = "failed"
 			task.ErrorText = err.Error()
 			task.mu.Unlock()
 			if errEvt := e.emitEvent(task, EventTaskFailed, fmt.Sprintf("Gemini generation failed: %v", err), map[string]any{"error": err.Error()}); errEvt != nil {
-				log.Printf("[AgentEngine] Event emission warning: %v", errEvt)
+				log.Printf("[AgentEngine] Critical: Failed to emit EventTaskFailed: %v", errEvt)
+				return fmt.Errorf("%w (event emission failed: %v)", err, errEvt)
 			}
 			return err
 		}

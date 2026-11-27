@@ -1312,3 +1312,94 @@ func TestAgentEngine_RequiredEventFailurePolicy(t *testing.T) {
 		t.Errorf("Expected 0 events recorded for failed Class B event emission, got: %d", len(snap.Events))
 	}
 }
+
+type FailingFailingAIProvider struct {
+	router.Provider
+}
+
+func (p *FailingFailingAIProvider) Name() string { return "Gemini API" }
+func (p *FailingFailingAIProvider) DefaultModel() string { return "gemini-2.5-flash" }
+func (p *FailingFailingAIProvider) Generate(ctx context.Context, req router.GenerateRequest) (*router.GenerateResponse, error) {
+	return nil, errors.New("simulated AI generation failure")
+}
+
+func TestAgentEngine_ProductionPathTaskFailedAndCancelledEventFailure(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "devorbit_failed_cancelled_policy_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp workspace: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	failingProv := &FailingFailingAIProvider{}
+	aiRouter := router.NewAIRouter()
+	aiRouter.RegisterProvider("Gemini API", failingProv)
+
+	approvalMgr := NewApprovalManager()
+	engine := NewGeminiAgentEngine(aiRouter, nil, approvalMgr)
+
+	// A. Test Task Failure with Event Emission Failure
+	failedTaskCount := 0
+	engine.SetEventHook(func(evtType EventType, data map[string]any) error {
+		if evtType == EventTaskFailed {
+			failedTaskCount++
+			return ErrUnsupportedValueType
+		}
+		return nil
+	})
+
+	taskF, _ := engine.CreateTask(tempDir, "failing prompt", "gemini-2.5-flash")
+	err = engine.RunTask(context.Background(), taskF.ID, "")
+
+	if err == nil {
+		t.Fatalf("Expected RunTask to fail when AI generation fails")
+	}
+
+	// Verify error wraps both original AI generation error AND event emission error
+	if !strings.Contains(err.Error(), "simulated AI generation failure") || !strings.Contains(err.Error(), "event emission failed") {
+		t.Errorf("Expected error wrapping original failure and event emission failure, got: %v", err)
+	}
+
+	// Verify task remains in 'failed' status and failedTaskCount is exactly 1 (no recursive event loop)
+	snapF, _ := engine.GetTask(taskF.ID)
+	if snapF.Status != "failed" || !strings.Contains(snapF.ErrorText, "simulated AI generation failure") {
+		t.Errorf("Expected task status 'failed' with original errorText, got status=%s, errorText=%s", snapF.Status, snapF.ErrorText)
+	}
+	if failedTaskCount != 1 {
+		t.Errorf("Expected EventTaskFailed hook invoked exactly once (no recursive loop), got: %d", failedTaskCount)
+	}
+
+	// B. Test Task Cancellation with Event Emission Failure
+	cancelTaskCount := 0
+
+	blockingProv := &BlockingAIProvider{blockChan: make(chan struct{})}
+	aiRouterC := router.NewAIRouter()
+	aiRouterC.RegisterProvider("Gemini API", blockingProv)
+
+	engineC := NewGeminiAgentEngine(aiRouterC, nil, approvalMgr)
+	engineC.SetEventHook(func(evtType EventType, data map[string]any) error {
+		if evtType == EventTaskCancelled {
+			cancelTaskCount++
+			return ErrUnsupportedValueType
+		}
+		return nil
+	})
+
+	taskC, _ := engineC.CreateTask(tempDir, "cancelling prompt", "gemini-2.5-flash")
+
+	ctxC, cancelC := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancelC()
+
+	errC := engineC.RunTask(ctxC, taskC.ID, "")
+	if errC == nil {
+		t.Fatalf("Expected RunTask to fail when context is cancelled")
+	}
+
+	// Verify task status is 'cancelled'
+	snapC, _ := engineC.GetTask(taskC.ID)
+	if snapC.Status != "cancelled" {
+		t.Errorf("Expected task status 'cancelled', got: %s", snapC.Status)
+	}
+	if cancelTaskCount < 1 {
+		t.Errorf("Expected EventTaskCancelled hook invoked, got: %d", cancelTaskCount)
+	}
+}
