@@ -450,3 +450,136 @@ func TestAgentEngine_PendingTurnResumptionState(t *testing.T) {
 		t.Errorf("File creation failed during resumed turn execution: %v", err)
 	}
 }
+
+func TestAgentEngine_AdversarialAuthorizationAndMultiplePauseResumes(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "devorbit_adv_resumes_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp workspace: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	jail := security.NewWorkspaceJail([]string{tempDir})
+	policy := security.NewDefaultCommandPolicy()
+
+	storage := filesystem.NewStorageEngine(jail, 10*1024*1024)
+	procRunner := process.NewProcessRunner(policy, jail)
+	gitClient := git.NewGitClient(jail)
+	adbClient := adb.NewADBClient("adb")
+
+	wsSvc := NewWorkspaceService(jail)
+	fsSvc := NewFilesystemService(storage)
+	psSvc := NewProcessService(procRunner)
+	gsSvc := NewGitService(gitClient)
+	dsSvc := NewDeviceService(adbClient)
+
+	approvalMgr := NewApprovalManager()
+	executor := NewAgentToolExecutor(wsSvc, fsSvc, psSvc, gsSvc, dsSvc, approvalMgr)
+
+	mockProvider := router.NewMockGeminiProvider()
+	aiRouter := router.NewAIRouter()
+	aiRouter.RegisterProvider("Gemini API", mockProvider)
+
+	// Mock turn requiring 2 sequential approval-required tool calls:
+	// Call 0: create_file("fileA.txt")
+	// Call 1: create_file("fileB.txt")
+	mockProvider.SetResponseForPrompt("two approvals test", &router.GenerateResponse{
+		Model: "gemini-2.5-flash",
+		Text:  "Created fileA and fileB",
+		FunctionCalls: []router.FunctionCall{
+			{
+				Name: router.ToolCreateFile,
+				Arguments: map[string]any{
+					"path":    "fileA.txt",
+					"content": "content A",
+				},
+			},
+			{
+				Name: router.ToolCreateFile,
+				Arguments: map[string]any{
+					"path":    "fileB.txt",
+					"content": "content B",
+				},
+			},
+		},
+	})
+
+	engine := NewGeminiAgentEngine(aiRouter, executor, approvalMgr)
+
+	task, err := engine.CreateTask(tempDir, "two approvals test", "gemini-2.5-flash")
+	if err != nil {
+		t.Fatalf("Failed to create task: %v", err)
+	}
+
+	// Step 1: Initial run -> Pauses on Call 0 (fileA approval required)
+	err = engine.RunTask(context.Background(), task.ID, "")
+	if err != nil {
+		t.Fatalf("Initial RunTask failed: %v", err)
+	}
+
+	tState, _ := engine.GetTask(task.ID)
+	if tState.Status != "approval_required" {
+		t.Fatalf("Expected status 'approval_required', got: %s", tState.Status)
+	}
+	tokenA := tState.ApprovalToken
+
+	// Adversarial Test 1: Invalid/wrong token submission -> Must fail and keep Call 0 unexecuted
+	err = engine.ResumeTaskWithApproval(context.Background(), task.ID, "appr-INVALID-TOKEN")
+	if err != ErrApprovalMismatch && err != ErrApprovalTokenNotFound {
+		t.Errorf("Expected authorization mismatch error for invalid token, got: %v", err)
+	}
+
+	tStateAdv1, _ := engine.GetTask(task.ID)
+	if tStateAdv1.Status != "approval_required" {
+		t.Errorf("Task status should remain 'approval_required' after rejected invalid token, got: %s", tStateAdv1.Status)
+	}
+	if tStateAdv1.PendingTurn == nil || tStateAdv1.PendingTurn.CallStates[0].Executed {
+		t.Errorf("Call 0 must remain unexecuted after invalid token rejection")
+	}
+
+	// Step 2: Resume Call 0 with valid tokenA -> Executes Call 0, then pauses on Call 1!
+	err = engine.ResumeTaskWithApproval(context.Background(), task.ID, tokenA)
+	if err != nil {
+		t.Fatalf("Resume with tokenA failed: %v", err)
+	}
+
+	tStateStep2, _ := engine.GetTask(task.ID)
+	if tStateStep2.Status != "approval_required" {
+		t.Fatalf("Task should pause on Call 1 ('approval_required'), got: %s", tStateStep2.Status)
+	}
+	tokenB := tStateStep2.ApprovalToken
+
+	if tokenA == tokenB {
+		t.Errorf("Call 1 must generate a distinct approval token from Call 0")
+	}
+
+	// Verify fileA was created and Call 0 is marked Executed
+	if !tStateStep2.PendingTurn.CallStates[0].Executed || tStateStep2.PendingTurn.CallStates[1].Executed {
+		t.Errorf("Call 0 should be Executed=true and Call 1 should be Executed=false")
+	}
+	fileABytes, _ := os.ReadFile(filepath.Join(tempDir, "fileA.txt"))
+	if string(fileABytes) != "content A" {
+		t.Errorf("fileA.txt content mismatch: %s", string(fileABytes))
+	}
+
+	// Adversarial Test 2: Replaying tokenA on paused Call 1 -> Must fail (tokenA already consumed)
+	err = engine.ResumeTaskWithApproval(context.Background(), task.ID, tokenA)
+	if err != ErrApprovalTokenNotFound && err != ErrApprovalMismatch {
+		t.Errorf("Replaying consumed tokenA must fail, got: %v", err)
+	}
+
+	// Step 3: Resume Call 1 with valid tokenB -> Completes turn successfully!
+	err = engine.ResumeTaskWithApproval(context.Background(), task.ID, tokenB)
+	if err != nil {
+		t.Fatalf("Resume with tokenB failed: %v", err)
+	}
+
+	tFinal, _ := engine.GetTask(task.ID)
+	if tFinal.Status != "completed" {
+		t.Errorf("Task should be 'completed', got: %s", tFinal.Status)
+	}
+
+	fileBBytes, _ := os.ReadFile(filepath.Join(tempDir, "fileB.txt"))
+	if string(fileBBytes) != "content B" {
+		t.Errorf("fileB.txt content mismatch: %s", string(fileBBytes))
+	}
+}

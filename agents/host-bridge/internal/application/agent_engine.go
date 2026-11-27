@@ -183,50 +183,89 @@ func (e *GeminiAgentEngine) executePendingTurn(ctx context.Context, task *AgentT
 	}
 
 	for i := range pt.CallStates {
+		task.mu.Lock()
 		cs := &pt.CallStates[i]
 		if cs.Executed {
+			task.mu.Unlock()
 			continue // Already executed in an earlier attempt
 		}
 
-		tok := ""
-		if approvalToken != "" && (cs.PendingToken == "" || cs.PendingToken == approvalToken) {
-			tok = approvalToken
+		// Authorization validation before calling tool executor
+		if cs.PendingToken != "" {
+			if approvalToken == "" {
+				task.Status = "approval_required"
+				task.ApprovalToken = cs.PendingToken
+				task.mu.Unlock()
+				return false, ErrApprovalRequired
+			}
+			if approvalToken != cs.PendingToken {
+				task.Status = "approval_required"
+				task.ApprovalToken = cs.PendingToken
+				task.mu.Unlock()
+				return false, ErrApprovalMismatch
+			}
+		} else if approvalToken != "" {
+			task.Status = "approval_required"
+			task.mu.Unlock()
+			return false, ErrApprovalMismatch
 		}
 
-		e.emitEvent(task, EventToolExecutionStarted, fmt.Sprintf("Executing tool '%s' (%d/%d)", cs.FunctionCall.Name, i+1, len(pt.CallStates)), map[string]any{
-			"tool": cs.FunctionCall.Name,
-			"args": cs.FunctionCall.Arguments,
+		tok := approvalToken
+		callCopy := cs.FunctionCall
+		task.mu.Unlock()
+
+		e.emitEvent(task, EventToolExecutionStarted, fmt.Sprintf("Executing tool '%s' (%d/%d)", callCopy.Name, i+1, len(pt.CallStates)), map[string]any{
+			"tool": callCopy.Name,
+			"args": callCopy.Arguments,
 		})
 
-		resMap, proposal, err := e.toolExecutor.ExecuteTool(ctx, task.ID, task.WorkspaceID, &cs.FunctionCall, tok)
+		// Execute tool outside task mutex
+		resMap, proposal, err := e.toolExecutor.ExecuteTool(ctx, task.ID, task.WorkspaceID, &callCopy, tok)
+
+		task.mu.Lock()
 		if err != nil {
 			if errors.Is(err, ErrApprovalRequired) && proposal != nil {
 				cs.PendingToken = proposal.Token
-				task.mu.Lock()
 				task.Status = "approval_required"
 				task.ApprovalToken = proposal.Token
 				task.mu.Unlock()
 
-				e.emitEvent(task, EventApprovalRequired, fmt.Sprintf("Tool '%s' requires user approval", cs.FunctionCall.Name), map[string]any{
+				e.emitEvent(task, EventApprovalRequired, fmt.Sprintf("Tool '%s' requires user approval", callCopy.Name), map[string]any{
 					"proposal": proposal,
 				})
 				return false, nil // Paused for approval
 			}
 
-			log.Printf("Tool '%s' execution error: %v", cs.FunctionCall.Name, err)
+			if errors.Is(err, ErrApprovalMismatch) || errors.Is(err, ErrApprovalTokenNotFound) || errors.Is(err, ErrApprovalExpired) {
+				// Authorization error: DO NOT mark Executed. Keep task in approval_required state.
+				task.Status = "approval_required"
+				if cs.PendingToken != "" {
+					task.ApprovalToken = cs.PendingToken
+				}
+				task.mu.Unlock()
+				return false, err
+			}
+
+			// Non-authorization execution error (e.g., file not found, command error)
+			log.Printf("Tool '%s' execution error: %v", callCopy.Name, err)
 			resMap = map[string]any{"error": err.Error()}
 		}
 
 		cs.Executed = true
 		cs.Response = resMap
 		cs.PendingToken = ""
+		task.mu.Unlock()
 
-		e.emitEvent(task, EventToolExecutionCompleted, fmt.Sprintf("Tool '%s' completed", cs.FunctionCall.Name), map[string]any{
-			"tool":   cs.FunctionCall.Name,
+		e.emitEvent(task, EventToolExecutionCompleted, fmt.Sprintf("Tool '%s' completed", callCopy.Name), map[string]any{
+			"tool":   callCopy.Name,
 			"result": resMap,
 		})
+
+		// Reset approvalToken after consumption so subsequent unexecuted calls require their own token
+		approvalToken = ""
 	}
 
+	task.mu.Lock()
 	// All calls in pending turn completed! Record turn messages.
 	toolResponses := make([]router.FunctionResponse, len(pt.CallStates))
 	for i, cs := range pt.CallStates {
@@ -236,7 +275,6 @@ func (e *GeminiAgentEngine) executePendingTurn(ctx context.Context, task *AgentT
 		}
 	}
 
-	task.mu.Lock()
 	task.Messages = append(task.Messages, router.Message{
 		Role:          "model",
 		FunctionCalls: pt.TurnResponse.FunctionCalls,
@@ -381,7 +419,13 @@ func (e *GeminiAgentEngine) ResumeTaskWithApproval(ctx context.Context, taskID, 
 	task.Status = "running"
 	task.mu.Unlock()
 
-	return e.RunTask(ctx, taskID, approvalToken)
+	err := e.RunTask(ctx, taskID, approvalToken)
+	if err != nil && (errors.Is(err, ErrApprovalMismatch) || errors.Is(err, ErrApprovalTokenNotFound) || errors.Is(err, ErrApprovalExpired)) {
+		task.mu.Lock()
+		task.Status = "approval_required"
+		task.mu.Unlock()
+	}
+	return err
 }
 
 func (e *GeminiAgentEngine) CancelTask(taskID string) bool {
