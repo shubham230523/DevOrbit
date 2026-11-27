@@ -1354,9 +1354,9 @@ func TestAgentEngine_ProductionPathTaskFailedAndCancelledEventFailure(t *testing
 		t.Fatalf("Expected RunTask to fail when AI generation fails")
 	}
 
-	// Verify error wraps both original AI generation error AND event emission error
-	if !strings.Contains(err.Error(), "simulated AI generation failure") || !strings.Contains(err.Error(), "event emission failed") {
-		t.Errorf("Expected error wrapping original failure and event emission failure, got: %v", err)
+	// Verify error structurally wraps both original AI generation error AND event emission error
+	if !errors.Is(err, ErrUnsupportedValueType) || !strings.Contains(err.Error(), "simulated AI generation failure") {
+		t.Errorf("Expected errors.Is(err, ErrUnsupportedValueType) and original error, got: %v", err)
 	}
 
 	// Verify task remains in 'failed' status and failedTaskCount is exactly 1 (no recursive event loop)
@@ -1394,6 +1394,10 @@ func TestAgentEngine_ProductionPathTaskFailedAndCancelledEventFailure(t *testing
 		t.Fatalf("Expected RunTask to fail when context is cancelled")
 	}
 
+	if !errors.Is(errC, ErrUnsupportedValueType) {
+		t.Errorf("Expected errors.Is(errC, ErrUnsupportedValueType) for cancellation event failure, got: %v", errC)
+	}
+
 	// Verify task status is 'cancelled'
 	snapC, _ := engineC.GetTask(taskC.ID)
 	if snapC.Status != "cancelled" {
@@ -1401,5 +1405,46 @@ func TestAgentEngine_ProductionPathTaskFailedAndCancelledEventFailure(t *testing
 	}
 	if cancelTaskCount < 1 {
 		t.Errorf("Expected EventTaskCancelled hook invoked, got: %d", cancelTaskCount)
+	}
+
+	// C. Test Explicit CancelTaskWithError with Event Emission Failure
+	engineC2 := NewGeminiAgentEngine(aiRouterC, nil, approvalMgr)
+	engineC2.SetEventHook(func(evtType EventType, data map[string]any) error {
+		if evtType == EventTaskCancelled {
+			return ErrUnsupportedValueType
+		}
+		return nil
+	})
+
+	taskC2, _ := engineC2.CreateTask(tempDir, "explicit cancellation prompt", "gemini-2.5-flash")
+	foundC2, errC2 := engineC2.CancelTaskWithError(taskC2.ID)
+	if !foundC2 {
+		t.Fatalf("Expected CancelTaskWithError to find task")
+	}
+	if errC2 == nil || !errors.Is(errC2, ErrUnsupportedValueType) {
+		t.Errorf("Expected CancelTaskWithError to return error wrapping ErrUnsupportedValueType, got: %v", errC2)
+	}
+
+	snapC2, _ := engineC2.GetTask(taskC2.ID)
+	if snapC2.Status != "cancelled" {
+		t.Errorf("Expected task status 'cancelled', got: %s", snapC2.Status)
+	}
+
+	// D. Test Cancellation Deduplication (Explicit Cancellation vs Context Cancellation)
+	dupEventCount := 0
+	engineD := NewGeminiAgentEngine(aiRouterC, nil, approvalMgr)
+	engineD.SetEventHook(func(evtType EventType, data map[string]any) error {
+		if evtType == EventTaskCancelled {
+			dupEventCount++
+		}
+		return nil
+	})
+
+	taskD, _ := engineD.CreateTask(tempDir, "dedup prompt", "gemini-2.5-flash")
+	_ = engineD.CancelTask(taskD.ID)
+	_ = engineD.emitCancellationEvent(taskD, "second cancellation")
+
+	if dupEventCount != 1 {
+		t.Errorf("Expected exactly 1 cancellation event attempt per cancellation transition, got: %d", dupEventCount)
 	}
 }

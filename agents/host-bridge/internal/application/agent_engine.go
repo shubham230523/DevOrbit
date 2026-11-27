@@ -61,10 +61,11 @@ type AgentTask struct {
 	ResultText    string            `json:"result_text,omitempty"`
 	ErrorText     string            `json:"error_text,omitempty"`
 	CreatedAt     time.Time         `json:"created_at"`
-	UpdatedAt     time.Time         `json:"updated_at"`
-	executing     bool
-	mu            sync.Mutex
-	cancelFn      context.CancelFunc
+	UpdatedAt             time.Time         `json:"updated_at"`
+	executing             bool
+	cancelledEventEmitted bool
+	mu                    sync.Mutex
+	cancelFn              context.CancelFunc
 }
 
 var ErrUnsupportedValueType = errors.New("unsupported payload value type: must be JSON-compatible primitive, map, or slice")
@@ -439,6 +440,18 @@ func (e *GeminiAgentEngine) emitEvent(task *AgentTask, evtType EventType, msg st
 	return nil
 }
 
+func (e *GeminiAgentEngine) emitCancellationEvent(task *AgentTask, msg string) error {
+	task.mu.Lock()
+	if task.cancelledEventEmitted {
+		task.mu.Unlock()
+		return nil // Already published terminal cancellation event for this task transition
+	}
+	task.cancelledEventEmitted = true
+	task.mu.Unlock()
+
+	return e.emitEvent(task, EventTaskCancelled, msg, nil)
+}
+
 func (e *GeminiAgentEngine) CreateTask(workspaceID, prompt, modelID string) (*AgentTask, error) {
 	b := make([]byte, 12)
 	if _, err := rand.Read(b); err != nil {
@@ -691,9 +704,9 @@ func (e *GeminiAgentEngine) runTaskInternal(ctx context.Context, taskID string, 
 				task.Status = "cancelled"
 			}
 			task.mu.Unlock()
-			if errEvt := e.emitEvent(task, EventTaskCancelled, "Task cancelled or timed out", nil); errEvt != nil {
+			if errEvt := e.emitCancellationEvent(task, "Task cancelled or timed out"); errEvt != nil {
 				log.Printf("[AgentEngine] Critical: Failed to emit EventTaskCancelled: %v", errEvt)
-				return fmt.Errorf("%w (event emission failed: %v)", taskCtx.Err(), errEvt)
+				return errors.Join(taskCtx.Err(), fmt.Errorf("failed to emit EventTaskCancelled: %w", errEvt))
 			}
 			return taskCtx.Err()
 		default:
@@ -721,9 +734,9 @@ func (e *GeminiAgentEngine) runTaskInternal(ctx context.Context, taskID string, 
 				task.Status = "cancelled"
 				task.ErrorText = taskCtx.Err().Error()
 				task.mu.Unlock()
-				if errEvt := e.emitEvent(task, EventTaskCancelled, "Task cancelled or timed out", nil); errEvt != nil {
+				if errEvt := e.emitCancellationEvent(task, "Task cancelled or timed out"); errEvt != nil {
 					log.Printf("[AgentEngine] Critical: Failed to emit EventTaskCancelled: %v", errEvt)
-					return fmt.Errorf("%w (event emission failed: %v)", taskCtx.Err(), errEvt)
+					return errors.Join(taskCtx.Err(), fmt.Errorf("failed to emit EventTaskCancelled: %w", errEvt))
 				}
 				return taskCtx.Err()
 			}
@@ -734,7 +747,7 @@ func (e *GeminiAgentEngine) runTaskInternal(ctx context.Context, taskID string, 
 			task.mu.Unlock()
 			if errEvt := e.emitEvent(task, EventTaskFailed, fmt.Sprintf("Gemini generation failed: %v", err), map[string]any{"error": err.Error()}); errEvt != nil {
 				log.Printf("[AgentEngine] Critical: Failed to emit EventTaskFailed: %v", errEvt)
-				return fmt.Errorf("%w (event emission failed: %v)", err, errEvt)
+				return errors.Join(err, fmt.Errorf("failed to emit EventTaskFailed: %w", errEvt))
 			}
 			return err
 		}
@@ -793,13 +806,13 @@ func (e *GeminiAgentEngine) runTaskInternal(ctx context.Context, taskID string, 
 	return fmt.Errorf("task exceeded maximum turn count (%d)", maxTurns)
 }
 
-func (e *GeminiAgentEngine) CancelTask(taskID string) bool {
+func (e *GeminiAgentEngine) CancelTaskWithError(taskID string) (bool, error) {
 	e.mu.RLock()
 	task, found := e.activeTasks[taskID]
 	e.mu.RUnlock()
 
 	if !found {
-		return false
+		return false, fmt.Errorf("task '%s' not found", taskID)
 	}
 
 	task.mu.Lock()
@@ -809,10 +822,20 @@ func (e *GeminiAgentEngine) CancelTask(taskID string) bool {
 	task.Status = "cancelled"
 	task.mu.Unlock()
 
-	if errEvt := e.emitEvent(task, EventTaskCancelled, fmt.Sprintf("Task '%s' cancelled by user", taskID), nil); errEvt != nil {
-		log.Printf("[AgentEngine] Event emission warning: %v", errEvt)
+	if errEvt := e.emitCancellationEvent(task, fmt.Sprintf("Task '%s' cancelled by user", taskID)); errEvt != nil {
+		log.Printf("[AgentEngine] Critical: Failed to emit EventTaskCancelled for '%s': %v", taskID, errEvt)
+		return true, fmt.Errorf("failed to emit EventTaskCancelled for '%s': %w", taskID, errEvt)
 	}
-	return true
+	return true, nil
+}
+
+// CancelTask is a backwards-compatible wrapper around CancelTaskWithError.
+func (e *GeminiAgentEngine) CancelTask(taskID string) bool {
+	found, err := e.CancelTaskWithError(taskID)
+	if err != nil {
+		log.Printf("[AgentEngine] CancelTask warning for '%s': %v", taskID, err)
+	}
+	return found
 }
 
 func (e *GeminiAgentEngine) GetTask(taskID string) (*AgentTask, bool) {
