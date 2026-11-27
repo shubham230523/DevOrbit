@@ -1462,77 +1462,160 @@ func TestAgentEngine_CancellationPublicationCoordination(t *testing.T) {
 	aiRouter.RegisterProvider("Gemini API", mockProvider)
 
 	approvalMgr := NewApprovalManager()
-	engine := NewGeminiAgentEngine(aiRouter, nil, approvalMgr)
 
-	pubEnteredChan := make(chan struct{}, 1)
-	pubUnblockChan := make(chan struct{})
-	var hookCount atomic.Int64
+	// --- 1. Test Concurrent Cancellation with Failed Event Publication ---
+	engineFail := NewGeminiAgentEngine(aiRouter, nil, approvalMgr)
 
-	engine.SetEventHook(func(evtType EventType, data map[string]any) error {
+	pubEnteredFail := make(chan struct{}, 1)
+	pubUnblockFail := make(chan struct{})
+	waiterEnteredFail := make(chan struct{}, 1)
+	var hookCountFail atomic.Int64
+
+	engineFail.SetEventHook(func(evtType EventType, data map[string]any) error {
 		if evtType == EventTaskCancelled {
-			hookCount.Add(1)
+			hookCountFail.Add(1)
 			select {
-			case pubEnteredChan <- struct{}{}:
+			case pubEnteredFail <- struct{}{}:
 			default:
 			}
-			<-pubUnblockChan
+			<-pubUnblockFail
 			return ErrUnsupportedValueType
 		}
 		return nil
 	})
 
-	task, _ := engine.CreateTask(tempDir, "coordination test", "gemini-2.5-flash")
+	engineFail.SetCancellationWaiterHook(func() {
+		select {
+		case waiterEnteredFail <- struct{}{}:
+		default:
+		}
+	})
 
-	readyChan := make(chan struct{}, 2)
-	barrier := make(chan struct{})
-	resChan := make(chan error, 2)
+	taskFail, _ := engineFail.CreateTask(tempDir, "coordination fail test", "gemini-2.5-flash")
 
-	// Goroutine 1 calls CancelTaskWithError
+	readyFail := make(chan struct{}, 2)
+	barrierFail := make(chan struct{})
+	resFail := make(chan error, 2)
+
 	go func() {
-		readyChan <- struct{}{}
-		<-barrier
-		_, errC := engine.CancelTaskWithError(task.ID)
-		resChan <- errC
+		readyFail <- struct{}{}
+		<-barrierFail
+		_, errC := engineFail.CancelTaskWithError(taskFail.ID)
+		resFail <- errC
 	}()
 
-	// Goroutine 2 calls emitCancellationEvent directly
 	go func() {
-		readyChan <- struct{}{}
-		<-barrier
-		errC := engine.emitCancellationEvent(task, "concurrent cancellation")
-		resChan <- errC
+		readyFail <- struct{}{}
+		<-barrierFail
+		errC := engineFail.emitCancellationEvent(taskFail, "concurrent cancellation")
+		resFail <- errC
 	}()
 
-	// Wait for both goroutines to reach barrier
-	<-readyChan
-	<-readyChan
-	close(barrier)
+	<-readyFail
+	<-readyFail
+	close(barrierFail)
 
-	// Wait for the first goroutine to enter the cancellation event hook
-	<-pubEnteredChan
+	// Wait for Caller 1 to enter EventTaskCancelled publication hook
+	<-pubEnteredFail
 
-	// Unblock publication in hook
-	close(pubUnblockChan)
+	// Caller 2 executes and enters the cancellation waiter branch
+	<-waiterEnteredFail
 
-	// Read both results
-	err1 := <-resChan
-	err2 := <-resChan
+	// Unblock Caller 1
+	close(pubUnblockFail)
 
-	// BOTH callers MUST receive ErrUnsupportedValueType from the failed publication!
-	if err1 == nil || !errors.Is(err1, ErrUnsupportedValueType) {
-		t.Errorf("Expected Goroutine 1 error to wrap ErrUnsupportedValueType, got: %v", err1)
+	errF1 := <-resFail
+	errF2 := <-resFail
+
+	// BOTH callers MUST receive ErrUnsupportedValueType from failed publication
+	if errF1 == nil || !errors.Is(errF1, ErrUnsupportedValueType) {
+		t.Errorf("Expected Goroutine 1 error to wrap ErrUnsupportedValueType, got: %v", errF1)
 	}
-	if err2 == nil || !errors.Is(err2, ErrUnsupportedValueType) {
-		t.Errorf("Expected Goroutine 2 error to wrap ErrUnsupportedValueType, got: %v", err2)
+	if errF2 == nil || !errors.Is(errF2, ErrUnsupportedValueType) {
+		t.Errorf("Expected Goroutine 2 error to wrap ErrUnsupportedValueType, got: %v", errF2)
 	}
 
-	// Verify EXACTLY ONE publication attempt occurred
-	if count := hookCount.Load(); count != 1 {
+	if count := hookCountFail.Load(); count != 1 {
 		t.Errorf("Expected exactly 1 EventTaskCancelled publication attempt, got: %d", count)
 	}
 
-	snap, _ := engine.GetTask(task.ID)
-	if snap.Status != "cancelled" {
-		t.Errorf("Expected task status 'cancelled', got: %s", snap.Status)
+	snapF, _ := engineFail.GetTask(taskFail.ID)
+	if snapF.Status != "cancelled" {
+		t.Errorf("Expected task status 'cancelled', got: %s", snapF.Status)
+	}
+
+	// --- 2. Test Concurrent Cancellation with Successful Event Publication ---
+	engineSucc := NewGeminiAgentEngine(aiRouter, nil, approvalMgr)
+
+	pubEnteredSucc := make(chan struct{}, 1)
+	pubUnblockSucc := make(chan struct{})
+	waiterEnteredSucc := make(chan struct{}, 1)
+	var hookCountSucc atomic.Int64
+
+	engineSucc.SetEventHook(func(evtType EventType, data map[string]any) error {
+		if evtType == EventTaskCancelled {
+			hookCountSucc.Add(1)
+			select {
+			case pubEnteredSucc <- struct{}{}:
+			default:
+			}
+			<-pubUnblockSucc
+		}
+		return nil
+	})
+
+	engineSucc.SetCancellationWaiterHook(func() {
+		select {
+		case waiterEnteredSucc <- struct{}{}:
+		default:
+		}
+	})
+
+	taskSucc, _ := engineSucc.CreateTask(tempDir, "coordination succ test", "gemini-2.5-flash")
+
+	readySucc := make(chan struct{}, 2)
+	barrierSucc := make(chan struct{})
+	resSucc := make(chan error, 2)
+
+	go func() {
+		readySucc <- struct{}{}
+		<-barrierSucc
+		_, errC := engineSucc.CancelTaskWithError(taskSucc.ID)
+		resSucc <- errC
+	}()
+
+	go func() {
+		readySucc <- struct{}{}
+		<-barrierSucc
+		errC := engineSucc.emitCancellationEvent(taskSucc, "concurrent cancellation succ")
+		resSucc <- errC
+	}()
+
+	<-readySucc
+	<-readySucc
+	close(barrierSucc)
+
+	<-pubEnteredSucc
+	<-waiterEnteredSucc
+
+	close(pubUnblockSucc)
+
+	errS1 := <-resSucc
+	errS2 := <-resSucc
+
+	if errS1 != nil {
+		t.Errorf("Expected Goroutine 1 error to be nil on successful publication, got: %v", errS1)
+	}
+	if errS2 != nil {
+		t.Errorf("Expected Goroutine 2 error to be nil on successful publication, got: %v", errS2)
+	}
+
+	if count := hookCountSucc.Load(); count != 1 {
+		t.Errorf("Expected exactly 1 EventTaskCancelled publication attempt, got: %d", count)
+	}
+
+	snapS, _ := engineSucc.GetTask(taskSucc.ID)
+	if snapS.Status != "cancelled" {
+		t.Errorf("Expected task status 'cancelled', got: %s", snapS.Status)
 	}
 }

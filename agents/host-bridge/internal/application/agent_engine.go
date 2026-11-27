@@ -354,13 +354,14 @@ type ToolExecutor interface {
 }
 
 type GeminiAgentEngine struct {
-	mu             sync.RWMutex
-	aiRouter       *router.AIRouter
-	toolExecutor   ToolExecutor
-	approvalMgr    *ApprovalManager
-	activeTasks    map[string]*AgentTask
-	eventListeners map[string]func(evt TaskEvent)
-	eventHook      func(evtType EventType, data map[string]any) error
+	mu                     sync.RWMutex
+	aiRouter               *router.AIRouter
+	toolExecutor           ToolExecutor
+	approvalMgr            *ApprovalManager
+	activeTasks            map[string]*AgentTask
+	eventListeners         map[string]func(evt TaskEvent)
+	eventHook              func(evtType EventType, data map[string]any) error
+	cancellationWaiterHook func()
 }
 
 func NewGeminiAgentEngine(
@@ -381,6 +382,12 @@ func (e *GeminiAgentEngine) SetEventHook(hook func(evtType EventType, data map[s
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.eventHook = hook
+}
+
+func (e *GeminiAgentEngine) SetCancellationWaiterHook(hook func()) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.cancellationWaiterHook = hook
 }
 
 func (e *GeminiAgentEngine) SubscribeEvents(id string, listener func(evt TaskEvent)) {
@@ -461,7 +468,13 @@ func (e *GeminiAgentEngine) emitCancellationEvent(task *AgentTask, msg string) e
 
 		case cancellationInProgress:
 			waitChan := task.cancellationWait
+			e.mu.RLock()
+			waiterHook := e.cancellationWaiterHook
+			e.mu.RUnlock()
 			task.mu.Unlock()
+			if waiterHook != nil {
+				waiterHook()
+			}
 			if waitChan != nil {
 				<-waitChan
 			}
