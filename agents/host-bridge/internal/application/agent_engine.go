@@ -67,65 +67,113 @@ type AgentTask struct {
 	cancelFn      context.CancelFunc
 }
 
-func deepCopyMap(m map[string]any) map[string]any {
-	if m == nil {
-		return nil
-	}
-	cp := make(map[string]any, len(m))
-	for k, v := range m {
-		cp[k] = deepCopyValue(v)
-	}
-	return cp
-}
+var ErrUnsupportedValueType = errors.New("unsupported payload value type: must be JSON-compatible primitive, map, or slice")
 
-func deepCopyValue(v any) any {
+func validateAndCopyValue(v any) (any, error) {
 	if v == nil {
-		return nil
+		return nil, nil
 	}
 	switch val := v.(type) {
 	case map[string]any:
-		return deepCopyMap(val)
+		return validateAndCopyMap(val)
 	case map[string]string:
 		cp := make(map[string]string, len(val))
 		for k, elem := range val {
 			cp[k] = elem
 		}
-		return cp
+		return cp, nil
 	case map[string]int:
 		cp := make(map[string]int, len(val))
 		for k, elem := range val {
 			cp[k] = elem
 		}
-		return cp
+		return cp, nil
 	case map[string]bool:
 		cp := make(map[string]bool, len(val))
 		for k, elem := range val {
 			cp[k] = elem
 		}
-		return cp
+		return cp, nil
 	case []any:
 		cp := make([]any, len(val))
 		for i, elem := range val {
-			cp[i] = deepCopyValue(elem)
+			copiedElem, err := validateAndCopyValue(elem)
+			if err != nil {
+				return nil, err
+			}
+			cp[i] = copiedElem
 		}
-		return cp
+		return cp, nil
 	case []string:
-		return append([]string(nil), val...)
+		return append([]string(nil), val...), nil
 	case []int:
-		return append([]int(nil), val...)
+		return append([]int(nil), val...), nil
 	case []int64:
-		return append([]int64(nil), val...)
+		return append([]int64(nil), val...), nil
 	case []float64:
-		return append([]float64(nil), val...)
+		return append([]float64(nil), val...), nil
 	case []bool:
-		return append([]bool(nil), val...)
+		return append([]bool(nil), val...), nil
+	case []router.FunctionCall:
+		return deepCopyFunctionCalls(val), nil
+	case router.FunctionCall:
+		return deepCopyFunctionCall(val), nil
+	case *ApprovalProposal:
+		if val == nil {
+			return nil, nil
+		}
+		argsCopy := append([]string(nil), val.Args...)
+		return &ApprovalProposal{
+			Token:          val.Token,
+			TaskID:         val.TaskID,
+			WorkspaceID:    val.WorkspaceID,
+			ToolName:       val.ToolName,
+			TargetPath:     val.TargetPath,
+			ExpectedSHA256: val.ExpectedSHA256,
+			Command:        val.Command,
+			Args:           argsCopy,
+			TargetContent:  val.TargetContent,
+			Replacement:    val.Replacement,
+			CreatedAt:      val.CreatedAt,
+			ExpiresAt:      val.ExpiresAt,
+		}, nil
 	case string, bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
-		return val
+		return val, nil
 	default:
-		// Unsupported non-JSON mutable types (channels, functions, complex struct pointers)
-		// are normalized to nil to enforce a strict JSON-compatible data contract.
+		return nil, fmt.Errorf("%w: %T", ErrUnsupportedValueType, v)
+	}
+}
+
+func validateAndCopyMap(m map[string]any) (map[string]any, error) {
+	if m == nil {
+		return nil, nil
+	}
+	cp := make(map[string]any, len(m))
+	for k, v := range m {
+		copiedVal, err := validateAndCopyValue(v)
+		if err != nil {
+			return nil, fmt.Errorf("key '%s': %w", k, err)
+		}
+		cp[k] = copiedVal
+	}
+	return cp, nil
+}
+
+func deepCopyMap(m map[string]any) map[string]any {
+	cp, err := validateAndCopyMap(m)
+	if err != nil {
+		log.Printf("[AgentEngine] Payload validation warning: %v", err)
+	}
+	return cp
+}
+
+func deepCopyValue(v any) any {
+	copiedVal, err := validateAndCopyValue(v)
+	if err != nil {
+		log.Printf("[AgentEngine] Payload value validation warning: %v", err)
 		return nil
 	}
+	return copiedVal
 }
 
 func deepCopyFunctionCall(fc router.FunctionCall) router.FunctionCall {
@@ -250,10 +298,14 @@ func (t *AgentTask) Snapshot() *AgentTask {
 	}
 }
 
+type ToolExecutor interface {
+	ExecuteTool(ctx context.Context, taskID, workspaceID string, call *router.FunctionCall, approvalToken string) (map[string]any, *ApprovalProposal, error)
+}
+
 type GeminiAgentEngine struct {
 	mu             sync.RWMutex
 	aiRouter       *router.AIRouter
-	toolExecutor   *AgentToolExecutor
+	toolExecutor   ToolExecutor
 	approvalMgr    *ApprovalManager
 	activeTasks    map[string]*AgentTask
 	eventListeners map[string]func(evt TaskEvent)
@@ -261,7 +313,7 @@ type GeminiAgentEngine struct {
 
 func NewGeminiAgentEngine(
 	aiRouter *router.AIRouter,
-	executor *AgentToolExecutor,
+	executor ToolExecutor,
 	approvalMgr *ApprovalManager,
 ) *GeminiAgentEngine {
 	return &GeminiAgentEngine{

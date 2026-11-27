@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -676,17 +677,19 @@ func TestAgentEngine_StartBarrierCompetingOwnership(t *testing.T) {
 	// Wait for the winning call to enter Generate and hold execution ownership
 	<-enteredA
 
+	// Collect first error result (which MUST be the losing request's "task is already running" error)
+	losingErrA := <-resA
+	if losingErrA == nil || losingErrA.Error() != "task is already running" {
+		t.Fatalf("Scenario A: expected losing request to receive 'task is already running', got: %v", losingErrA)
+	}
+
 	// Unblock the winning call
 	close(blockA)
 
-	errA1 := <-resA
-	errA2 := <-resA
-
-	if (errA1 == nil && errA2 != nil && errA2.Error() == "task is already running") ||
-		(errA2 == nil && errA1 != nil && errA1.Error() == "task is already running") {
-		// PASS
-	} else {
-		t.Fatalf("Scenario A start barrier competition failed: errA1=%v, errA2=%v", errA1, errA2)
+	// Collect second error result (winning request's success)
+	winningErrA := <-resA
+	if winningErrA != nil {
+		t.Fatalf("Scenario A: expected winning request to succeed, got: %v", winningErrA)
 	}
 
 	// --- Scenario B: Two simultaneous ResumeTaskWithApproval calls competing with the SAME valid token ---
@@ -742,16 +745,17 @@ func TestAgentEngine_StartBarrierCompetingOwnership(t *testing.T) {
 	close(barrierB)
 
 	<-enteredB
+
+	losingErrB := <-resB
+	if losingErrB == nil || losingErrB.Error() != "task is already running" {
+		t.Fatalf("Scenario B: expected losing request to receive 'task is already running', got: %v", losingErrB)
+	}
+
 	close(blockB)
 
-	errB1 := <-resB
-	errB2 := <-resB
-
-	if (errB1 == nil && errB2 != nil && errB2.Error() == "task is already running") ||
-		(errB2 == nil && errB1 != nil && errB1.Error() == "task is already running") {
-		// PASS
-	} else {
-		t.Fatalf("Scenario B start barrier competition failed: errB1=%v, errB2=%v", errB1, errB2)
+	winningErrB := <-resB
+	if winningErrB != nil {
+		t.Fatalf("Scenario B: expected winning request to succeed, got: %v", winningErrB)
 	}
 
 	// Verify file was created EXACTLY ONCE
@@ -812,22 +816,17 @@ func TestAgentEngine_StartBarrierCompetingOwnership(t *testing.T) {
 	close(barrierC)
 
 	<-enteredC
+
+	losingErrC := <-resC
+	if losingErrC == nil || (!strings.Contains(losingErrC.Error(), "already running") && !strings.Contains(losingErrC.Error(), "expected 'approval_required'")) {
+		t.Fatalf("Scenario C: expected losing request to be rejected, got: %v", losingErrC)
+	}
+
 	close(blockC)
 
-	errC1 := <-resC
-	errC2 := <-resC
-
-	successCount := 0
-	alreadyRunningCount := 0
-	for _, errC := range []error{errC1, errC2} {
-		if errC == nil {
-			successCount++
-		} else if strings.Contains(errC.Error(), "already running") || strings.Contains(errC.Error(), "expected 'approval_required'") {
-			alreadyRunningCount++
-		}
-	}
-	if successCount != 1 || alreadyRunningCount != 1 {
-		t.Fatalf("Scenario C competition failed: errC1=%v, errC2=%v", errC1, errC2)
+	winningErrC := <-resC
+	if winningErrC != nil {
+		t.Fatalf("Scenario C: expected winning request to succeed, got: %v", winningErrC)
 	}
 }
 
@@ -859,8 +858,6 @@ func TestAgentEngine_DeepSnapshotIsolationAndMutationImmunity(t *testing.T) {
 	aiRouter := router.NewAIRouter()
 	aiRouter.RegisterProvider("Gemini API", mockProvider)
 
-	dummyChan := make(chan int)
-
 	mockProvider.SetResponseForPrompt("snapshot test", &router.GenerateResponse{
 		Model: "gemini-2.5-flash",
 		Text:  "",
@@ -868,9 +865,8 @@ func TestAgentEngine_DeepSnapshotIsolationAndMutationImmunity(t *testing.T) {
 			{
 				Name: router.ToolCreateFile,
 				Arguments: map[string]any{
-					"path":            "orig.txt",
-					"content":         "orig content",
-					"unsupported_ptr": dummyChan,
+					"path":    "orig.txt",
+					"content": "orig content",
 					"nested_map": map[string]any{
 						"str_key": "orig_str",
 					},
@@ -889,12 +885,6 @@ func TestAgentEngine_DeepSnapshotIsolationAndMutationImmunity(t *testing.T) {
 	snap, found := engine.GetTask(task.ID)
 	if !found || snap == nil || snap.PendingTurn == nil {
 		t.Fatalf("Failed to obtain snapshot with PendingTurn")
-	}
-
-	// Verify unsupported non-JSON-primitive mutable values (channels/pointers) are normalized safely to nil
-	unsupportedVal := snap.PendingTurn.TurnResponse.FunctionCalls[0].Arguments["unsupported_ptr"]
-	if unsupportedVal != nil {
-		t.Errorf("Expected unsupported channel value to be normalized to nil, got: %v", unsupportedVal)
 	}
 
 	// Mutate nested snapshot data structures aggressively
@@ -917,36 +907,138 @@ func TestAgentEngine_DeepSnapshotIsolationAndMutationImmunity(t *testing.T) {
 	}
 }
 
-func TestAgentEngine_AdversarialExecutorMutationImmunity(t *testing.T) {
-	fc := router.FunctionCall{
-		Name: "read_file",
-		Arguments: map[string]any{
-			"path": "original.txt",
-			"nested_map": map[string]any{
-				"key": "original_val",
+type AdversarialMutatingExecutor struct {
+	invoked bool
+}
+
+func (m *AdversarialMutatingExecutor) ExecuteTool(ctx context.Context, taskID, workspaceID string, call *router.FunctionCall, approvalToken string) (map[string]any, *ApprovalProposal, error) {
+	m.invoked = true
+	// Aggressively mutate the received FunctionCall.Arguments through the real executor call path
+	if call != nil && call.Arguments != nil {
+		call.Arguments["path"] = "MUTATED_BY_EXECUTOR.txt"
+		if nestedMap, ok := call.Arguments["nested_map"].(map[string]any); ok {
+			nestedMap["key"] = "MUTATED_BY_EXECUTOR"
+		}
+		if nestedSlice, ok := call.Arguments["nested_slice"].([]any); ok && len(nestedSlice) > 0 {
+			nestedSlice[0] = "MUTATED_BY_EXECUTOR"
+		}
+		call.Arguments["added_key"] = "ADDED_BY_EXECUTOR"
+		delete(call.Arguments, "original_key")
+	}
+	return map[string]any{"status": "ok"}, nil, nil
+}
+
+func TestAgentEngine_RealExecutorBoundaryAdversarialMutation(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "devorbit_real_executor_mutation_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp workspace: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	mockProv := router.NewMockGeminiProvider()
+	aiRouter := router.NewAIRouter()
+	aiRouter.RegisterProvider("Gemini API", mockProv)
+
+	approvalMgr := NewApprovalManager()
+	mutatingExec := &AdversarialMutatingExecutor{}
+
+	engine := NewGeminiAgentEngine(aiRouter, mutatingExec, approvalMgr)
+
+	mockProv.SetResponseForPrompt("real executor mutation test", &router.GenerateResponse{
+		Model: "gemini-2.5-flash",
+		Text:  "",
+		FunctionCalls: []router.FunctionCall{
+			{
+				Name: "custom_tool",
+				Arguments: map[string]any{
+					"path":         "original_path.txt",
+					"original_key": "original_val",
+					"nested_map": map[string]any{
+						"key": "original_nested_val",
+					},
+					"nested_slice": []any{"original_slice_item"},
+				},
 			},
-			"nested_slice": []any{"item1"},
 		},
+	})
+
+	task, err := engine.CreateTask(tempDir, "real executor mutation test", "gemini-2.5-flash")
+	if err != nil {
+		t.Fatalf("CreateTask failed: %v", err)
 	}
 
-	callCopy := deepCopyFunctionCall(fc)
-
-	// Simulating aggressive executor mutation on received FunctionCall
-	callCopy.Arguments["path"] = "MUTATED_BY_EXECUTOR.txt"
-	callCopy.Arguments["nested_map"].(map[string]any)["key"] = "MUTATED_BY_EXECUTOR"
-	callCopy.Arguments["nested_slice"].([]any)[0] = "MUTATED_BY_EXECUTOR"
-	delete(callCopy.Arguments, "path")
-	callCopy.Arguments["added_key"] = "ADDED_BY_EXECUTOR"
-
-	// Assert original FunctionCall fc remained completely unmutated
-	if fc.Arguments["path"] != "original.txt" {
-		t.Errorf("Executor mutation leaked to original FunctionCall: path = %v", fc.Arguments["path"])
+	// Execute turn through real production executePendingTurn -> ExecuteTool call path
+	err = engine.RunTask(context.Background(), task.ID, "")
+	if err != nil {
+		t.Fatalf("RunTask failed: %v", err)
 	}
-	if fc.Arguments["nested_map"].(map[string]any)["key"] != "original_val" {
-		t.Errorf("Executor mutation leaked to original FunctionCall: key = %v", fc.Arguments["nested_map"].(map[string]any)["key"])
+
+	if !mutatingExec.invoked {
+		t.Fatalf("Expected MutatingMockToolExecutor to be invoked via ExecuteTool")
 	}
-	if fc.Arguments["nested_slice"].([]any)[0] != "item1" {
-		t.Errorf("Executor mutation leaked to original FunctionCall: slice = %v", fc.Arguments["nested_slice"].([]any)[0])
+
+	// Fetch fresh live task state
+	engine.mu.RLock()
+	liveTask := engine.activeTasks[task.ID]
+	engine.mu.RUnlock()
+
+	// Verify relevant task.Messages (model turn function call arguments) were NOT mutated by executor!
+	if len(liveTask.Messages) < 2 {
+		t.Fatalf("Expected at least 2 messages in task, got: %d", len(liveTask.Messages))
+	}
+
+	modelMsg := liveTask.Messages[1]
+	if len(modelMsg.FunctionCalls) == 0 {
+		t.Fatalf("Expected function calls in model message")
+	}
+
+	origArgs := modelMsg.FunctionCalls[0].Arguments
+	if origArgs["path"] != "original_path.txt" {
+		t.Errorf("Mutation leak! Model message FunctionCall path argument was mutated: %v", origArgs["path"])
+	}
+	if origArgs["original_key"] != "original_val" {
+		t.Errorf("Mutation leak! Model message FunctionCall original_key was deleted or mutated")
+	}
+	if _, found := origArgs["added_key"]; found {
+		t.Errorf("Mutation leak! Model message FunctionCall received added_key")
+	}
+	if nestedMap, ok := origArgs["nested_map"].(map[string]any); !ok || nestedMap["key"] != "original_nested_val" {
+		t.Errorf("Mutation leak! Model message FunctionCall nested_map was mutated: %v", nestedMap)
+	}
+	if nestedSlice, ok := origArgs["nested_slice"].([]any); !ok || len(nestedSlice) == 0 || nestedSlice[0] != "original_slice_item" {
+		t.Errorf("Mutation leak! Model message FunctionCall nested_slice was mutated: %v", nestedSlice)
+	}
+}
+
+func TestAgentEngine_ExplicitUnsupportedTypeValidationContract(t *testing.T) {
+	dummyChan := make(chan int)
+
+	// Validate supported primitive and container types pass
+	supportedMap := map[string]any{
+		"str":       "val",
+		"int":       42,
+		"bool":      true,
+		"nil":       nil,
+		"sub_map":   map[string]any{"k": "v"},
+		"sub_slice": []any{"elem"},
+	}
+
+	copied, err := validateAndCopyMap(supportedMap)
+	if err != nil {
+		t.Errorf("Supported map failed validation: %v", err)
+	}
+	if copied["str"] != "val" || copied["int"] != 42 {
+		t.Errorf("Copied map content mismatch")
+	}
+
+	// Validate unsupported non-JSON primitive returns explicit ErrUnsupportedValueType
+	unsupportedMap := map[string]any{
+		"chan_key": dummyChan,
+	}
+
+	_, err = validateAndCopyMap(unsupportedMap)
+	if err == nil || !errors.Is(err, ErrUnsupportedValueType) {
+		t.Errorf("Expected ErrUnsupportedValueType for unsupported channel type, got: %v", err)
 	}
 }
 
