@@ -1318,10 +1318,12 @@ type FailingFailingAIProvider struct {
 	router.Provider
 }
 
+var origGenErr = errors.New("simulated AI generation failure")
+
 func (p *FailingFailingAIProvider) Name() string { return "Gemini API" }
 func (p *FailingFailingAIProvider) DefaultModel() string { return "gemini-2.5-flash" }
 func (p *FailingFailingAIProvider) Generate(ctx context.Context, req router.GenerateRequest) (*router.GenerateResponse, error) {
-	return nil, errors.New("simulated AI generation failure")
+	return nil, origGenErr
 }
 
 func TestAgentEngine_ProductionPathTaskFailedAndCancelledEventFailure(t *testing.T) {
@@ -1356,8 +1358,11 @@ func TestAgentEngine_ProductionPathTaskFailedAndCancelledEventFailure(t *testing
 	}
 
 	// Verify error structurally wraps both original AI generation error AND event emission error
-	if !errors.Is(err, ErrUnsupportedValueType) || !strings.Contains(err.Error(), "simulated AI generation failure") {
-		t.Errorf("Expected errors.Is(err, ErrUnsupportedValueType) and original error, got: %v", err)
+	if !errors.Is(err, origGenErr) {
+		t.Errorf("Expected errors.Is(err, origGenErr) to be true, got: %v", err)
+	}
+	if !errors.Is(err, ErrUnsupportedValueType) {
+		t.Errorf("Expected errors.Is(err, ErrUnsupportedValueType) to be true, got: %v", err)
 	}
 
 	// Verify task remains in 'failed' status and failedTaskCount is exactly 1 (no recursive event loop)
@@ -1395,8 +1400,11 @@ func TestAgentEngine_ProductionPathTaskFailedAndCancelledEventFailure(t *testing
 		t.Fatalf("Expected RunTask to fail when context is cancelled")
 	}
 
+	if !errors.Is(errC, context.DeadlineExceeded) && !errors.Is(errC, context.Canceled) {
+		t.Errorf("Expected errors.Is(errC, context.DeadlineExceeded/Canceled) to be true, got: %v", errC)
+	}
 	if !errors.Is(errC, ErrUnsupportedValueType) {
-		t.Errorf("Expected errors.Is(errC, ErrUnsupportedValueType) for cancellation event failure, got: %v", errC)
+		t.Errorf("Expected errors.Is(errC, ErrUnsupportedValueType) to be true, got: %v", errC)
 	}
 
 	// Verify task status is 'cancelled'
@@ -1457,165 +1465,163 @@ func TestAgentEngine_CancellationPublicationCoordination(t *testing.T) {
 	}
 	defer os.RemoveAll(tempDir)
 
-	mockProvider := router.NewMockGeminiProvider()
-	aiRouter := router.NewAIRouter()
-	aiRouter.RegisterProvider("Gemini API", mockProvider)
-
 	approvalMgr := NewApprovalManager()
 
-	// --- 1. Test Concurrent Cancellation with Failed Event Publication ---
-	engineFail := NewGeminiAgentEngine(aiRouter, nil, approvalMgr)
+	// --- 1. Test Production-Path Concurrent Cancellation with Failed Event Publication ---
+	genEnteredA := make(chan struct{}, 1)
+	genBlockA := make(chan struct{})
+	blockingProvA := &BlockingAIProvider{enteredChan: genEnteredA, blockChan: genBlockA}
 
-	pubEnteredFail := make(chan struct{}, 1)
-	pubUnblockFail := make(chan struct{})
-	waiterEnteredFail := make(chan struct{}, 1)
-	var hookCountFail atomic.Int64
+	aiRouterA := router.NewAIRouter()
+	aiRouterA.RegisterProvider("Gemini API", blockingProvA)
 
-	engineFail.SetEventHook(func(evtType EventType, data map[string]any) error {
+	engineA := NewGeminiAgentEngine(aiRouterA, nil, approvalMgr)
+
+	pubEnteredA := make(chan struct{}, 1)
+	pubBlockA := make(chan struct{})
+	waiterEnteredA := make(chan struct{}, 1)
+	var hookCountA atomic.Int64
+
+	engineA.SetEventHook(func(evtType EventType, data map[string]any) error {
 		if evtType == EventTaskCancelled {
-			hookCountFail.Add(1)
+			hookCountA.Add(1)
 			select {
-			case pubEnteredFail <- struct{}{}:
+			case pubEnteredA <- struct{}{}:
 			default:
 			}
-			<-pubUnblockFail
+			<-pubBlockA
 			return ErrUnsupportedValueType
 		}
 		return nil
 	})
 
-	engineFail.SetCancellationWaiterHook(func() {
+	engineA.SetCancellationWaiterHook(func() {
 		select {
-		case waiterEnteredFail <- struct{}{}:
+		case waiterEnteredA <- struct{}{}:
 		default:
 		}
 	})
 
-	taskFail, _ := engineFail.CreateTask(tempDir, "coordination fail test", "gemini-2.5-flash")
+	taskA, _ := engineA.CreateTask(tempDir, "production path cancel A", "gemini-2.5-flash")
 
-	readyFail := make(chan struct{}, 2)
-	barrierFail := make(chan struct{})
-	resFail := make(chan error, 2)
-
+	// Goroutine 0 starts RunTask through real production path
+	runErrChanA := make(chan error, 1)
 	go func() {
-		readyFail <- struct{}{}
-		<-barrierFail
-		_, errC := engineFail.CancelTaskWithError(taskFail.ID)
-		resFail <- errC
+		runErrChanA <- engineA.RunTask(context.Background(), taskA.ID, "")
 	}()
 
+	// Wait until RunTask is actively executing inside AI generation
+	<-genEnteredA
+
+	// Goroutine 1 calls CancelTaskWithError while RunTask is running
+	cancelErrChanA := make(chan error, 1)
 	go func() {
-		readyFail <- struct{}{}
-		<-barrierFail
-		errC := engineFail.emitCancellationEvent(taskFail, "concurrent cancellation")
-		resFail <- errC
+		_, cErr := engineA.CancelTaskWithError(taskA.ID)
+		cancelErrChanA <- cErr
 	}()
 
-	<-readyFail
-	<-readyFail
-	close(barrierFail)
+	// Wait for CancelTaskWithError to enter the EventTaskCancelled event hook and block on pubBlockA
+	<-pubEnteredA
 
-	// Wait for Caller 1 to enter EventTaskCancelled publication hook
-	<-pubEnteredFail
+	// Unblock AI generation in RunTask -> RunTask observes context cancellation
+	close(genBlockA)
 
-	// Caller 2 executes and enters the cancellation waiter branch
-	<-waiterEnteredFail
+	// RunTask enters emitCancellationEvent, sees cancellationState == cancellationInProgress, and enters waiter hook
+	<-waiterEnteredA
 
-	// Unblock Caller 1
-	close(pubUnblockFail)
+	// Unblock publication in event hook
+	close(pubBlockA)
 
-	errF1 := <-resFail
-	errF2 := <-resFail
+	runErrA := <-runErrChanA
+	cancelErrA := <-cancelErrChanA
 
-	// BOTH callers MUST receive ErrUnsupportedValueType from failed publication
-	if errF1 == nil || !errors.Is(errF1, ErrUnsupportedValueType) {
-		t.Errorf("Expected Goroutine 1 error to wrap ErrUnsupportedValueType, got: %v", errF1)
+	// Both callers MUST receive errors wrapping ErrUnsupportedValueType
+	if runErrA == nil || !errors.Is(runErrA, ErrUnsupportedValueType) {
+		t.Errorf("Expected RunTask error to wrap ErrUnsupportedValueType, got: %v", runErrA)
 	}
-	if errF2 == nil || !errors.Is(errF2, ErrUnsupportedValueType) {
-		t.Errorf("Expected Goroutine 2 error to wrap ErrUnsupportedValueType, got: %v", errF2)
+	if cancelErrA == nil || !errors.Is(cancelErrA, ErrUnsupportedValueType) {
+		t.Errorf("Expected CancelTaskWithError error to wrap ErrUnsupportedValueType, got: %v", cancelErrA)
 	}
 
-	if count := hookCountFail.Load(); count != 1 {
+	if count := hookCountA.Load(); count != 1 {
 		t.Errorf("Expected exactly 1 EventTaskCancelled publication attempt, got: %d", count)
 	}
 
-	snapF, _ := engineFail.GetTask(taskFail.ID)
-	if snapF.Status != "cancelled" {
-		t.Errorf("Expected task status 'cancelled', got: %s", snapF.Status)
+	snapA, _ := engineA.GetTask(taskA.ID)
+	if snapA.Status != "cancelled" {
+		t.Errorf("Expected task status 'cancelled', got: %s", snapA.Status)
 	}
 
-	// --- 2. Test Concurrent Cancellation with Successful Event Publication ---
-	engineSucc := NewGeminiAgentEngine(aiRouter, nil, approvalMgr)
+	// --- 2. Test Production-Path Concurrent Cancellation with Successful Event Publication ---
+	genEnteredB := make(chan struct{}, 1)
+	genBlockB := make(chan struct{})
+	blockingProvB := &BlockingAIProvider{enteredChan: genEnteredB, blockChan: genBlockB}
 
-	pubEnteredSucc := make(chan struct{}, 1)
-	pubUnblockSucc := make(chan struct{})
-	waiterEnteredSucc := make(chan struct{}, 1)
-	var hookCountSucc atomic.Int64
+	aiRouterB := router.NewAIRouter()
+	aiRouterB.RegisterProvider("Gemini API", blockingProvB)
 
-	engineSucc.SetEventHook(func(evtType EventType, data map[string]any) error {
+	engineB := NewGeminiAgentEngine(aiRouterB, nil, approvalMgr)
+
+	pubEnteredB := make(chan struct{}, 1)
+	pubBlockB := make(chan struct{})
+	waiterEnteredB := make(chan struct{}, 1)
+	var hookCountB atomic.Int64
+
+	engineB.SetEventHook(func(evtType EventType, data map[string]any) error {
 		if evtType == EventTaskCancelled {
-			hookCountSucc.Add(1)
+			hookCountB.Add(1)
 			select {
-			case pubEnteredSucc <- struct{}{}:
+			case pubEnteredB <- struct{}{}:
 			default:
 			}
-			<-pubUnblockSucc
+			<-pubBlockB
 		}
 		return nil
 	})
 
-	engineSucc.SetCancellationWaiterHook(func() {
+	engineB.SetCancellationWaiterHook(func() {
 		select {
-		case waiterEnteredSucc <- struct{}{}:
+		case waiterEnteredB <- struct{}{}:
 		default:
 		}
 	})
 
-	taskSucc, _ := engineSucc.CreateTask(tempDir, "coordination succ test", "gemini-2.5-flash")
+	taskB, _ := engineB.CreateTask(tempDir, "production path cancel B", "gemini-2.5-flash")
 
-	readySucc := make(chan struct{}, 2)
-	barrierSucc := make(chan struct{})
-	resSucc := make(chan error, 2)
-
+	runErrChanB := make(chan error, 1)
 	go func() {
-		readySucc <- struct{}{}
-		<-barrierSucc
-		_, errC := engineSucc.CancelTaskWithError(taskSucc.ID)
-		resSucc <- errC
+		runErrChanB <- engineB.RunTask(context.Background(), taskB.ID, "")
 	}()
 
+	<-genEnteredB
+
+	cancelErrChanB := make(chan error, 1)
 	go func() {
-		readySucc <- struct{}{}
-		<-barrierSucc
-		errC := engineSucc.emitCancellationEvent(taskSucc, "concurrent cancellation succ")
-		resSucc <- errC
+		_, cErr := engineB.CancelTaskWithError(taskB.ID)
+		cancelErrChanB <- cErr
 	}()
 
-	<-readySucc
-	<-readySucc
-	close(barrierSucc)
+	<-pubEnteredB
+	close(genBlockB)
+	<-waiterEnteredB
+	close(pubBlockB)
 
-	<-pubEnteredSucc
-	<-waiterEnteredSucc
+	runErrB := <-runErrChanB
+	cancelErrB := <-cancelErrChanB
 
-	close(pubUnblockSucc)
-
-	errS1 := <-resSucc
-	errS2 := <-resSucc
-
-	if errS1 != nil {
-		t.Errorf("Expected Goroutine 1 error to be nil on successful publication, got: %v", errS1)
+	if cancelErrB != nil {
+		t.Errorf("Expected CancelTaskWithError to succeed with nil error, got: %v", cancelErrB)
 	}
-	if errS2 != nil {
-		t.Errorf("Expected Goroutine 2 error to be nil on successful publication, got: %v", errS2)
+	if runErrB == nil || !errors.Is(runErrB, context.Canceled) {
+		t.Errorf("Expected RunTask error to wrap context.Canceled, got: %v", runErrB)
 	}
 
-	if count := hookCountSucc.Load(); count != 1 {
+	if count := hookCountB.Load(); count != 1 {
 		t.Errorf("Expected exactly 1 EventTaskCancelled publication attempt, got: %d", count)
 	}
 
-	snapS, _ := engineSucc.GetTask(taskSucc.ID)
-	if snapS.Status != "cancelled" {
-		t.Errorf("Expected task status 'cancelled', got: %s", snapS.Status)
+	snapB, _ := engineB.GetTask(taskB.ID)
+	if snapB.Status != "cancelled" {
+		t.Errorf("Expected task status 'cancelled', got: %s", snapB.Status)
 	}
 }
