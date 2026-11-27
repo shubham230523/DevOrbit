@@ -908,11 +908,22 @@ func TestAgentEngine_DeepSnapshotIsolationAndMutationImmunity(t *testing.T) {
 }
 
 type AdversarialMutatingExecutor struct {
-	invocationCount int
+	mu               sync.Mutex
+	call0Invocations int
+	call1Invocations int
 }
 
 func (m *AdversarialMutatingExecutor) ExecuteTool(ctx context.Context, taskID, workspaceID string, call *router.FunctionCall, approvalToken string) (map[string]any, *ApprovalProposal, error) {
-	m.invocationCount++
+	m.mu.Lock()
+	if call != nil {
+		if call.Name == "custom_tool" {
+			m.call0Invocations++
+		} else if call.Name == "create_file_approval" {
+			m.call1Invocations++
+		}
+	}
+	m.mu.Unlock()
+
 	// Aggressively mutate the received FunctionCall.Arguments through the real executor call path
 	if call != nil && call.Arguments != nil {
 		call.Arguments["path"] = "MUTATED_BY_EXECUTOR.txt"
@@ -992,8 +1003,13 @@ func TestAgentEngine_RealExecutorBoundaryAdversarialMutation(t *testing.T) {
 		t.Fatalf("RunTask failed: %v", err)
 	}
 
-	if mutatingExec.invocationCount != 2 {
-		t.Fatalf("Expected exactly 2 tool execution attempts (1 executed, 1 paused for approval), got: %d", mutatingExec.invocationCount)
+	mutatingExec.mu.Lock()
+	c0Count := mutatingExec.call0Invocations
+	c1Count := mutatingExec.call1Invocations
+	mutatingExec.mu.Unlock()
+
+	if c0Count != 1 || c1Count != 1 {
+		t.Fatalf("Before resume: expected call0Invocations=1, call1Invocations=1, got call0=%d, call1=%d", c0Count, c1Count)
 	}
 
 	// Fetch fresh live task state while paused on approval
@@ -1035,6 +1051,20 @@ func TestAgentEngine_RealExecutorBoundaryAdversarialMutation(t *testing.T) {
 		t.Fatalf("ResumeTaskWithApproval failed: %v", err)
 	}
 
+	mutatingExec.mu.Lock()
+	c0CountAfter := mutatingExec.call0Invocations
+	c1CountAfter := mutatingExec.call1Invocations
+	mutatingExec.mu.Unlock()
+
+	// Assert Call 0 was NOT re-executed during resume (count remains 1)
+	if c0CountAfter != 1 {
+		t.Errorf("Call 0 was re-executed during resume! Expected call0Invocations=1, got: %d", c0CountAfter)
+	}
+	// Assert Call 1 executed exactly once after resume (1 initial approval attempt + 1 approved execution = 2)
+	if c1CountAfter != 2 {
+		t.Errorf("Call 1 execution count mismatch! Expected call1Invocations=2, got: %d", c1CountAfter)
+	}
+
 	// Fetch live task after turn completion
 	engine.mu.RLock()
 	completedTask := engine.activeTasks[task.ID]
@@ -1042,17 +1072,35 @@ func TestAgentEngine_RealExecutorBoundaryAdversarialMutation(t *testing.T) {
 
 	// 4. Assert task.Messages[1] (model turn) FunctionCalls[0].Arguments remain UNMUTATED!
 	completedTask.mu.Lock()
-	if len(completedTask.Messages) < 2 {
+	if completedTask.Status != "completed" {
+		t.Errorf("Expected final completedTask.Status = 'completed', got: %s", completedTask.Status)
+	}
+	if len(completedTask.Messages) < 3 {
 		completedTask.mu.Unlock()
-		t.Fatalf("Expected at least 2 messages in completed task")
+		t.Fatalf("Expected at least 3 messages in completed task, got: %d", len(completedTask.Messages))
 	}
+
 	modelMsg := completedTask.Messages[1]
-	origArgs := modelMsg.FunctionCalls[0].Arguments
-	if origArgs["path"] != "original_path.txt" || origArgs["original_key"] != "original_val" {
-		t.Errorf("Mutation leak! Model message FunctionCall arguments mutated: %v", origArgs)
+	origArgs0 := modelMsg.FunctionCalls[0].Arguments
+	if origArgs0["path"] != "original_path.txt" || origArgs0["original_key"] != "original_val" {
+		t.Errorf("Mutation leak! Model message FunctionCalls[0] arguments mutated: %v", origArgs0)
 	}
-	if _, found := origArgs["added_key"]; found {
-		t.Errorf("Mutation leak! Model message FunctionCall received added_key")
+	if _, found := origArgs0["added_key"]; found {
+		t.Errorf("Mutation leak! Model message FunctionCalls[0] received added_key")
+	}
+
+	origArgs1 := modelMsg.FunctionCalls[1].Arguments
+	if origArgs1["path"] != "approval_path.txt" || origArgs1["original_key"] != "approval_val" {
+		t.Errorf("Mutation leak! Model message FunctionCalls[1] arguments mutated: %v", origArgs1)
+	}
+
+	// Verify both tool responses recorded correctly in tool response message (Messages[2])
+	toolMsg := completedTask.Messages[2]
+	if len(toolMsg.FunctionResponses) < 2 {
+		t.Fatalf("Expected 2 function responses in tool message, got: %d", len(toolMsg.FunctionResponses))
+	}
+	if toolMsg.FunctionResponses[0].Response["status"] != "ok" || toolMsg.FunctionResponses[1].Response["status"] != "ok" {
+		t.Errorf("Function responses not recorded correctly: %v", toolMsg.FunctionResponses)
 	}
 	completedTask.mu.Unlock()
 }
