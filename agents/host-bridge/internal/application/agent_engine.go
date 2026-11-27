@@ -48,24 +48,34 @@ type PendingTurnState struct {
 	CallStates   []FunctionCallState     `json:"call_states"`
 }
 
+type cancellationPublicationState int
+
+const (
+	cancellationNotStarted cancellationPublicationState = iota
+	cancellationInProgress
+	cancellationCompleted
+)
+
 type AgentTask struct {
-	ID            string            `json:"id"`
-	WorkspaceID   string            `json:"workspace_id"`
-	Prompt        string            `json:"prompt"`
-	ModelID       string            `json:"model_id"`
-	Status        string            `json:"status"` // "running", "approval_required", "completed", "failed", "cancelled"
-	Messages      []router.Message  `json:"messages"`
-	Events        []TaskEvent       `json:"events"`
-	PendingTurn   *PendingTurnState `json:"pending_turn,omitempty"`
-	ApprovalToken string            `json:"approval_token,omitempty"`
-	ResultText    string            `json:"result_text,omitempty"`
-	ErrorText     string            `json:"error_text,omitempty"`
-	CreatedAt     time.Time         `json:"created_at"`
-	UpdatedAt             time.Time         `json:"updated_at"`
-	executing             bool
-	cancelledEventEmitted bool
-	mu                    sync.Mutex
-	cancelFn              context.CancelFunc
+	ID                string                        `json:"id"`
+	WorkspaceID       string                        `json:"workspace_id"`
+	Prompt            string                        `json:"prompt"`
+	ModelID           string                        `json:"model_id"`
+	Status            string                        `json:"status"` // "running", "approval_required", "completed", "failed", "cancelled"
+	Messages          []router.Message              `json:"messages"`
+	Events            []TaskEvent                   `json:"events"`
+	PendingTurn       *PendingTurnState             `json:"pending_turn,omitempty"`
+	ApprovalToken     string                        `json:"approval_token,omitempty"`
+	ResultText        string                        `json:"result_text,omitempty"`
+	ErrorText         string                        `json:"error_text,omitempty"`
+	CreatedAt         time.Time                     `json:"created_at"`
+	UpdatedAt         time.Time                     `json:"updated_at"`
+	executing         bool
+	cancellationState cancellationPublicationState
+	cancellationErr   error
+	cancellationWait  chan struct{}
+	mu                sync.Mutex
+	cancelFn          context.CancelFunc
 }
 
 var ErrUnsupportedValueType = errors.New("unsupported payload value type: must be JSON-compatible primitive, map, or slice")
@@ -441,15 +451,40 @@ func (e *GeminiAgentEngine) emitEvent(task *AgentTask, evtType EventType, msg st
 }
 
 func (e *GeminiAgentEngine) emitCancellationEvent(task *AgentTask, msg string) error {
-	task.mu.Lock()
-	if task.cancelledEventEmitted {
-		task.mu.Unlock()
-		return nil // Already published terminal cancellation event for this task transition
-	}
-	task.cancelledEventEmitted = true
-	task.mu.Unlock()
+	for {
+		task.mu.Lock()
+		switch task.cancellationState {
+		case cancellationCompleted:
+			err := task.cancellationErr
+			task.mu.Unlock()
+			return err
 
-	return e.emitEvent(task, EventTaskCancelled, msg, nil)
+		case cancellationInProgress:
+			waitChan := task.cancellationWait
+			task.mu.Unlock()
+			if waitChan != nil {
+				<-waitChan
+			}
+			continue
+
+		case cancellationNotStarted:
+			task.cancellationState = cancellationInProgress
+			task.cancellationWait = make(chan struct{})
+			task.mu.Unlock()
+
+			pubErr := e.emitEvent(task, EventTaskCancelled, msg, nil)
+
+			task.mu.Lock()
+			task.cancellationErr = pubErr
+			task.cancellationState = cancellationCompleted
+			if task.cancellationWait != nil {
+				close(task.cancellationWait)
+			}
+			task.mu.Unlock()
+
+			return pubErr
+		}
+	}
 }
 
 func (e *GeminiAgentEngine) CreateTask(workspaceID, prompt, modelID string) (*AgentTask, error) {

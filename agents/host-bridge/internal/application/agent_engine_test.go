@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1446,5 +1447,92 @@ func TestAgentEngine_ProductionPathTaskFailedAndCancelledEventFailure(t *testing
 
 	if dupEventCount != 1 {
 		t.Errorf("Expected exactly 1 cancellation event attempt per cancellation transition, got: %d", dupEventCount)
+	}
+}
+
+func TestAgentEngine_CancellationPublicationCoordination(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "devorbit_coord_cancellation_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp workspace: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	mockProvider := router.NewMockGeminiProvider()
+	aiRouter := router.NewAIRouter()
+	aiRouter.RegisterProvider("Gemini API", mockProvider)
+
+	approvalMgr := NewApprovalManager()
+	engine := NewGeminiAgentEngine(aiRouter, nil, approvalMgr)
+
+	pubEnteredChan := make(chan struct{}, 1)
+	pubUnblockChan := make(chan struct{})
+	var hookCount atomic.Int64
+
+	engine.SetEventHook(func(evtType EventType, data map[string]any) error {
+		if evtType == EventTaskCancelled {
+			hookCount.Add(1)
+			select {
+			case pubEnteredChan <- struct{}{}:
+			default:
+			}
+			<-pubUnblockChan
+			return ErrUnsupportedValueType
+		}
+		return nil
+	})
+
+	task, _ := engine.CreateTask(tempDir, "coordination test", "gemini-2.5-flash")
+
+	readyChan := make(chan struct{}, 2)
+	barrier := make(chan struct{})
+	resChan := make(chan error, 2)
+
+	// Goroutine 1 calls CancelTaskWithError
+	go func() {
+		readyChan <- struct{}{}
+		<-barrier
+		_, errC := engine.CancelTaskWithError(task.ID)
+		resChan <- errC
+	}()
+
+	// Goroutine 2 calls emitCancellationEvent directly
+	go func() {
+		readyChan <- struct{}{}
+		<-barrier
+		errC := engine.emitCancellationEvent(task, "concurrent cancellation")
+		resChan <- errC
+	}()
+
+	// Wait for both goroutines to reach barrier
+	<-readyChan
+	<-readyChan
+	close(barrier)
+
+	// Wait for the first goroutine to enter the cancellation event hook
+	<-pubEnteredChan
+
+	// Unblock publication in hook
+	close(pubUnblockChan)
+
+	// Read both results
+	err1 := <-resChan
+	err2 := <-resChan
+
+	// BOTH callers MUST receive ErrUnsupportedValueType from the failed publication!
+	if err1 == nil || !errors.Is(err1, ErrUnsupportedValueType) {
+		t.Errorf("Expected Goroutine 1 error to wrap ErrUnsupportedValueType, got: %v", err1)
+	}
+	if err2 == nil || !errors.Is(err2, ErrUnsupportedValueType) {
+		t.Errorf("Expected Goroutine 2 error to wrap ErrUnsupportedValueType, got: %v", err2)
+	}
+
+	// Verify EXACTLY ONE publication attempt occurred
+	if count := hookCount.Load(); count != 1 {
+		t.Errorf("Expected exactly 1 EventTaskCancelled publication attempt, got: %d", count)
+	}
+
+	snap, _ := engine.GetTask(task.ID)
+	if snap.Status != "cancelled" {
+		t.Errorf("Expected task status 'cancelled', got: %s", snap.Status)
 	}
 }
