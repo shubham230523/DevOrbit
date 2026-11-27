@@ -122,9 +122,9 @@ func deepCopyValue(v any) any {
 	case string, bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
 		return val
 	default:
-		// Convert non-JSON-primitive mutable values (channels, functions, complex struct pointers)
-		// to string representations to prevent mutable reference aliasing.
-		return fmt.Sprintf("%v", val)
+		// Unsupported non-JSON mutable types (channels, functions, complex struct pointers)
+		// are normalized to nil to enforce a strict JSON-compatible data contract.
+		return nil
 	}
 }
 
@@ -401,7 +401,7 @@ func (e *GeminiAgentEngine) executePendingTurn(ctx context.Context, task *AgentT
 		}
 
 		tok := approvalToken
-		callCopy := cs.FunctionCall
+		callCopy := deepCopyFunctionCall(cs.FunctionCall)
 		task.mu.Unlock()
 
 		e.emitEvent(task, EventToolExecutionStarted, fmt.Sprintf("Executing tool '%s' (%d/%d)", callCopy.Name, i+1, len(pt.CallStates)), map[string]any{

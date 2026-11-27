@@ -891,10 +891,10 @@ func TestAgentEngine_DeepSnapshotIsolationAndMutationImmunity(t *testing.T) {
 		t.Fatalf("Failed to obtain snapshot with PendingTurn")
 	}
 
-	// Verify unsupported non-JSON-primitive mutable values (channels/pointers) are normalized safely
+	// Verify unsupported non-JSON-primitive mutable values (channels/pointers) are normalized safely to nil
 	unsupportedVal := snap.PendingTurn.TurnResponse.FunctionCalls[0].Arguments["unsupported_ptr"]
-	if _, ok := unsupportedVal.(string); !ok {
-		t.Errorf("Expected unsupported channel value to be normalized to string representation, got: %T", unsupportedVal)
+	if unsupportedVal != nil {
+		t.Errorf("Expected unsupported channel value to be normalized to nil, got: %v", unsupportedVal)
 	}
 
 	// Mutate nested snapshot data structures aggressively
@@ -914,5 +914,108 @@ func TestAgentEngine_DeepSnapshotIsolationAndMutationImmunity(t *testing.T) {
 	}
 	if snapFresh.PendingTurn.CallStates[0].FunctionCall.Arguments["content"] == "MUTATED_CONTENT" {
 		t.Errorf("Mutation leak! CallState FunctionCall arguments map was mutated via snapshot")
+	}
+}
+
+func TestAgentEngine_AdversarialExecutorMutationImmunity(t *testing.T) {
+	fc := router.FunctionCall{
+		Name: "read_file",
+		Arguments: map[string]any{
+			"path": "original.txt",
+			"nested_map": map[string]any{
+				"key": "original_val",
+			},
+			"nested_slice": []any{"item1"},
+		},
+	}
+
+	callCopy := deepCopyFunctionCall(fc)
+
+	// Simulating aggressive executor mutation on received FunctionCall
+	callCopy.Arguments["path"] = "MUTATED_BY_EXECUTOR.txt"
+	callCopy.Arguments["nested_map"].(map[string]any)["key"] = "MUTATED_BY_EXECUTOR"
+	callCopy.Arguments["nested_slice"].([]any)[0] = "MUTATED_BY_EXECUTOR"
+	delete(callCopy.Arguments, "path")
+	callCopy.Arguments["added_key"] = "ADDED_BY_EXECUTOR"
+
+	// Assert original FunctionCall fc remained completely unmutated
+	if fc.Arguments["path"] != "original.txt" {
+		t.Errorf("Executor mutation leaked to original FunctionCall: path = %v", fc.Arguments["path"])
+	}
+	if fc.Arguments["nested_map"].(map[string]any)["key"] != "original_val" {
+		t.Errorf("Executor mutation leaked to original FunctionCall: key = %v", fc.Arguments["nested_map"].(map[string]any)["key"])
+	}
+	if fc.Arguments["nested_slice"].([]any)[0] != "item1" {
+		t.Errorf("Executor mutation leaked to original FunctionCall: slice = %v", fc.Arguments["nested_slice"].([]any)[0])
+	}
+}
+
+func TestAgentEngine_EventListenerIsolation(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "devorbit_event_isolation_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp workspace: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	jail := security.NewWorkspaceJail([]string{tempDir})
+	policy := security.NewDefaultCommandPolicy()
+
+	storage := filesystem.NewStorageEngine(jail, 10*1024*1024)
+	procRunner := process.NewProcessRunner(policy, jail)
+	gitClient := git.NewGitClient(jail)
+	adbClient := adb.NewADBClient("adb")
+
+	wsSvc := NewWorkspaceService(jail)
+	fsSvc := NewFilesystemService(storage)
+	psSvc := NewProcessService(procRunner)
+	gsSvc := NewGitService(gitClient)
+	dsSvc := NewDeviceService(adbClient)
+
+	approvalMgr := NewApprovalManager()
+	executor := NewAgentToolExecutor(wsSvc, fsSvc, psSvc, gsSvc, dsSvc, approvalMgr)
+
+	mockProvider := router.NewMockGeminiProvider()
+	aiRouter := router.NewAIRouter()
+	aiRouter.RegisterProvider("Gemini API", mockProvider)
+
+	mockProvider.SetResponseForPrompt("listener test", &router.GenerateResponse{
+		Model: "gemini-2.5-flash",
+		Text:  "Task completed",
+	})
+
+	engine := NewGeminiAgentEngine(aiRouter, executor, approvalMgr)
+
+	var listener2Val string
+
+	// Listener 1 mutates event data
+	engine.SubscribeEvents("listener-1", func(evt TaskEvent) {
+		if evt.Data != nil {
+			evt.Data["workspace_id"] = "MUTATED_BY_LISTENER_1"
+		}
+	})
+
+	// Listener 2 observes event data
+	engine.SubscribeEvents("listener-2", func(evt TaskEvent) {
+		if evt.Data != nil && evt.Type == EventTaskStarted {
+			if val, ok := evt.Data["workspace_id"].(string); ok {
+				listener2Val = val
+			}
+		}
+	})
+
+	task, _ := engine.CreateTask(tempDir, "listener test", "gemini-2.5-flash")
+	_ = engine.RunTask(context.Background(), task.ID, "")
+
+	// Verify Listener 2 received original unmutated workspace_id
+	if listener2Val == "MUTATED_BY_LISTENER_1" {
+		t.Errorf("Mutation leak! Listener 1 mutated event data observed by Listener 2")
+	}
+
+	// Verify stored task events remain unmutated
+	snap, _ := engine.GetTask(task.ID)
+	if len(snap.Events) > 0 && snap.Events[0].Data != nil {
+		if snap.Events[0].Data["workspace_id"] == "MUTATED_BY_LISTENER_1" {
+			t.Errorf("Mutation leak! Listener 1 mutated stored task event data")
+		}
 	}
 }
