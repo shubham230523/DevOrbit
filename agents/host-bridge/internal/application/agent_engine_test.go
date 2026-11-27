@@ -1458,6 +1458,27 @@ func TestAgentEngine_ProductionPathTaskFailedAndCancelledEventFailure(t *testing
 	}
 }
 
+func mustRecv(t *testing.T, ch <-chan struct{}, label string) {
+	t.Helper()
+	select {
+	case <-ch:
+		// Success
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Timeout waiting on channel receive: %s", label)
+	}
+}
+
+func mustRecvErr(t *testing.T, ch <-chan error, label string) error {
+	t.Helper()
+	select {
+	case err := <-ch:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Timeout waiting on error channel receive: %s", label)
+		return nil
+	}
+}
+
 func TestAgentEngine_CancellationPublicationCoordination(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "devorbit_coord_cancellation_*")
 	if err != nil {
@@ -1510,8 +1531,8 @@ func TestAgentEngine_CancellationPublicationCoordination(t *testing.T) {
 		runErrChanA <- engineA.RunTask(context.Background(), taskA.ID, "")
 	}()
 
-	// Wait until RunTask is actively executing inside AI generation
-	<-genEnteredA
+	// Wait boundedly until RunTask is actively executing inside AI generation
+	mustRecv(t, genEnteredA, "genEnteredA")
 
 	// Goroutine 1 calls CancelTaskWithError while RunTask is running
 	cancelErrChanA := make(chan error, 1)
@@ -1520,20 +1541,20 @@ func TestAgentEngine_CancellationPublicationCoordination(t *testing.T) {
 		cancelErrChanA <- cErr
 	}()
 
-	// Wait for CancelTaskWithError to enter the EventTaskCancelled event hook and block on pubBlockA
-	<-pubEnteredA
+	// Wait boundedly for CancelTaskWithError to enter the EventTaskCancelled event hook and block on pubBlockA
+	mustRecv(t, pubEnteredA, "pubEnteredA")
 
 	// Unblock AI generation in RunTask -> RunTask observes context cancellation
 	close(genBlockA)
 
-	// RunTask enters emitCancellationEvent, sees cancellationState == cancellationInProgress, and enters waiter hook
-	<-waiterEnteredA
+	// Wait boundedly for RunTask to enter emitCancellationEvent, see cancellationState == cancellationInProgress, and enter waiter hook
+	mustRecv(t, waiterEnteredA, "waiterEnteredA")
 
 	// Unblock publication in event hook
 	close(pubBlockA)
 
-	runErrA := <-runErrChanA
-	cancelErrA := <-cancelErrChanA
+	runErrA := mustRecvErr(t, runErrChanA, "runErrChanA")
+	cancelErrA := mustRecvErr(t, cancelErrChanA, "cancelErrChanA")
 
 	// Both callers MUST receive errors wrapping ErrUnsupportedValueType
 	if runErrA == nil || !errors.Is(runErrA, ErrUnsupportedValueType) {
@@ -1593,7 +1614,7 @@ func TestAgentEngine_CancellationPublicationCoordination(t *testing.T) {
 		runErrChanB <- engineB.RunTask(context.Background(), taskB.ID, "")
 	}()
 
-	<-genEnteredB
+	mustRecv(t, genEnteredB, "genEnteredB")
 
 	cancelErrChanB := make(chan error, 1)
 	go func() {
@@ -1601,13 +1622,13 @@ func TestAgentEngine_CancellationPublicationCoordination(t *testing.T) {
 		cancelErrChanB <- cErr
 	}()
 
-	<-pubEnteredB
+	mustRecv(t, pubEnteredB, "pubEnteredB")
 	close(genBlockB)
-	<-waiterEnteredB
+	mustRecv(t, waiterEnteredB, "waiterEnteredB")
 	close(pubBlockB)
 
-	runErrB := <-runErrChanB
-	cancelErrB := <-cancelErrChanB
+	runErrB := mustRecvErr(t, runErrChanB, "runErrChanB")
+	cancelErrB := mustRecvErr(t, cancelErrChanB, "cancelErrChanB")
 
 	if cancelErrB != nil {
 		t.Errorf("Expected CancelTaskWithError to succeed with nil error, got: %v", cancelErrB)
