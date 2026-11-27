@@ -380,6 +380,7 @@ func (e *GeminiAgentEngine) UnsubscribeEvents(id string) {
 func (e *GeminiAgentEngine) emitEvent(task *AgentTask, evtType EventType, msg string, data map[string]any) error {
 	dataCopy, err := validateAndCopyMap(data)
 	if err != nil {
+		log.Printf("[AgentEngine] Payload validation error for event '%s': %v", evtType, err)
 		return fmt.Errorf("cannot emit event '%s': %w", evtType, err)
 	}
 
@@ -404,7 +405,11 @@ func (e *GeminiAgentEngine) emitEvent(task *AgentTask, evtType EventType, msg st
 	e.mu.RUnlock()
 
 	for _, l := range listeners {
-		listenerDataCopy, _ := validateAndCopyMap(evt.Data)
+		listenerDataCopy, err := validateAndCopyMap(evt.Data)
+		if err != nil {
+			log.Printf("[AgentEngine] Listener payload copy warning for event '%s': %v", evtType, err)
+			continue
+		}
 		l(TaskEvent{
 			TaskID:    evt.TaskID,
 			Type:      evt.Type,
@@ -507,10 +512,12 @@ func (e *GeminiAgentEngine) executePendingTurn(ctx context.Context, task *AgentT
 		}
 		task.mu.Unlock()
 
-		_ = e.emitEvent(task, EventToolExecutionStarted, fmt.Sprintf("Executing tool '%s' (%d/%d)", callCopy.Name, i+1, len(pt.CallStates)), map[string]any{
+		if err := e.emitEvent(task, EventToolExecutionStarted, fmt.Sprintf("Executing tool '%s' (%d/%d)", callCopy.Name, i+1, len(pt.CallStates)), map[string]any{
 			"tool": callCopy.Name,
 			"args": callCopy.Arguments,
-		})
+		}); err != nil {
+			log.Printf("[AgentEngine] Event emission warning: %v", err)
+		}
 
 		// Execute tool outside task mutex
 		resMap, proposal, err := e.toolExecutor.ExecuteTool(ctx, task.ID, task.WorkspaceID, &callCopy, tok)
@@ -523,9 +530,11 @@ func (e *GeminiAgentEngine) executePendingTurn(ctx context.Context, task *AgentT
 				task.ApprovalToken = proposal.Token
 				task.mu.Unlock()
 
-				_ = e.emitEvent(task, EventApprovalRequired, fmt.Sprintf("Tool '%s' requires user approval", callCopy.Name), map[string]any{
+				if errEvt := e.emitEvent(task, EventApprovalRequired, fmt.Sprintf("Tool '%s' requires user approval", callCopy.Name), map[string]any{
 					"proposal": proposal,
-				})
+				}); errEvt != nil {
+					log.Printf("[AgentEngine] Event emission warning: %v", errEvt)
+				}
 				return false, nil // Paused for approval
 			}
 
@@ -549,10 +558,12 @@ func (e *GeminiAgentEngine) executePendingTurn(ctx context.Context, task *AgentT
 		cs.PendingToken = ""
 		task.mu.Unlock()
 
-		_ = e.emitEvent(task, EventToolExecutionCompleted, fmt.Sprintf("Tool '%s' completed", callCopy.Name), map[string]any{
+		if errEvt := e.emitEvent(task, EventToolExecutionCompleted, fmt.Sprintf("Tool '%s' completed", callCopy.Name), map[string]any{
 			"tool":   callCopy.Name,
 			"result": resMap,
-		})
+		}); errEvt != nil {
+			log.Printf("[AgentEngine] Event emission warning: %v", errEvt)
+		}
 
 		// Reset approvalToken after consumption so subsequent unexecuted calls require their own token
 		approvalToken = ""
@@ -627,10 +638,12 @@ func (e *GeminiAgentEngine) runTaskInternal(ctx context.Context, taskID string, 
 		cancel()
 	}()
 
-	_ = e.emitEvent(task, EventTaskStarted, fmt.Sprintf("Task '%s' started", taskID), map[string]any{
+	if errEvt := e.emitEvent(task, EventTaskStarted, fmt.Sprintf("Task '%s' started", taskID), map[string]any{
 		"workspace_id": task.WorkspaceID,
 		"model_id":     task.ModelID,
-	})
+	}); errEvt != nil {
+		log.Printf("[AgentEngine] Event emission warning: %v", errEvt)
+	}
 
 	tools := router.GetStageCToolDeclarations()
 	maxTurns := 15
@@ -654,12 +667,16 @@ func (e *GeminiAgentEngine) runTaskInternal(ctx context.Context, taskID string, 
 				task.Status = "cancelled"
 			}
 			task.mu.Unlock()
-			_ = e.emitEvent(task, EventTaskCancelled, "Task cancelled or timed out", nil)
+			if errEvt := e.emitEvent(task, EventTaskCancelled, "Task cancelled or timed out", nil); errEvt != nil {
+				log.Printf("[AgentEngine] Event emission warning: %v", errEvt)
+			}
 			return taskCtx.Err()
 		default:
 		}
 
-		_ = e.emitEvent(task, EventGeminiProcessing, fmt.Sprintf("Turn %d: Consulting Gemini model %s", turn, task.ModelID), nil)
+		if errEvt := e.emitEvent(task, EventGeminiProcessing, fmt.Sprintf("Turn %d: Consulting Gemini model %s", turn, task.ModelID), nil); errEvt != nil {
+			log.Printf("[AgentEngine] Event emission warning: %v", errEvt)
+		}
 
 		task.mu.Lock()
 		messagesCopy := make([]router.Message, len(task.Messages))
@@ -678,7 +695,9 @@ func (e *GeminiAgentEngine) runTaskInternal(ctx context.Context, taskID string, 
 			task.Status = "failed"
 			task.ErrorText = err.Error()
 			task.mu.Unlock()
-			_ = e.emitEvent(task, EventTaskFailed, fmt.Sprintf("Gemini generation failed: %v", err), map[string]any{"error": err.Error()})
+			if errEvt := e.emitEvent(task, EventTaskFailed, fmt.Sprintf("Gemini generation failed: %v", err), map[string]any{"error": err.Error()}); errEvt != nil {
+				log.Printf("[AgentEngine] Event emission warning: %v", errEvt)
+			}
 			return err
 		}
 
@@ -692,15 +711,19 @@ func (e *GeminiAgentEngine) runTaskInternal(ctx context.Context, taskID string, 
 			})
 			task.mu.Unlock()
 
-			_ = e.emitEvent(task, EventTaskCompleted, "Task completed successfully", map[string]any{
+			if errEvt := e.emitEvent(task, EventTaskCompleted, "Task completed successfully", map[string]any{
 				"result_text": genResp.Text,
-			})
+			}); errEvt != nil {
+				log.Printf("[AgentEngine] Event emission warning: %v", errEvt)
+			}
 			return nil
 		}
 
-		_ = e.emitEvent(task, EventToolRequested, fmt.Sprintf("Gemini requested %d tool calls", len(genResp.FunctionCalls)), map[string]any{
+		if errEvt := e.emitEvent(task, EventToolRequested, fmt.Sprintf("Gemini requested %d tool calls", len(genResp.FunctionCalls)), map[string]any{
 			"function_calls": genResp.FunctionCalls,
-		})
+		}); errEvt != nil {
+			log.Printf("[AgentEngine] Event emission warning: %v", errEvt)
+		}
 
 		callStates := make([]FunctionCallState, len(genResp.FunctionCalls))
 		for i, fc := range genResp.FunctionCalls {
@@ -743,7 +766,9 @@ func (e *GeminiAgentEngine) CancelTask(taskID string) bool {
 	task.Status = "cancelled"
 	task.mu.Unlock()
 
-	_ = e.emitEvent(task, EventTaskCancelled, fmt.Sprintf("Task '%s' cancelled by user", taskID), nil)
+	if errEvt := e.emitEvent(task, EventTaskCancelled, fmt.Sprintf("Task '%s' cancelled by user", taskID), nil); errEvt != nil {
+		log.Printf("[AgentEngine] Event emission warning: %v", errEvt)
+	}
 	return true
 }
 

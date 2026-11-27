@@ -818,7 +818,7 @@ func TestAgentEngine_StartBarrierCompetingOwnership(t *testing.T) {
 	<-enteredC
 
 	losingErrC := <-resC
-	if losingErrC == nil || (!strings.Contains(losingErrC.Error(), "already running") && !strings.Contains(losingErrC.Error(), "expected 'approval_required'")) {
+	if losingErrC == nil || (!strings.Contains(losingErrC.Error(), "already running") && !errors.Is(losingErrC, ErrApprovalRequired) && !strings.Contains(losingErrC.Error(), "expected 'approval_required'")) {
 		t.Fatalf("Scenario C: expected losing request to be rejected, got: %v", losingErrC)
 	}
 
@@ -1156,5 +1156,77 @@ func TestAgentEngine_EventListenerIsolation(t *testing.T) {
 		if snap.Events[0].Data["workspace_id"] == "MUTATED_BY_LISTENER_1" {
 			t.Errorf("Mutation leak! Listener 1 mutated stored task event data")
 		}
+	}
+}
+
+func TestAgentEngine_RealEventRejection(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "devorbit_event_rejection_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp workspace: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	mockProvider := router.NewMockGeminiProvider()
+	aiRouter := router.NewAIRouter()
+	aiRouter.RegisterProvider("Gemini API", mockProvider)
+
+	approvalMgr := NewApprovalManager()
+	engine := NewGeminiAgentEngine(aiRouter, nil, approvalMgr)
+
+	task, _ := engine.CreateTask(tempDir, "rejection test", "gemini-2.5-flash")
+
+	receivedEvents := 0
+	engine.SubscribeEvents("listener-test", func(evt TaskEvent) {
+		receivedEvents++
+	})
+
+	dummyChan := make(chan int)
+
+	// 1. Attempt emitting invalid event with unsupported channel type -> MUST return ErrUnsupportedValueType
+	err = engine.emitEvent(task, EventTaskStarted, "invalid event", map[string]any{
+		"bad_key": dummyChan,
+	})
+
+	if err == nil || !errors.Is(err, ErrUnsupportedValueType) {
+		t.Fatalf("Expected ErrUnsupportedValueType for event payload with channel, got: %v", err)
+	}
+
+	// Verify invalid event was NOT stored in task.Events
+	snap0, _ := engine.GetTask(task.ID)
+	if len(snap0.Events) != 0 {
+		t.Errorf("Invalid event was incorrectly appended to task.Events: %v", snap0.Events)
+	}
+
+	// Verify listener was NOT invoked for invalid event
+	if receivedEvents != 0 {
+		t.Errorf("Listener was incorrectly invoked for invalid event")
+	}
+
+	// 2. Emit valid event with nested map
+	inputData := map[string]any{
+		"workspace_id": "ws-valid",
+		"nested": map[string]any{
+			"key": "orig_val",
+		},
+	}
+
+	err = engine.emitEvent(task, EventTaskStarted, "valid event", inputData)
+	if err != nil {
+		t.Fatalf("Failed to emit valid event: %v", err)
+	}
+
+	// Caller mutates input map AFTER emission
+	inputData["workspace_id"] = "MUTATED_BY_CALLER"
+	inputData["nested"].(map[string]any)["key"] = "MUTATED_BY_CALLER"
+
+	// Verify stored task event remained UNMUTATED by caller
+	snap1, _ := engine.GetTask(task.ID)
+	if len(snap1.Events) != 1 {
+		t.Fatalf("Expected 1 stored event, got: %d", len(snap1.Events))
+	}
+
+	storedData := snap1.Events[0].Data
+	if storedData["workspace_id"] == "MUTATED_BY_CALLER" || storedData["nested"].(map[string]any)["key"] == "MUTATED_BY_CALLER" {
+		t.Errorf("Caller map mutation leaked into stored task event: %v", storedData)
 	}
 }
