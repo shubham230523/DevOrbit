@@ -590,8 +590,133 @@ func TestAgentEngine_AdversarialAuthorizationAndMultiplePauseResumes(t *testing.
 	}
 }
 
-func TestAgentEngine_AtomicExecutionOwnershipAndConcurrentReaders(t *testing.T) {
-	tempDir, err := os.MkdirTemp("", "devorbit_atomic_ownership_*")
+type BlockingAIProvider struct {
+	router.Provider
+	enteredChan chan struct{}
+	blockChan   chan struct{}
+}
+
+func (p *BlockingAIProvider) Name() string { return "Gemini API" }
+func (p *BlockingAIProvider) DefaultModel() string { return "gemini-2.5-flash" }
+func (p *BlockingAIProvider) Generate(ctx context.Context, req router.GenerateRequest) (*router.GenerateResponse, error) {
+	if p.enteredChan != nil {
+		select {
+		case p.enteredChan <- struct{}{}:
+		default:
+		}
+	}
+	if p.blockChan != nil {
+		select {
+		case <-p.blockChan:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return &router.GenerateResponse{
+		Model: req.Model,
+		Text:  "blocking completion finished",
+	}, nil
+}
+
+func TestAgentEngine_DeterministicBlockingConcurrentOwnership(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "devorbit_blocking_ownership_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp workspace: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	jail := security.NewWorkspaceJail([]string{tempDir})
+	policy := security.NewDefaultCommandPolicy()
+
+	storage := filesystem.NewStorageEngine(jail, 10*1024*1024)
+	procRunner := process.NewProcessRunner(policy, jail)
+	gitClient := git.NewGitClient(jail)
+	adbClient := adb.NewADBClient("adb")
+
+	wsSvc := NewWorkspaceService(jail)
+	fsSvc := NewFilesystemService(storage)
+	psSvc := NewProcessService(procRunner)
+	gsSvc := NewGitService(gitClient)
+	dsSvc := NewDeviceService(adbClient)
+
+	approvalMgr := NewApprovalManager()
+	executor := NewAgentToolExecutor(wsSvc, fsSvc, psSvc, gsSvc, dsSvc, approvalMgr)
+
+	enteredChan := make(chan struct{}, 1)
+	blockChan := make(chan struct{})
+	blockingProv := &BlockingAIProvider{enteredChan: enteredChan, blockChan: blockChan}
+
+	aiRouter := router.NewAIRouter()
+	aiRouter.RegisterProvider("Gemini API", blockingProv)
+
+	engine := NewGeminiAgentEngine(aiRouter, executor, approvalMgr)
+
+	task, err := engine.CreateTask(tempDir, "blocking task test", "gemini-2.5-flash")
+	if err != nil {
+		t.Fatalf("Failed to create task: %v", err)
+	}
+
+	// 1. Goroutine 0 starts RunTask and enters AI generation
+	go0Done := make(chan error, 1)
+	go func() {
+		go0Done <- engine.RunTask(context.Background(), task.ID, "")
+	}()
+
+	// Wait deterministically for Goroutine 0 to acquire execution ownership and enter AI generation
+	<-enteredChan
+
+	// 2. Goroutines 1..5 call RunTask simultaneously -> MUST ALL receive "task is already running"
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	alreadyRunningErrs := 0
+
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rErr := engine.RunTask(context.Background(), task.ID, "")
+			if rErr != nil && rErr.Error() == "task is already running" {
+				mu.Lock()
+				alreadyRunningErrs++
+				mu.Unlock()
+			}
+		}()
+	}
+
+	// 3. Goroutines 6..10 call ResumeTaskWithApproval simultaneously -> MUST ALL receive "task is already running"
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resErr := engine.ResumeTaskWithApproval(context.Background(), task.ID, "appr-dummy")
+			if resErr != nil && resErr.Error() == "task is already running" {
+				mu.Lock()
+				alreadyRunningErrs++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+
+	if alreadyRunningErrs != 10 {
+		t.Errorf("Expected 10 'task is already running' errors while task was executing, got: %d", alreadyRunningErrs)
+	}
+
+	// Unblock Goroutine 0
+	close(blockChan)
+	go0Err := <-go0Done
+	if go0Err != nil {
+		t.Fatalf("Goroutine 0 RunTask failed: %v", go0Err)
+	}
+
+	taskFinal, _ := engine.GetTask(task.ID)
+	if taskFinal.Status != "completed" {
+		t.Errorf("Expected task status 'completed', got: %s", taskFinal.Status)
+	}
+}
+
+func TestAgentEngine_DeepSnapshotIsolationAndMutationImmunity(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "devorbit_snapshot_isolation_*")
 	if err != nil {
 		t.Fatalf("Failed to create temp workspace: %v", err)
 	}
@@ -618,72 +743,47 @@ func TestAgentEngine_AtomicExecutionOwnershipAndConcurrentReaders(t *testing.T) 
 	aiRouter := router.NewAIRouter()
 	aiRouter.RegisterProvider("Gemini API", mockProvider)
 
-	mockProvider.SetResponseForPrompt("concurrent ownership test", &router.GenerateResponse{
+	mockProvider.SetResponseForPrompt("snapshot test", &router.GenerateResponse{
 		Model: "gemini-2.5-flash",
-		Text:  "Task completed",
+		Text:  "",
+		FunctionCalls: []router.FunctionCall{
+			{
+				Name: router.ToolCreateFile,
+				Arguments: map[string]any{
+					"path":    "orig.txt",
+					"content": "orig content",
+				},
+			},
+		},
 	})
 
 	engine := NewGeminiAgentEngine(aiRouter, executor, approvalMgr)
 
-	task, err := engine.CreateTask(tempDir, "concurrent ownership test", "gemini-2.5-flash")
-	if err != nil {
-		t.Fatalf("Failed to create task: %v", err)
+	task, _ := engine.CreateTask(tempDir, "snapshot test", "gemini-2.5-flash")
+	_ = engine.RunTask(context.Background(), task.ID, "")
+
+	// Obtain snapshot
+	snap, found := engine.GetTask(task.ID)
+	if !found || snap == nil || snap.PendingTurn == nil {
+		t.Fatalf("Failed to obtain snapshot with PendingTurn")
 	}
 
-	// 1. Concurrent direct RunTask calls -> Exactly 1 succeeds, other returns "task is already running"
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	alreadyRunningErrs := 0
+	// Mutate nested snapshot data structures aggressively
+	snap.Events[0].Data["workspace_id"] = "MUTATED_WORKSPACE"
+	snap.PendingTurn.TurnResponse.FunctionCalls[0].Arguments["path"] = "MUTATED_PATH"
+	snap.PendingTurn.CallStates[0].FunctionCall.Arguments["content"] = "MUTATED_CONTENT"
 
-	// Set executing = true to simulate an active execution
-	task.mu.Lock()
-	task.executing = true
-	task.mu.Unlock()
+	// Fetch fresh snapshot from live task
+	snapFresh, _ := engine.GetTask(task.ID)
 
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			rErr := engine.RunTask(context.Background(), task.ID, "")
-			mu.Lock()
-			if rErr != nil && rErr.Error() == "task is already running" {
-				alreadyRunningErrs++
-			}
-			mu.Unlock()
-		}()
+	// Verify original live task state remains completely unmutated
+	if snapFresh.Events[0].Data["workspace_id"] == "MUTATED_WORKSPACE" {
+		t.Errorf("Mutation leak! Event Data map was mutated via snapshot")
 	}
-	wg.Wait()
-
-	if alreadyRunningErrs != 10 {
-		t.Errorf("Expected 10 'task is already running' errors while executing = true, got: %d", alreadyRunningErrs)
+	if snapFresh.PendingTurn.TurnResponse.FunctionCalls[0].Arguments["path"] == "MUTATED_PATH" {
+		t.Errorf("Mutation leak! FunctionCall arguments map was mutated via snapshot")
 	}
-
-	// Release executing ownership
-	task.mu.Lock()
-	task.executing = false
-	task.mu.Unlock()
-
-	// Direct RunTask now succeeds
-	err = engine.RunTask(context.Background(), task.ID, "")
-	if err != nil {
-		t.Errorf("Expected RunTask to succeed after releasing executing ownership, got: %v", err)
+	if snapFresh.PendingTurn.CallStates[0].FunctionCall.Arguments["content"] == "MUTATED_CONTENT" {
+		t.Errorf("Mutation leak! CallState FunctionCall arguments map was mutated via snapshot")
 	}
-
-	// 2. Concurrent task readers during task execution do not observe data races or corrupted snapshots
-	task2, _ := engine.CreateTask(tempDir, "concurrent ownership test", "gemini-2.5-flash")
-
-	readerDone := make(chan bool)
-	go func() {
-		for i := 0; i < 100; i++ {
-			snap, ok := engine.GetTask(task2.ID)
-			if ok && snap != nil {
-				_ = snap.Status
-				_ = snap.PendingTurn
-			}
-		}
-		readerDone <- true
-	}()
-
-	_ = engine.RunTask(context.Background(), task2.ID, "")
-	<-readerDone
 }

@@ -67,38 +67,138 @@ type AgentTask struct {
 	cancelFn      context.CancelFunc
 }
 
+func deepCopyMap(m map[string]any) map[string]any {
+	if m == nil {
+		return nil
+	}
+	cp := make(map[string]any, len(m))
+	for k, v := range m {
+		cp[k] = deepCopyValue(v)
+	}
+	return cp
+}
+
+func deepCopyValue(v any) any {
+	if v == nil {
+		return nil
+	}
+	switch val := v.(type) {
+	case map[string]any:
+		return deepCopyMap(val)
+	case []any:
+		cp := make([]any, len(val))
+		for i, elem := range val {
+			cp[i] = deepCopyValue(elem)
+		}
+		return cp
+	case []string:
+		return append([]string(nil), val...)
+	default:
+		return v
+	}
+}
+
+func deepCopyFunctionCall(fc router.FunctionCall) router.FunctionCall {
+	return router.FunctionCall{
+		Name:      fc.Name,
+		Arguments: deepCopyMap(fc.Arguments),
+	}
+}
+
+func deepCopyFunctionCalls(fcs []router.FunctionCall) []router.FunctionCall {
+	if fcs == nil {
+		return nil
+	}
+	cp := make([]router.FunctionCall, len(fcs))
+	for i, fc := range fcs {
+		cp[i] = deepCopyFunctionCall(fc)
+	}
+	return cp
+}
+
+func deepCopyFunctionResponse(fr router.FunctionResponse) router.FunctionResponse {
+	return router.FunctionResponse{
+		Name:     fr.Name,
+		Response: deepCopyMap(fr.Response),
+	}
+}
+
+func deepCopyFunctionResponses(frs []router.FunctionResponse) []router.FunctionResponse {
+	if frs == nil {
+		return nil
+	}
+	cp := make([]router.FunctionResponse, len(frs))
+	for i, fr := range frs {
+		cp[i] = deepCopyFunctionResponse(fr)
+	}
+	return cp
+}
+
+func deepCopyMessages(msgs []router.Message) []router.Message {
+	if msgs == nil {
+		return nil
+	}
+	cp := make([]router.Message, len(msgs))
+	for i, msg := range msgs {
+		cp[i] = router.Message{
+			Role:              msg.Role,
+			Content:           msg.Content,
+			FunctionCalls:     deepCopyFunctionCalls(msg.FunctionCalls),
+			FunctionResponses: deepCopyFunctionResponses(msg.FunctionResponses),
+		}
+	}
+	return cp
+}
+
+func deepCopyEvents(evts []TaskEvent) []TaskEvent {
+	if evts == nil {
+		return nil
+	}
+	cp := make([]TaskEvent, len(evts))
+	for i, evt := range evts {
+		cp[i] = TaskEvent{
+			TaskID:    evt.TaskID,
+			Type:      evt.Type,
+			Message:   evt.Message,
+			Data:      deepCopyMap(evt.Data),
+			Timestamp: evt.Timestamp,
+		}
+	}
+	return cp
+}
+
+// Snapshot returns a thread-safe deep copy of the AgentTask and all its nested mutable data structures.
+// Ownership & Synchronization Rules:
+// 1. All live task state updates MUST acquire t.mu.Lock().
+// 2. External calls (AI model generation, tool execution) MUST NOT hold t.mu.
+// 3. Callers receiving a Snapshot cannot mutate internal live task state.
 func (t *AgentTask) Snapshot() *AgentTask {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	messagesCopy := make([]router.Message, len(t.Messages))
-	copy(messagesCopy, t.Messages)
-
-	eventsCopy := make([]TaskEvent, len(t.Events))
-	copy(eventsCopy, t.Events)
+	messagesCopy := deepCopyMessages(t.Messages)
+	eventsCopy := deepCopyEvents(t.Events)
 
 	var pendingCopy *PendingTurnState
 	if t.PendingTurn != nil {
 		callStatesCopy := make([]FunctionCallState, len(t.PendingTurn.CallStates))
 		for i, cs := range t.PendingTurn.CallStates {
-			var respCopy map[string]any
-			if cs.Response != nil {
-				respCopy = make(map[string]any, len(cs.Response))
-				for k, v := range cs.Response {
-					respCopy[k] = v
-				}
-			}
 			callStatesCopy[i] = FunctionCallState{
 				Index:        cs.Index,
-				FunctionCall: cs.FunctionCall,
+				FunctionCall: deepCopyFunctionCall(cs.FunctionCall),
 				Executed:     cs.Executed,
-				Response:     respCopy,
+				Response:     deepCopyMap(cs.Response),
 				PendingToken: cs.PendingToken,
 			}
 		}
 		pendingCopy = &PendingTurnState{
-			TurnResponse: t.PendingTurn.TurnResponse,
-			CallStates:   callStatesCopy,
+			TurnResponse: router.GenerateResponse{
+				Model:         t.PendingTurn.TurnResponse.Model,
+				Text:          t.PendingTurn.TurnResponse.Text,
+				FinishReason:  t.PendingTurn.TurnResponse.FinishReason,
+				FunctionCalls: deepCopyFunctionCalls(t.PendingTurn.TurnResponse.FunctionCalls),
+			},
+			CallStates: callStatesCopy,
 		}
 	}
 
