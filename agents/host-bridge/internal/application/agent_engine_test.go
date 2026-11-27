@@ -1278,3 +1278,37 @@ func TestAgentEngine_RealEventRejection(t *testing.T) {
 		t.Errorf("Caller map mutation leaked into stored task event: %v", storedData)
 	}
 }
+
+func TestAgentEngine_RequiredEventFailurePolicy(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "devorbit_required_event_policy_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp workspace: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	mockProvider := router.NewMockGeminiProvider()
+	aiRouter := router.NewAIRouter()
+	aiRouter.RegisterProvider("Gemini API", mockProvider)
+
+	approvalMgr := NewApprovalManager()
+	engine := NewGeminiAgentEngine(aiRouter, nil, approvalMgr)
+
+	task, _ := engine.CreateTask(tempDir, "policy test", "gemini-2.5-flash")
+
+	dummyChan := make(chan int)
+	badData := map[string]any{
+		"proposal": dummyChan,
+	}
+
+	// Class B Required Event Emission Failure -> MUST return ErrUnsupportedValueType and NOT store event
+	err = engine.emitEvent(task, EventApprovalRequired, "requires approval", badData)
+	if err == nil || !errors.Is(err, ErrUnsupportedValueType) {
+		t.Errorf("Expected EventApprovalRequired with channel payload to fail with ErrUnsupportedValueType, got: %v", err)
+	}
+
+	// Verify task.Events did NOT record the failing Class B event
+	snap, _ := engine.GetTask(task.ID)
+	if len(snap.Events) != 0 {
+		t.Errorf("Expected 0 events recorded for failed Class B event emission, got: %d", len(snap.Events))
+	}
+}

@@ -533,7 +533,13 @@ func (e *GeminiAgentEngine) executePendingTurn(ctx context.Context, task *AgentT
 				if errEvt := e.emitEvent(task, EventApprovalRequired, fmt.Sprintf("Tool '%s' requires user approval", callCopy.Name), map[string]any{
 					"proposal": proposal,
 				}); errEvt != nil {
-					log.Printf("[AgentEngine] Event emission warning: %v", errEvt)
+					log.Printf("[AgentEngine] Critical: Failed to emit EventApprovalRequired for tool '%s': %v", callCopy.Name, errEvt)
+					task.mu.Lock()
+					task.Status = "failed"
+					task.ErrorText = fmt.Sprintf("failed to emit EventApprovalRequired for tool '%s': %v", callCopy.Name, errEvt)
+					task.ApprovalToken = ""
+					task.mu.Unlock()
+					return false, fmt.Errorf("failed to emit EventApprovalRequired for tool '%s': %w", callCopy.Name, errEvt)
 				}
 				return false, nil // Paused for approval
 			}
@@ -714,7 +720,12 @@ func (e *GeminiAgentEngine) runTaskInternal(ctx context.Context, taskID string, 
 			if errEvt := e.emitEvent(task, EventTaskCompleted, "Task completed successfully", map[string]any{
 				"result_text": genResp.Text,
 			}); errEvt != nil {
-				log.Printf("[AgentEngine] Event emission warning: %v", errEvt)
+				log.Printf("[AgentEngine] Critical: Failed to emit EventTaskCompleted: %v", errEvt)
+				task.mu.Lock()
+				task.Status = "failed"
+				task.ErrorText = fmt.Sprintf("task completed but lifecycle event emission failed: %v", errEvt)
+				task.mu.Unlock()
+				return fmt.Errorf("task completed but lifecycle event emission failed: %w", errEvt)
 			}
 			return nil
 		}
