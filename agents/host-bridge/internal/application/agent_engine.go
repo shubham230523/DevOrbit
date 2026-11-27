@@ -141,6 +141,19 @@ func (e *GeminiAgentEngine) CreateTask(workspaceID, prompt, modelID string) (*Ag
 	}
 
 	e.mu.Lock()
+	if len(e.activeTasks) > 200 {
+		for id, t := range e.activeTasks {
+			t.mu.Lock()
+			st := t.Status
+			t.mu.Unlock()
+			if st == "completed" || st == "failed" || st == "cancelled" {
+				delete(e.activeTasks, id)
+				if len(e.activeTasks) <= 100 {
+					break
+				}
+			}
+		}
+	}
 	e.activeTasks[taskID] = task
 	e.mu.Unlock()
 

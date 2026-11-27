@@ -75,6 +75,16 @@ func (r *ProcessRunner) ExecuteProcess(ctx context.Context, spec *domain.Process
 	}
 
 	r.mu.Lock()
+	if len(r.processes) > 200 {
+		for id, p := range r.processes {
+			if p.info.Status != domain.ProcessStatusRunning {
+				delete(r.processes, id)
+				if len(r.processes) <= 100 {
+					break
+				}
+			}
+		}
+	}
 	r.processes[processID] = ap
 	r.mu.Unlock()
 
