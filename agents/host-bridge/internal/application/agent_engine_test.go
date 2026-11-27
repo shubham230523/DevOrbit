@@ -339,3 +339,114 @@ func TestApprovalManager_ExhaustiveAdversarialBinding(t *testing.T) {
 		t.Errorf("Security flaw! Concurrent consumption permitted %d successes, expected exactly 1", successCount)
 	}
 }
+
+func TestAgentEngine_PendingTurnResumptionState(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "devorbit_pending_turn_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp workspace: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	jail := security.NewWorkspaceJail([]string{tempDir})
+	policy := security.NewDefaultCommandPolicy()
+
+	storage := filesystem.NewStorageEngine(jail, 10*1024*1024)
+	procRunner := process.NewProcessRunner(policy, jail)
+	gitClient := git.NewGitClient(jail)
+	adbClient := adb.NewADBClient("adb")
+
+	wsSvc := NewWorkspaceService(jail)
+	fsSvc := NewFilesystemService(storage)
+	psSvc := NewProcessService(procRunner)
+	gsSvc := NewGitService(gitClient)
+	dsSvc := NewDeviceService(adbClient)
+
+	approvalMgr := NewApprovalManager()
+	executor := NewAgentToolExecutor(wsSvc, fsSvc, psSvc, gsSvc, dsSvc, approvalMgr)
+
+	mockProvider := router.NewMockGeminiProvider()
+	aiRouter := router.NewAIRouter()
+	aiRouter.RegisterProvider("Gemini API", mockProvider)
+
+	_ = os.WriteFile(filepath.Join(tempDir, "existing.txt"), []byte("existing content"), 0644)
+
+	// Mock response with 2 function calls:
+	// Call 0: read_file (read-only -> executes immediately)
+	// Call 1: create_file (mutating -> requires approval)
+	mockProvider.SetResponseForPrompt("multi tool test", &router.GenerateResponse{
+		Model: "gemini-2.5-flash",
+		Text:  "",
+		FunctionCalls: []router.FunctionCall{
+			{
+				Name: router.ToolReadFile,
+				Arguments: map[string]any{
+					"path": "existing.txt",
+				},
+			},
+			{
+				Name: router.ToolCreateFile,
+				Arguments: map[string]any{
+					"path":    "created_by_agent.txt",
+					"content": "hello from agent",
+				},
+			},
+		},
+	})
+
+	engine := NewGeminiAgentEngine(aiRouter, executor, approvalMgr)
+
+	task, err := engine.CreateTask(tempDir, "multi tool test", "gemini-2.5-flash")
+	if err != nil {
+		t.Fatalf("Failed to create task: %v", err)
+	}
+
+	// 1. Initial execution pause on Call 1 (create_file approval required)
+	err = engine.RunTask(context.Background(), task.ID, "")
+	if err != nil {
+		t.Fatalf("RunTask returned unexpected error: %v", err)
+	}
+
+	taskState, _ := engine.GetTask(task.ID)
+	if taskState.Status != "approval_required" || taskState.ApprovalToken == "" {
+		t.Fatalf("Expected status 'approval_required', got: %s", taskState.Status)
+	}
+
+	// Verify Call 0 (read_file) was executed and recorded in CallStates[0]
+	if taskState.PendingTurn == nil || len(taskState.PendingTurn.CallStates) != 2 {
+		t.Fatalf("Expected 2 call states in PendingTurn, got: %v", taskState.PendingTurn)
+	}
+	if !taskState.PendingTurn.CallStates[0].Executed {
+		t.Errorf("Call 0 (read_file) should have been marked Executed = true before pausing")
+	}
+
+	// 2. Test concurrent resume rejection
+	taskState.mu.Lock()
+	taskState.Status = "running"
+	taskState.mu.Unlock()
+	err = engine.ResumeTaskWithApproval(context.Background(), task.ID, taskState.ApprovalToken)
+	if err == nil || err.Error() != "task is already running" {
+		t.Errorf("Expected 'task is already running' error for concurrent resume attempt, got: %v", err)
+	}
+
+	taskState.mu.Lock()
+	taskState.Status = "approval_required"
+	taskState.mu.Unlock()
+
+	// 3. Resume task with valid approval token -> Call 0 MUST NOT be re-executed, Call 1 MUST execute
+	token := taskState.ApprovalToken
+	err = engine.ResumeTaskWithApproval(context.Background(), task.ID, token)
+	if err != nil {
+		t.Fatalf("ResumeTaskWithApproval failed: %v", err)
+	}
+
+	taskFinal, _ := engine.GetTask(task.ID)
+	if taskFinal.Status != "completed" {
+		t.Errorf("Expected final task status 'completed', got: %s", taskFinal.Status)
+	}
+
+	// Verify created_by_agent.txt was created
+	createdData, err := os.ReadFile(filepath.Join(tempDir, "created_by_agent.txt"))
+	if err != nil || string(createdData) != "hello from agent" {
+		t.Errorf("File creation failed during resumed turn execution: %v", err)
+	}
+}

@@ -35,20 +35,33 @@ type TaskEvent struct {
 	Timestamp int64          `json:"timestamp"`
 }
 
+type FunctionCallState struct {
+	Index        int                 `json:"index"`
+	FunctionCall router.FunctionCall `json:"function_call"`
+	Executed     bool                `json:"executed"`
+	Response     map[string]any      `json:"response,omitempty"`
+	PendingToken string              `json:"pending_token,omitempty"`
+}
+
+type PendingTurnState struct {
+	TurnResponse router.GenerateResponse `json:"turn_response"`
+	CallStates   []FunctionCallState     `json:"call_states"`
+}
+
 type AgentTask struct {
-	ID            string                  `json:"id"`
-	WorkspaceID   string                  `json:"workspace_id"`
-	Prompt        string                  `json:"prompt"`
-	ModelID       string                  `json:"model_id"`
-	Status        string                  `json:"status"` // "running", "approval_required", "completed", "failed", "cancelled"
-	Messages      []router.Message        `json:"messages"`
-	Events        []TaskEvent             `json:"events"`
-	PendingTurn   *router.GenerateResponse `json:"pending_turn,omitempty"`
-	ApprovalToken string                  `json:"approval_token,omitempty"`
-	ResultText    string                  `json:"result_text,omitempty"`
-	ErrorText     string                  `json:"error_text,omitempty"`
-	CreatedAt     time.Time               `json:"created_at"`
-	UpdatedAt     time.Time               `json:"updated_at"`
+	ID            string            `json:"id"`
+	WorkspaceID   string            `json:"workspace_id"`
+	Prompt        string            `json:"prompt"`
+	ModelID       string            `json:"model_id"`
+	Status        string            `json:"status"` // "running", "approval_required", "completed", "failed", "cancelled"
+	Messages      []router.Message  `json:"messages"`
+	Events        []TaskEvent       `json:"events"`
+	PendingTurn   *PendingTurnState `json:"pending_turn,omitempty"`
+	ApprovalToken string            `json:"approval_token,omitempty"`
+	ResultText    string            `json:"result_text,omitempty"`
+	ErrorText     string            `json:"error_text,omitempty"`
+	CreatedAt     time.Time         `json:"created_at"`
+	UpdatedAt     time.Time         `json:"updated_at"`
 	mu            sync.Mutex
 	cancelFn      context.CancelFunc
 }
@@ -160,6 +173,85 @@ func (e *GeminiAgentEngine) CreateTask(workspaceID, prompt, modelID string) (*Ag
 	return task, nil
 }
 
+func (e *GeminiAgentEngine) executePendingTurn(ctx context.Context, task *AgentTask, approvalToken string) (bool, error) {
+	task.mu.Lock()
+	pt := task.PendingTurn
+	task.mu.Unlock()
+
+	if pt == nil {
+		return true, nil
+	}
+
+	for i := range pt.CallStates {
+		cs := &pt.CallStates[i]
+		if cs.Executed {
+			continue // Already executed in an earlier attempt
+		}
+
+		tok := ""
+		if approvalToken != "" && (cs.PendingToken == "" || cs.PendingToken == approvalToken) {
+			tok = approvalToken
+		}
+
+		e.emitEvent(task, EventToolExecutionStarted, fmt.Sprintf("Executing tool '%s' (%d/%d)", cs.FunctionCall.Name, i+1, len(pt.CallStates)), map[string]any{
+			"tool": cs.FunctionCall.Name,
+			"args": cs.FunctionCall.Arguments,
+		})
+
+		resMap, proposal, err := e.toolExecutor.ExecuteTool(ctx, task.ID, task.WorkspaceID, &cs.FunctionCall, tok)
+		if err != nil {
+			if errors.Is(err, ErrApprovalRequired) && proposal != nil {
+				cs.PendingToken = proposal.Token
+				task.mu.Lock()
+				task.Status = "approval_required"
+				task.ApprovalToken = proposal.Token
+				task.mu.Unlock()
+
+				e.emitEvent(task, EventApprovalRequired, fmt.Sprintf("Tool '%s' requires user approval", cs.FunctionCall.Name), map[string]any{
+					"proposal": proposal,
+				})
+				return false, nil // Paused for approval
+			}
+
+			log.Printf("Tool '%s' execution error: %v", cs.FunctionCall.Name, err)
+			resMap = map[string]any{"error": err.Error()}
+		}
+
+		cs.Executed = true
+		cs.Response = resMap
+		cs.PendingToken = ""
+
+		e.emitEvent(task, EventToolExecutionCompleted, fmt.Sprintf("Tool '%s' completed", cs.FunctionCall.Name), map[string]any{
+			"tool":   cs.FunctionCall.Name,
+			"result": resMap,
+		})
+	}
+
+	// All calls in pending turn completed! Record turn messages.
+	toolResponses := make([]router.FunctionResponse, len(pt.CallStates))
+	for i, cs := range pt.CallStates {
+		toolResponses[i] = router.FunctionResponse{
+			Name:     cs.FunctionCall.Name,
+			Response: cs.Response,
+		}
+	}
+
+	task.mu.Lock()
+	task.Messages = append(task.Messages, router.Message{
+		Role:          "model",
+		FunctionCalls: pt.TurnResponse.FunctionCalls,
+	})
+	task.Messages = append(task.Messages, router.Message{
+		Role:              "tool",
+		FunctionResponses: toolResponses,
+	})
+	task.PendingTurn = nil
+	task.ApprovalToken = ""
+	task.mu.Unlock()
+
+	return true, nil
+}
+
 func (e *GeminiAgentEngine) RunTask(ctx context.Context, taskID string, approvalToken string) error {
 	e.mu.RLock()
 	task, found := e.activeTasks[taskID]
@@ -183,66 +275,10 @@ func (e *GeminiAgentEngine) RunTask(ctx context.Context, taskID string, approval
 	tools := router.GetStageCToolDeclarations()
 	maxTurns := 15
 
-	task.mu.Lock()
-	pendingTurn := task.PendingTurn
-	task.mu.Unlock()
-
-	if pendingTurn != nil && approvalToken != "" {
-		e.emitEvent(task, EventToolRequested, fmt.Sprintf("Resuming pending turn with approval for %d tool calls", len(pendingTurn.FunctionCalls)), map[string]any{
-			"function_calls": pendingTurn.FunctionCalls,
-		})
-
-		toolResponses := make([]router.FunctionResponse, 0, len(pendingTurn.FunctionCalls))
-		for _, fc := range pendingTurn.FunctionCalls {
-			e.emitEvent(task, EventToolExecutionStarted, fmt.Sprintf("Executing approved tool '%s'", fc.Name), map[string]any{
-				"tool": fc.Name,
-				"args": fc.Arguments,
-			})
-
-			resMap, proposal, err := e.toolExecutor.ExecuteTool(taskCtx, task.ID, task.WorkspaceID, &fc, approvalToken)
-			if err != nil {
-				if errors.Is(err, ErrApprovalRequired) && proposal != nil {
-					task.mu.Lock()
-					task.Status = "approval_required"
-					task.ApprovalToken = proposal.Token
-					task.PendingTurn = pendingTurn
-					task.mu.Unlock()
-
-					e.emitEvent(task, EventApprovalRequired, fmt.Sprintf("Tool '%s' requires user approval", fc.Name), map[string]any{
-						"proposal": proposal,
-					})
-					return nil
-				}
-
-				log.Printf("Approved tool '%s' execution error: %v", fc.Name, err)
-				resMap = map[string]any{"error": err.Error()}
-			}
-
-			e.emitEvent(task, EventToolExecutionCompleted, fmt.Sprintf("Approved tool '%s' completed", fc.Name), map[string]any{
-				"tool":   fc.Name,
-				"result": resMap,
-			})
-
-			toolResponses = append(toolResponses, router.FunctionResponse{
-				Name:     fc.Name,
-				Response: resMap,
-			})
-		}
-
-		task.mu.Lock()
-		task.Messages = append(task.Messages, router.Message{
-			Role:          "model",
-			FunctionCalls: pendingTurn.FunctionCalls,
-		})
-		task.Messages = append(task.Messages, router.Message{
-			Role:              "tool",
-			FunctionResponses: toolResponses,
-		})
-		task.PendingTurn = nil
-		task.ApprovalToken = ""
-		task.mu.Unlock()
-
-		approvalToken = ""
+	// Process pending turn if task was resumed from an approval state
+	completed, err := e.executePendingTurn(taskCtx, task, approvalToken)
+	if err != nil || !completed {
+		return err
 	}
 
 	for turn := 1; turn <= maxTurns; turn++ {
@@ -299,60 +335,52 @@ func (e *GeminiAgentEngine) RunTask(ctx context.Context, taskID string, approval
 			"function_calls": genResp.FunctionCalls,
 		})
 
-		toolResponses := make([]router.FunctionResponse, 0, len(genResp.FunctionCalls))
-
-		for _, fc := range genResp.FunctionCalls {
-			e.emitEvent(task, EventToolExecutionStarted, fmt.Sprintf("Executing tool '%s'", fc.Name), map[string]any{
-				"tool": fc.Name,
-				"args": fc.Arguments,
-			})
-
-			resMap, proposal, err := e.toolExecutor.ExecuteTool(taskCtx, task.ID, task.WorkspaceID, &fc, approvalToken)
-			if err != nil {
-				if errors.Is(err, ErrApprovalRequired) && proposal != nil {
-					task.mu.Lock()
-					task.Status = "approval_required"
-					task.ApprovalToken = proposal.Token
-					task.PendingTurn = genResp
-					task.mu.Unlock()
-
-					e.emitEvent(task, EventApprovalRequired, fmt.Sprintf("Tool '%s' requires user approval", fc.Name), map[string]any{
-						"proposal": proposal,
-					})
-					return nil
-				}
-
-				log.Printf("Tool '%s' execution error: %v", fc.Name, err)
-				resMap = map[string]any{"error": err.Error()}
+		callStates := make([]FunctionCallState, len(genResp.FunctionCalls))
+		for i, fc := range genResp.FunctionCalls {
+			callStates[i] = FunctionCallState{
+				Index:        i,
+				FunctionCall: fc,
+				Executed:     false,
 			}
-
-			e.emitEvent(task, EventToolExecutionCompleted, fmt.Sprintf("Tool '%s' completed", fc.Name), map[string]any{
-				"tool":   fc.Name,
-				"result": resMap,
-			})
-
-			toolResponses = append(toolResponses, router.FunctionResponse{
-				Name:     fc.Name,
-				Response: resMap,
-			})
 		}
 
 		task.mu.Lock()
-		task.Messages = append(task.Messages, router.Message{
-			Role:          "model",
-			FunctionCalls: genResp.FunctionCalls,
-		})
-		task.Messages = append(task.Messages, router.Message{
-			Role:              "tool",
-			FunctionResponses: toolResponses,
-		})
+		task.PendingTurn = &PendingTurnState{
+			TurnResponse: *genResp,
+			CallStates:   callStates,
+		}
 		task.mu.Unlock()
+
+		completed, err := e.executePendingTurn(taskCtx, task, "")
+		if err != nil || !completed {
+			return err
+		}
 	}
 
 	return fmt.Errorf("task exceeded maximum turn count (%d)", maxTurns)
 }
 
 func (e *GeminiAgentEngine) ResumeTaskWithApproval(ctx context.Context, taskID, approvalToken string) error {
+	e.mu.RLock()
+	task, found := e.activeTasks[taskID]
+	e.mu.RUnlock()
+
+	if !found {
+		return fmt.Errorf("task '%s' not found", taskID)
+	}
+
+	task.mu.Lock()
+	if task.Status == "running" {
+		task.mu.Unlock()
+		return errors.New("task is already running")
+	}
+	if task.Status != "approval_required" {
+		task.mu.Unlock()
+		return fmt.Errorf("task status is '%s', expected 'approval_required'", task.Status)
+	}
+	task.Status = "running"
+	task.mu.Unlock()
+
 	return e.RunTask(ctx, taskID, approvalToken)
 }
 
