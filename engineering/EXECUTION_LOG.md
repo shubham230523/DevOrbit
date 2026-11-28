@@ -35,3 +35,13 @@
 - **Baseline:** `7ba545da10f4ec61bf180c70c60960a3af03e5d4` (preserving Master Plan 24 baseline `efee2c99e16427223c803b89460dbe61fd151064`)
 - **Changes Made:** Created `AGENTS.md`, `engineering/PROJECT_CONTEXT.md`, `engineering/CURRENT_STATE.md`, `engineering/ACTIVE_PLAN.md`, `engineering/DECISIONS.md`, `engineering/KNOWN_ISSUES.md`, `engineering/EXECUTION_LOG.md`, `engineering/handoffs/latest-handoff.md`, and `engineering/handoffs/archive/.gitkeep`. Zero application code modified.
 - **Status:** `IN_PROGRESS` (pending commit, push, and remote SHA verification).
+
+---
+
+### Entry 4 — Master Plan 0 Completion & Master Plan 0.1 Continuity State Reconciliation
+- **Supersedes:** Entry 3's preliminary `IN_PROGRESS` status (Master Plan 0 was committed, pushed, and remote-verified at `7aed09683a829f83dd3a6f04cfbba0f6e376bc31`).
+- **Master Plan 0 Commit SHA:** `7aed09683a829f83dd3a6f04cfbba0f6e376bc31`
+- **Master Plan 24 Implementation Commit SHA:** `7ba545da10f4ec61bf180c70c60960a3af03e5d4`
+- **Master Plan 0 Status:** `COMPLETED` (`COMMITTED`, `PUSHED`, `REMOTE-VERIFIED` on `origin/security/atomic-agent-task-execution` and `origin/quality/autonomous-15min-improvement`).
+- **Master Plan 0.1 Changes Made:** Reconciled `CURRENT_STATE.md`, `ACTIVE_PLAN.md`, `EXECUTION_LOG.md`, `KNOWN_ISSUES.md`, and `handoffs/latest-handoff.md` to mark Master Plan 0 completed, remove obsolete MP0 commit/push instructions, record `7aed09683a829f83dd3a6f04cfbba0f6e376bc31` as the verified MP0 commit, preserve `7ba545da10f4ec61bf180c70c60960a3af03e5d4` as MP24's automated implementation commit, and document unresolved `session_store.go` persistence/empty-permission restoration risks and `pairing_client.dart` HTTPS-to-HTTP fallback behavior for independent review. Zero application code or tests modified.
+- **Remaining Work:** Independent review of Master Plan 24 (`7ba545da10f4ec61bf180c70c60960a3af03e5d4`) and live TLS/mobile-to-host validation.
