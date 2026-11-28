@@ -65,3 +65,26 @@
   - `flutter test` -> **PASS** (`+37: All tests passed!`, including 4 new HTTPS fallback regression tests & Go/Dart HTTP Auth MAC vector test).
 - **Phase 4 Live Validation Status:** **BLOCKED** on `Windows NT 10.0.26200.0` (no `caddy`/`nginx`, no trusted CA cert, `adb devices -l` empty).
 - **Stage Status:** Code & automated tests `IMPLEMENTED`, `TESTED`, `REVIEWED`; `PRODUCTION-VALIDATED` remains `BLOCKED`.
+
+---
+
+### Entry 6 — Master Plan 24.1: Revocation Durability & Rollback Failure Closure
+- **Verified Starting HEAD:** `2425cc838c64e7e1e28c67e33c1636d45e5889d7` (confirmed via `git rev-parse HEAD`; both `origin/security/atomic-agent-task-execution` and `origin/quality/autonomous-15min-improvement` matched it; `origin/main` = `c49804547aef7dc1100b8b444ee32695f353e7e6`, untouched).
+- **Working-Tree Reconciliation:** the session start found 10 modified files of unfinished MP24.1 work left uncommitted by a previous session plus one untracked Windows test file. They were inspected against source and Git, corrected, extended, and committed — not discarded.
+- **Code + Test Commit:** `76ca2286523b1978acec1e64723d74ec64cddf2d` (13 files, +1414/−97).
+- **Changes Made (IMPLEMENTED):**
+  - `session_store.go`: `RevokeSession` now writes a durable idempotent tombstone for sessions absent from memory, destroys the sealed secret referenced by persisted state before writing the tombstone, and documents the boolean contract. `saveLocked` merges persisted-only entries (previously it erased every durable session not loaded into memory). `RemoveSession`/`RevokeDevice` also destroy sealed secrets referenced only by persisted state; new helper `persistedSecretRefsLocked` + `readPersistedEntries`.
+  - `secret_store_windows.go`: new `windows-dpapi-file-v2` store writing each DPAPI-sealed secret to an external `0600` per-session file referenced by an opaque 32-hex id, giving a real `Delete()`; unsafe scopes and malformed refs fail closed.
+  - `pairing_handlers.go`/`handlers.go`/`broker_client.go`/`broker_authorizer.go`/`cmd/host-bridge/main.go`: `SessionRevoker` returns errors; revocation errors propagate; HTTP returns `500` on durability failure and `502` on remote failure; rollback revokes the in-memory BrokerClient session, reports rollback failures alongside the original error, and never returns a pairing success after partial provisioning; failed provisioning restores a prior device-revocation tombstone.
+  - `services/connection-broker/internal/broker/broker.go`: added `Broker.RevokeSession(machineID, sessionID)` (deauthorizes the session's client token/expiry, closes tunnels, notifies client) and `HandleRevoke` now uses it for `session_id`-only requests — the existing endpoint is reused, no new endpoint invented.
+- **Tests Added (TESTED):** `TestSessionStore_AbsentSessionRevocationTombstoneAndRollback`, `TestSessionStore_AbsentRevocationDestroysPersistedSealedSecret`, `TestSessionStore_RevocationPreservesUnloadedPersistedSessions`, `TestWindowsDPAPISecretStore_{StoreLoadDeleteAndFailClosed,RevokeAndRollbackBlockStaleFileRecovery,ErrorPropagationAndFailClosed}`, `TestBrokerClient_PersistenceAndRevocationErrorPropagation`, `TestPairingRollbackAndBrokerRevocationErrorPropagation`, `TestBroker_SessionOnlyRevocationIsolatedFromSiblingSessions`.
+- **Verification Commands Executed (after the final code edit):**
+  - `agents\host-bridge`: `go vet ./...` -> **PASS** (exit 0); `go test -count=1 -timeout=180s ./...` -> **PASS** (12/12 packages).
+  - `services\connection-broker`: `go vet ./...` + `go test -count=1 -timeout=120s ./...` -> **PASS** (exit 0).
+  - `services\control-plane`, `agents\ai-router`, `agents\acp-adapter`: `go vet ./...` + `go test ./...` -> **PASS** (exit 0).
+  - `GOOS=linux GOARCH=amd64` & `GOOS=windows GOARCH=amd64` `go build ./...` in `agents\host-bridge` and `services\connection-broker` -> **PASS** (exit 0).
+  - Native Windows DPAPI tests: `go test -run TestWindowsDPAPI -v ./internal/security/` -> **PASS** (3 tests).
+  - `go test -race -count=1 -timeout=300s ./internal/security/...` -> **BLOCKED** (exit 1: `# runtime/cgo` / `cc1.exe: sorry, unimplemented: 64-bit mode not compiled in`; only 32-bit MinGW installed).
+  - `apps/mobile`: `flutter analyze` -> **PASS** (`No issues found!`); `flutter test` -> **PASS** (`+37: All tests passed!`).
+- **Stage Status:** `IMPLEMENTED`, `TESTED`, `REVIEWED`, `COMMITTED` (`76ca2286523b1978acec1e64723d74ec64cddf2d`).
+- **Not Closed:** Master Plan 24 Criterion I (`PRODUCTION-VALIDATED`) and the `-race` suite remain `BLOCKED` on this host; MP24 is **not** declared fully closed or production-ready.
