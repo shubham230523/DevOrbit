@@ -13,15 +13,9 @@ import (
 	"devorbit.net/services/connection-broker/pkg/observability"
 )
 
-// processApprovalTTL bounds how long a Gradle execution authorization stays usable.
+// processApprovalTTL bounds how long a proposal stays undecided and how long an issued execution
+// token stays usable.
 const processApprovalTTL = 10 * time.Minute
-
-// approvalOwnerID binds an approval token to the session and device that requested it. The value is
-// stored in the proposal's TaskID field so the existing, already-hardened approval manager enforces
-// the binding; no new approval store is introduced.
-func approvalOwnerID(sessionID, deviceID string) string {
-	return "process-approval:" + sessionID + ":" + deviceID
-}
 
 // wipeApprovalToken clears the token from the spec so it cannot be logged, echoed, or inherited by
 // the child process environment.
@@ -29,37 +23,34 @@ func wipeApprovalToken(spec *domain.ProcessSpec) {
 	spec.ApprovalToken = ""
 }
 
-// consumeProcessApproval validates and consumes the single-use approval token carried by the spec.
-// It fails closed when no approval manager is configured.
-func (s *Server) consumeProcessApproval(sessionID, deviceID string, spec *domain.ProcessSpec) error {
-	if s.approvalMgr == nil {
-		return errors.New("approval manager not configured")
+// processApprovalStore lazily creates the store. A server without explicit configuration still
+// enforces approvals: the requirement is derived from the shared command policy, never from wiring.
+func (s *Server) processApprovalStore() *application.ProcessApprovalStore {
+	s.approvalStoreMu.Lock()
+	defer s.approvalStoreMu.Unlock()
+	if s.processApprovals == nil {
+		s.processApprovals = application.NewProcessApprovalStore(processApprovalTTL)
 	}
+	return s.processApprovals
+}
+
+// SetProcessApprovalStore replaces the store (used by tests and by main for a shared instance).
+func (s *Server) SetProcessApprovalStore(store *application.ProcessApprovalStore) {
+	s.approvalStoreMu.Lock()
+	defer s.approvalStoreMu.Unlock()
+	s.processApprovals = store
+}
+
+// consumeProcessApproval validates and consumes a single-use execution token issued by a human
+// approval decision. It revalidates the exact workspace, command and argument vector.
+func (s *Server) consumeProcessApproval(sessionID, deviceID string, spec *domain.ProcessSpec) error {
 	if strings.TrimSpace(spec.ApprovalToken) == "" {
 		return application.ErrApprovalRequirementMissing
 	}
-
-	_, err := s.approvalMgr.ConsumeApproval(
-		spec.ApprovalToken,
-		approvalOwnerID(sessionID, deviceID),
-		spec.WorkspaceID,
-		"execute_command",
-		"", "", // no target path / hash for command approvals
-		spec.Command,
-		spec.Args,
-		"", "", // no content fields for command approvals
+	_, err := s.processApprovalStore().Consume(
+		spec.ApprovalToken, sessionID, deviceID, spec.WorkspaceID, spec.Command, spec.Args,
 	)
-	if err != nil {
-		s.securityEvent(observability.LevelWarn, EventProcessApprovalRejected, map[string]any{
-			"command":   spec.Command,
-			"arg_count": len(spec.Args),
-			"workspace": spec.WorkspaceID,
-			"reason":    approvalRejectionReason(err),
-		})
-		s.incrementMetric("devorbit_process_approvals_rejected_total")
-		return err
-	}
-	return nil
+	return err
 }
 
 // approvalRejectionReason maps approval errors to stable, non-sensitive reason codes.
@@ -67,26 +58,53 @@ func approvalRejectionReason(err error) string {
 	switch {
 	case err == nil:
 		return "none"
-	case errors.Is(err, application.ErrApprovalTokenNotFound):
-		return "token_not_found_or_consumed"
-	case errors.Is(err, application.ErrApprovalExpired):
-		return "token_expired"
-	case errors.Is(err, application.ErrApprovalMismatch):
-		return "token_scope_mismatch"
 	case errors.Is(err, application.ErrApprovalRequirementMissing):
 		return "approval_missing"
+	case errors.Is(err, application.ErrProcessApprovalNotFound):
+		return "proposal_not_found"
+	case errors.Is(err, application.ErrProcessApprovalNotPending):
+		return "proposal_already_decided"
+	case errors.Is(err, application.ErrProcessApprovalExpired):
+		return "proposal_expired"
+	case errors.Is(err, application.ErrProcessApprovalOwner):
+		return "owner_mismatch"
+	case errors.Is(err, application.ErrProcessApprovalDigest):
+		return "digest_mismatch"
+	case errors.Is(err, application.ErrProcessApprovalScope):
+		return "scope_mismatch"
+	case errors.Is(err, application.ErrProcessApprovalToken):
+		return "token_not_found_or_consumed"
 	default:
 		return "approval_error"
 	}
 }
 
-// HandleCreateProcessApproval issues a single-use authorization for a command that requires an
-// explicit user decision (currently the Gradle family).
+// approvalStatus writes the fail-closed response for a rejected approval operation.
+func (s *Server) approvalStatus(w http.ResponseWriter, err error, command string, argCount int) {
+	status := http.StatusForbidden
+	switch {
+	case errors.Is(err, application.ErrProcessApprovalNotFound), errors.Is(err, application.ErrProcessApprovalToken):
+		status = http.StatusForbidden
+	case errors.Is(err, application.ErrProcessApprovalExpired):
+		status = http.StatusGone
+	case errors.Is(err, application.ErrProcessApprovalNotPending):
+		status = http.StatusConflict
+	}
+
+	s.securityEvent(observability.LevelWarn, EventProcessApprovalRejected, map[string]any{
+		"command":   command,
+		"arg_count": argCount,
+		"reason":    approvalRejectionReason(err),
+	})
+	s.incrementMetric("devorbit_process_approvals_rejected_total")
+	writeError(w, status, "approval_required: "+approvalRejectionReason(err))
+}
+
+// HandleCreateProcessApproval records a PENDING approval request.
 //
-// The proposal is bound to the requesting session+device, the workspace, the exact command and the
-// exact argument vector, expires after processApprovalTTL, and can be consumed once. Because this
-// endpoint requires an authenticated session with process:execute, an AI agent (which has no session)
-// cannot mint an approval to authorize its own command.
+// This endpoint deliberately issues no execution capability: it only tells the Host Bridge that a
+// command is proposed. Separation of request from grant is the property that stops an automated or
+// AI-driven caller from authorizing its own execution.
 func (s *Server) HandleCreateProcessApproval(w http.ResponseWriter, r *http.Request) {
 	authCtx, ok := s.authorizeRequest(w, r, security.PermissionProcessExecute)
 	if !ok {
@@ -94,10 +112,6 @@ func (s *Server) HandleCreateProcessApproval(w http.ResponseWriter, r *http.Requ
 	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if s.approvalMgr == nil {
-		writeError(w, http.StatusServiceUnavailable, "approval manager not configured")
 		return
 	}
 
@@ -116,42 +130,136 @@ func (s *Server) HandleCreateProcessApproval(w http.ResponseWriter, r *http.Requ
 	}
 
 	spec := &domain.ProcessSpec{WorkspaceID: req.WorkspaceID, Command: req.Command, Args: req.Args}
-	required, reason := s.processSvc.RequiresApproval(spec)
+	required, policyReason := s.processSvc.RequiresApproval(spec)
 	if !required {
 		writeError(w, http.StatusBadRequest, "command does not require approval; submit it directly")
 		return
 	}
 
-	proposal, err := s.approvalMgr.CreateProposal(
-		approvalOwnerID(authCtx.SessionID, authCtx.DeviceID),
-		req.WorkspaceID,
-		"execute_command",
-		"", "", "", "",
-		req.Command,
-		req.Args,
-		reason,
-		processApprovalTTL,
+	approval, err := s.processApprovalStore().Create(
+		authCtx.SessionID, authCtx.DeviceID,
+		req.WorkspaceID, req.Command, req.Args, policyReason,
 	)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create approval proposal")
 		return
 	}
 
-	// Audit the authorization request; the token itself must never be logged.
-	s.securityEvent(observability.LevelInfo, EventProcessApprovalIssued, map[string]any{
-		"command":    req.Command,
-		"arg_count":  len(req.Args),
-		"workspace":  req.WorkspaceID,
-		"expires_in": processApprovalTTL.String(),
+	s.securityEvent(observability.LevelInfo, EventProcessApprovalRequested, map[string]any{
+		"approval_id": approval.ID,
+		"command":     approval.Command,
+		"arg_count":   len(approval.Args),
+		"workspace":   approval.WorkspaceID,
+		"expires_at":  approval.ExpiresAt.Format(time.RFC3339),
 	})
-	s.incrementMetric("devorbit_process_approvals_issued_total")
+	s.incrementMetric("devorbit_process_approvals_requested_total")
 
+	// No execution_token: the caller must present this proposal to a human and then decide.
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"approval_id":    approval.ID,
+		"state":          approval.State,
+		"workspace_id":   approval.WorkspaceID,
+		"command":        approval.Command,
+		"args":           approval.Args,
+		"reason":         approval.Reason,
+		"command_digest": approval.Digest,
+		"expires_at":     approval.ExpiresAt.Format(time.RFC3339),
+	})
+}
+
+// HandleProcessApproval handles GET (status) and POST /decision on an existing proposal.
+func (s *Server) HandleProcessApproval(w http.ResponseWriter, r *http.Request) {
+	authCtx, ok := s.authorizeRequest(w, r, security.PermissionProcessExecute)
+	if !ok {
+		return
+	}
+
+	rest := strings.TrimPrefix(r.URL.Path, "/api/v1/processes/approvals/")
+	parts := strings.Split(strings.Trim(rest, "/"), "/")
+	approvalID := parts[0]
+	if approvalID == "" {
+		writeError(w, http.StatusNotFound, "approval id is required")
+		return
+	}
+
+	if len(parts) == 1 && r.Method == http.MethodGet {
+		s.handleGetProcessApproval(w, authCtx, approvalID)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "decision" && r.Method == http.MethodPost {
+		s.handleDecideProcessApproval(w, r, authCtx, approvalID)
+		return
+	}
+	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+}
+
+func (s *Server) handleGetProcessApproval(w http.ResponseWriter, authCtx *AuthenticatedContext, approvalID string) {
+	approval, err := s.processApprovalStore().Get(approvalID, authCtx.SessionID, authCtx.DeviceID)
+	if err != nil {
+		s.approvalStatus(w, err, "", 0)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"approval_token": proposal.Token,
-		"workspace_id":   proposal.WorkspaceID,
-		"command":        proposal.Command,
-		"args":           proposal.Args,
-		"reason":         proposal.Reason,
-		"expires_at":     proposal.ExpiresAt.Format(time.RFC3339),
+		"approval_id":    approval.ID,
+		"state":          approval.State,
+		"workspace_id":   approval.WorkspaceID,
+		"command":        approval.Command,
+		"args":           approval.Args,
+		"reason":         approval.Reason,
+		"command_digest": approval.Digest,
+		"expires_at":     approval.ExpiresAt.Format(time.RFC3339),
+	})
+}
+
+func (s *Server) handleDecideProcessApproval(w http.ResponseWriter, r *http.Request, authCtx *AuthenticatedContext, approvalID string) {
+	var req struct {
+		Decision      string `json:"decision"`
+		CommandDigest string `json:"command_digest"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid decision JSON")
+		return
+	}
+	decision := strings.ToLower(strings.TrimSpace(req.Decision))
+	if decision != "approve" && decision != "reject" {
+		writeError(w, http.StatusBadRequest, "decision must be 'approve' or 'reject'")
+		return
+	}
+
+	approval, err := s.processApprovalStore().Decide(
+		approvalID, authCtx.SessionID, authCtx.DeviceID, decision, req.CommandDigest,
+	)
+	if err != nil {
+		s.approvalStatus(w, err, "", 0)
+		return
+	}
+
+	if decision == "reject" {
+		s.securityEvent(observability.LevelInfo, EventProcessApprovalRejectedDecided, map[string]any{
+			"approval_id": approval.ID,
+			"command":     approval.Command,
+			"workspace":   approval.WorkspaceID,
+		})
+		s.incrementMetric("devorbit_process_approvals_rejected_decided_total")
+		writeJSON(w, http.StatusOK, map[string]any{
+			"approval_id": approval.ID,
+			"state":       approval.State,
+		})
+		return
+	}
+
+	// Approval recorded: the execution token is returned exactly once, to the deciding owner.
+	s.securityEvent(observability.LevelInfo, EventProcessApprovalApproved, map[string]any{
+		"approval_id": approval.ID,
+		"command":     approval.Command,
+		"arg_count":   len(approval.Args),
+		"workspace":   approval.WorkspaceID,
+	})
+	s.incrementMetric("devorbit_process_approvals_approved_total")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"approval_id":     approval.ID,
+		"state":           approval.State,
+		"execution_token": approval.Token,
+		"expires_at":      approval.ExpiresAt.Format(time.RFC3339),
 	})
 }

@@ -2,6 +2,54 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 import 'direct_e2e_http_client.dart';
+import '../../features/tasks/application/process_approval_controller.dart';
+
+/// Adapter that lets [ProcessApprovalController] drive the real Host Bridge client, so the approval
+/// state machine is shared by production code and its tests.
+class HostBridgeProcessApprovalApi implements ProcessApprovalApi {
+  HostBridgeProcessApprovalApi(this._client);
+
+  final HostBridgeApiClient _client;
+
+  @override
+  Future<ProcessApprovalRequestResult> requestProcessApproval({
+    required String workspaceId,
+    required String command,
+    required List<String> args,
+  }) =>
+      _client.requestProcessApproval(workspaceId: workspaceId, command: command, args: args);
+
+  @override
+  Future<ProcessApprovalDecisionResult> decideProcessApproval({
+    required String approvalId,
+    required String decision,
+    required String commandDigest,
+  }) =>
+      _client.decideProcessApproval(
+        approvalId: approvalId,
+        decision: decision,
+        commandDigest: commandDigest,
+      );
+
+  @override
+  Future<ProcessExecutionResult> executeProcess({
+    required String workspaceId,
+    required String command,
+    required List<String> args,
+    String? approvalToken,
+  }) async {
+    final result = await _client.executeProcess(
+      workspaceId: workspaceId,
+      command: command,
+      args: args,
+      approvalToken: approvalToken,
+    );
+    if (result != null) {
+      return ProcessExecutionResult(statusCode: 200, process: result);
+    }
+    return const ProcessExecutionResult(statusCode: 403, error: 'Execution rejected by the host');
+  }
+}
 
 class HostBridgeApiClient {
   final String baseUrl;
@@ -198,6 +246,7 @@ class HostBridgeApiClient {
     required String command,
     required List<String> args,
     String? requestId,
+    String? approvalToken,
   }) async {
     try {
       final res = await _sendProtected(
@@ -208,6 +257,7 @@ class HostBridgeApiClient {
           'command': command,
           'args': args,
           if (requestId != null) 'request_id': requestId,
+          if (approvalToken != null) 'approval_token': approvalToken,
         }),
         timeout: const Duration(seconds: 10),
       );
@@ -216,6 +266,84 @@ class HostBridgeApiClient {
       }
     } catch (_) {}
     return null;
+  }
+
+  /// Requests a process approval. Returns the raw status so the caller can distinguish 202 (pending),
+  /// 400 (command needs no approval) and 403 (not permitted).
+  Future<ProcessApprovalRequestResult> requestProcessApproval({
+    required String workspaceId,
+    required String command,
+    required List<String> args,
+  }) async {
+    try {
+      final res = await _sendProtected(
+        method: 'POST',
+        path: '/api/v1/processes/approvals',
+        body: jsonEncode({
+          'workspace_id': workspaceId,
+          'command': command,
+          'args': args,
+        }),
+        timeout: const Duration(seconds: 10),
+      );
+      if (res.statusCode == 202) {
+        final body = jsonDecode(res.body) as Map<String, dynamic>;
+        return ProcessApprovalRequestResult(
+          statusCode: 202,
+          proposal: ProcessApprovalProposal.fromJson(body),
+        );
+      }
+      return ProcessApprovalRequestResult(
+        statusCode: res.statusCode,
+        error: _errorMessage(res.body),
+      );
+    } catch (e) {
+      return ProcessApprovalRequestResult(statusCode: 0, error: e.toString());
+    }
+  }
+
+  /// Submits the human decision. A rejection needs no digest; an approval must echo the digest of the
+  /// proposal the user was shown.
+  Future<ProcessApprovalDecisionResult> decideProcessApproval({
+    required String approvalId,
+    required String decision,
+    required String commandDigest,
+  }) async {
+    try {
+      final res = await _sendProtected(
+        method: 'POST',
+        path: '/api/v1/processes/approvals/$approvalId/decision',
+        body: jsonEncode({
+          'decision': decision,
+          if (commandDigest.isNotEmpty) 'command_digest': commandDigest,
+        }),
+        timeout: const Duration(seconds: 10),
+      );
+      if (res.statusCode == 200) {
+        final body = jsonDecode(res.body) as Map<String, dynamic>;
+        return ProcessApprovalDecisionResult(
+          statusCode: 200,
+          state: body['state'] as String?,
+          executionToken: body['execution_token'] as String?,
+        );
+      }
+      return ProcessApprovalDecisionResult(
+        statusCode: res.statusCode,
+        error: _errorMessage(res.body),
+      );
+    } catch (e) {
+      return ProcessApprovalDecisionResult(statusCode: 0, error: e.toString());
+    }
+  }
+
+  String _errorMessage(String body) {
+    try {
+      final decoded = jsonDecode(body);
+      if (decoded is Map<String, dynamic> && decoded['error'] is String) {
+        return decoded['error'] as String;
+      }
+    } catch (_) {}
+    return 'Request failed';
   }
 
   Future<List<dynamic>> listADBDevices() async {

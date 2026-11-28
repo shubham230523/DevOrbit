@@ -50,7 +50,8 @@ type Server struct {
 	pairingEngine      *security.PairingEngine
 	rateLimiter        *security.RateLimiter
 	idempotency        *security.IdempotencyManager
-	approvalMgr        *application.ApprovalManager
+	processApprovals   *application.ProcessApprovalStore
+	approvalStoreMu    sync.Mutex
 	logger             *observability.Logger
 	metrics            *observability.Metrics
 	ready              atomic.Bool

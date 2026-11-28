@@ -69,7 +69,31 @@
 - **Android builds require sanitised Android env vars** — unset `ANDROID_PREFS_ROOT` and
   `ANDROID_USER_HOME` before Gradle builds on the development host.
 
+### Master Plan 26.2 (this session)
+
+- ~~`POST /api/v1/processes/approvals` returned a usable `approval_token` in the same response, so
+  requesting an approval was indistinguishable from granting it~~ — **RESOLVED**: proposals are now
+  pending and grant nothing; only an explicit decision that echoes the proposal digest mints a
+  single-use execution token.
+- ~~A Gradle execution could be authorized without any proposal being presented to a human~~ —
+  **RESOLVED**: the mobile client proposes first and shows the exact command, arguments, workspace,
+  reason and expiry before an approve/reject action is possible.
+- ~~Approval status responses could disclose the execution token~~ — **RESOLVED**: `Get` clears the
+  token; only the decision response carries it, exactly once.
+- ~~No end-to-end signed-HTTPS coverage of the approval flow (MP26.1 gap)~~ — **RESOLVED**: 12 TLS +
+  signed-request tests exercise the real middleware, including the self-approval regression.
+
 ## 3. Accepted Residual Risks (documented, not fixed)
+
+- **The host cannot prove a human rather than a compromised client performed the decision.** The host
+  guarantees that execution requires a separate decision bound to the exact proposal it issued, made
+  by the owning authenticated session/device, which an AI-generated tool call cannot produce. Proving
+  human presence (biometric/attestation) requires platform capability that does not exist in the
+  current client; this is a documented residual, not a solved property.
+- **The `command_digest` echo is an integrity binding, not a cryptographic proof of human perception.**
+  It guarantees a decision applies to the exact host-issued proposal and blocks blind approval of an
+  unknown command; it cannot prove the UI rendered it.
+
 
 - **Gradle two-step approval is a breaking API change for clients that ran builds in one call.**
   `/api/v1/processes/execute` now returns `403 approval_required` for Gradle; the mobile client must

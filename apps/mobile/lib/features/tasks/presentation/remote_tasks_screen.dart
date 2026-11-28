@@ -2,6 +2,10 @@ import 'package:flutter/material.dart';
 import '../../../core/network/api_client.dart';
 import '../../../core/network/direct_e2e_http_client.dart';
 import '../../../core/security/secure_storage.dart';
+import '../application/process_approval_controller.dart';
+
+/// The user's explicit decision for a proposed command.
+enum _ApprovalDecision { approve, reject, cancel }
 
 class RemoteTasksScreen extends StatefulWidget {
   final String? workspaceId;
@@ -19,11 +23,12 @@ class _RemoteTasksScreenState extends State<RemoteTasksScreen> {
   final ScrollController _scrollController = ScrollController();
 
   Future<void> _runTask(String taskName, String command, List<String> args) async {
+    if (_isRunning) return;
+
     setState(() {
       _isRunning = true;
       _logs.add('--- Executing Task: $taskName ($command ${args.join(" ")}) ---');
     });
-
     _scrollToBottom();
 
     final session = await SecureStorageService.instance.getPairedSession();
@@ -48,36 +53,116 @@ class _RemoteTasksScreenState extends State<RemoteTasksScreen> {
 
     final wsId = widget.workspaceId ?? (session['machineId'] ?? 'workspace');
 
-    final res = await client.executeProcess(
-      workspaceId: wsId,
-      command: command,
-      args: args,
-    );
+    // Commands that execute project-defined code (the Gradle family) require an explicit human
+    // decision. Propose first: requesting an approval grants nothing on its own.
+    final controller = ProcessApprovalController(HostBridgeProcessApprovalApi(client));
+    await controller.propose(workspaceId: wsId, command: command, args: args);
 
-    if (mounted) {
-      setState(() {
-        _isRunning = false;
-      });
+    Map<String, dynamic>? res;
+    switch (controller.phase) {
+      case ProcessApprovalPhase.unavailable:
+        // The host reported that this command needs no approval (for example `git`).
+        res = await client.executeProcess(workspaceId: wsId, command: command, args: args);
+        break;
+      case ProcessApprovalPhase.awaitingDecision:
+        final decision = await _askForDecision(controller.proposal!);
+        if (decision == _ApprovalDecision.approve) {
+          await controller.approve();
+          if (controller.phase == ProcessApprovalPhase.approved) {
+            await controller.executeApproved();
+            res = controller.result;
+          }
+        } else if (decision == _ApprovalDecision.reject) {
+          await controller.reject();
+        } else {
+          controller.cancel();
+        }
+        break;
+      default:
+        break;
+    }
+
+    if (!mounted) return;
+
+    setState(() {
+      _isRunning = false;
+      switch (controller.phase) {
+        case ProcessApprovalPhase.rejected:
+          _logs.add('--- Rejected by user: nothing was executed. ---\n');
+          break;
+        case ProcessApprovalPhase.cancelled:
+          _logs.add('--- Approval cancelled: nothing was executed. ---\n');
+          break;
+        case ProcessApprovalPhase.expired:
+          _logs.add('--- Approval expired before execution. Request the task again. ---\n');
+          break;
+        case ProcessApprovalPhase.failed:
+          _logs.add('--- Approval or execution failed: ${controller.error ?? "unknown error"} ---\n');
+          break;
+        default:
+          break;
+      }
 
       if (res != null) {
         final stdout = res['stdout'] as String? ?? '';
         final stderr = res['stderr'] as String? ?? '';
         final exitCode = res['exit_code'] ?? 0;
 
-        if (stdout.isNotEmpty) {
-          _logs.add(stdout);
-        }
-        if (stderr.isNotEmpty) {
-          _logs.add('[STDERR] $stderr');
-        }
-
+        if (stdout.isNotEmpty) _logs.add(stdout);
+        if (stderr.isNotEmpty) _logs.add('[STDERR] $stderr');
         _logs.add('--- Task Completed with exit code $exitCode ---\n');
-      } else {
+      } else if (controller.phase == ProcessApprovalPhase.completed) {
+        _logs.add('--- Task completed ---\n');
+      } else if (controller.phase == ProcessApprovalPhase.idle) {
         _logs.add('--- Task Execution Error: Host bridge did not return a valid response ---');
       }
+    });
+    _scrollToBottom();
+  }
 
-      _scrollToBottom();
-    }
+  /// Presents the exact command to the user for an explicit decision. The approval token is never
+  /// shown; only the proposed command, workspace and reason are displayed.
+  Future<_ApprovalDecision> _askForDecision(ProcessApprovalProposal proposal) async {
+    final decision = await showDialog<_ApprovalDecision>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Approve command execution?'),
+        content: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('This command runs project build logic and needs your approval.'),
+              const SizedBox(height: 12),
+              Text('Command: ${proposal.displayCommand}',
+                  style: const TextStyle(fontFamily: 'monospace')),
+              const SizedBox(height: 8),
+              Text('Workspace: ${proposal.workspaceId}'),
+              const SizedBox(height: 8),
+              Text('Reason: ${proposal.reason}'),
+              const SizedBox(height: 8),
+              Text('Expires: ${proposal.expiresAt.toLocal()}'),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(_ApprovalDecision.cancel),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(_ApprovalDecision.reject),
+            child: const Text('Reject'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.of(ctx).pop(_ApprovalDecision.approve),
+            child: const Text('Approve'),
+          ),
+        ],
+      ),
+    );
+    return decision ?? _ApprovalDecision.cancel;
   }
 
   void _scrollToBottom() {

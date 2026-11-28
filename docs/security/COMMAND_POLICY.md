@@ -114,34 +114,105 @@ project-defined build scripts. Gradle is therefore a separate trust boundary and
 auditable authorization in addition to session permission.
 
 **Agent path** (`execute_command` tool): unchanged and unconditional — the tool always returns an
-approval proposal and only executes after the proposal's single-use token is consumed.
+approval proposal and only executes after the proposal's single-use token is consumed by the host
+when the task is resumed from `/api/v1/agent/tasks/approve`. The AI never receives a token it can use.
 
-**HTTP path** (`/api/v1/processes/execute`): a Gradle command now requires an `approval_token`.
+**HTTP path** (`/api/v1/processes/execute`): Gradle requires an `execution_token` issued only by an
+explicit decision on a pending proposal.
 
-Two-step flow:
+Requesting an approval grants **nothing**. The earlier MP26.1 endpoint returned a usable token in the
+same response, which meant request and grant were the same operation; that is fixed.
+
+### Step 1 — propose (no capability issued)
 
 ```http
 POST /api/v1/processes/approvals
 Authorization: Bearer <session token>
-{"workspace_id": "...", "command": "gradlew", "args": ["assembleDebug"]}
+{"workspace_id": "...", "command": "./gradlew", "args": ["assembleDebug"]}
 
-200 {"approval_token": "appr-…", "reason": "...", "expires_at": "…"}
+202 {"approval_id": "pappr-…", "state": "pending",
+     "workspace_id": "...", "command": "./gradlew", "args": ["assembleDebug"],
+     "reason": "gradle executes project-defined build logic",
+     "command_digest": "<sha256 over the canonical request>",
+     "expires_at": "…"}
 ```
+
+The response deliberately contains **no** `execution_token`. A client that only knows how to request
+an approval can never execute.
+
+### Step 2 — decide (the human action)
+
+```http
+POST /api/v1/processes/approvals/{approval_id}/decision
+{"decision": "approve", "command_digest": "<digest from step 1>"}
+
+200 {"approval_id": "pappr-…", "state": "approved",
+     "execution_token": "pexec-…", "expires_at": "…"}
+```
+
+An approval must echo the digest of the proposal the user was shown, so a decision can only apply to
+the exact command the host issued. A rejection needs no digest and never produces a token:
+
+```http
+{"decision": "reject"}  ->  200 {"state": "rejected"}
+```
+
+### Step 3 — execute
 
 ```http
 POST /api/v1/processes/execute
-{"workspace_id": "...", "command": "gradlew", "args": ["assembleDebug"],
- "approval_token": "appr-…"}
+{"workspace_id": "...", "command": "./gradlew", "args": ["assembleDebug"],
+ "execution_token": "pexec-…"}
 ```
 
-Token properties: bound to the requesting **session and device**, the **workspace**, the **exact
-command and argument vector**; single-use; expires after 10 minutes; constant-time compared. A token
-that is missing, expired, consumed, replayed, or presented by another session fails closed with
-`403 approval_required`.
+The host revalidates session, device, workspace, command and argument vector immediately before
+launch and deletes the token, so one approval authorizes exactly one execution.
 
-**Product impact:** clients that called `/api/v1/processes/execute` with a Gradle command in a single
-step now receive `403 approval_required`. The mobile client must adopt the two-step flow (M3 UI work).
-This is a deliberate fail-closed change, not an accident.
+### Status
+
+```http
+GET /api/v1/processes/approvals/{approval_id}
+200 {"approval_id": "…", "state": "pending|approved|rejected|expired|consumed", ...}
+```
+
+The status representation never contains the execution token.
+
+### Error behaviour (all fail closed)
+
+| Condition | Status |
+|---|---|
+| Missing token on a Gradle execution | 403 `approval_required: approval_missing` |
+| Unknown/already-consumed/replayed token | 403 `approval_required: token_not_found_or_consumed` |
+| Proposal unknown | 403 `approval_required: proposal_not_found` |
+| Proposal already decided | 409 `approval_required: proposal_already_decided` |
+| Proposal expired | 410 `approval_required: proposal_expired` |
+| Decision digest mismatch | 403 `approval_required: digest_mismatch` |
+| Decision/consumption by another session or device | 403 `approval_required: owner_mismatch` |
+| Execution does not match the approved workspace/command/args | 403 `approval_required: scope_mismatch` |
+| Command needs no approval | 400 on the approval endpoints |
+
+### Token properties
+
+Bound to the requesting **session and device**, the **workspace**, the **exact command and argument
+vector**; single-use; expires after 10 minutes (same window as the proposal); constant-time compared;
+removed from the request before the process starts, so it is never logged, echoed, or inherited by the
+child process.
+
+### Mobile flow
+
+`RemoteTasksScreen` drives `ProcessApprovalController`:
+
+1. Propose → a dialog shows the exact command, arguments, workspace, reason and expiry.
+2. **Approve** → the decision is submitted; execution is attempted only after the host returns a token.
+3. **Reject** → nothing is executed and no token exists.
+4. **Cancel** → the proposal simply expires host-side; nothing is authorized locally.
+
+States rendered: `requesting`, `awaitingDecision`, `approved`, `executing`, `completed`, `rejected`,
+`cancelled`, `expired`, `unavailable`, `failed`. Duplicate taps are ignored while a request is in
+flight, and a network failure never auto-retries an approval.
+
+**Product impact:** a single-step Gradle execution now returns `403 approval_required`. This is a
+deliberate fail-closed change; the client implements the two-step protocol above.
 
 ## 8. Related limits
 
