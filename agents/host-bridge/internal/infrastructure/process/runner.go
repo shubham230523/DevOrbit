@@ -14,6 +14,15 @@ import (
 	"devorbit.net/services/connection-broker/pkg/observability"
 )
 
+// RequiresApproval reports whether the spec needs an explicit user authorization decision before it
+// may execute. It delegates to the command policy so both execution boundaries share one rule.
+func (r *ProcessRunner) RequiresApproval(spec *domain.ProcessSpec) (bool, string) {
+	if spec == nil {
+		return true, "missing process specification"
+	}
+	return r.policy.RequiresApproval(spec.Command, spec.Args)
+}
+
 // recordPolicyRejection emits a security event and metric for a denied command execution.
 // Only the executable base name and a stable reason are recorded: arguments may contain user
 // content or secrets and must never be logged.

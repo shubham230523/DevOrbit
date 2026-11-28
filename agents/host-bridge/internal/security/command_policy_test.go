@@ -2,6 +2,8 @@ package security
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -219,6 +221,10 @@ func TestCommandPolicy_RejectsPromptInjectionDerivedCommands(t *testing.T) {
 func TestCommandPolicy_ResolveExecutableStaysInsideWorkspace(t *testing.T) {
 	p := NewDefaultCommandPolicy()
 	workDir := t.TempDir()
+	// Containment is enforced on the real filesystem, so the wrapper must exist as a regular file.
+	if err := os.WriteFile(filepath.Join(workDir, "gradlew"), []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatalf("failed to create wrapper: %v", err)
+	}
 
 	resolved, err := p.ResolveExecutable("./gradlew", workDir)
 	if err != nil {

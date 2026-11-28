@@ -53,6 +53,8 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 
 	// Protected process endpoints
 	mux.HandleFunc("/api/v1/processes/execute", s.withAuth(http.MethodPost, security.PermissionProcessExecute, s.HandleExecuteProcess))
+	// Approval issuance for commands that execute project-defined code (Gradle family).
+	mux.HandleFunc("/api/v1/processes/approvals", s.withAuth(http.MethodPost, security.PermissionProcessExecute, s.HandleCreateProcessApproval))
 	mux.HandleFunc("/api/v1/processes/", func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/api/v1/processes/") {
 			http.NotFound(w, r)

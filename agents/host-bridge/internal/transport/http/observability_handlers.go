@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"time"
 
+	"devorbit.net/agents/host-bridge/internal/application"
 	"devorbit.net/agents/host-bridge/internal/security"
 	"devorbit.net/services/connection-broker/pkg/observability"
 )
@@ -25,6 +26,9 @@ const (
 	EventStartup              = "host_bridge_started"
 	EventShutdown             = "host_bridge_stopping"
 	EventHealthReady          = "host_bridge_ready"
+	EventProcessApprovalIssued   = "process_approval_issued"
+	EventProcessApprovalRejected = "process_approval_rejected"
+	EventProcessApproved         = "process_approval_consumed"
 )
 
 // SetObservability installs the structured logger and metrics registry. Both are optional and
@@ -32,6 +36,12 @@ const (
 func (s *Server) SetObservability(logger *observability.Logger, metrics *observability.Metrics) {
 	s.logger = logger
 	s.metrics = metrics
+}
+
+// SetApprovalManager installs the approval manager used to authorize commands that execute
+// project-defined code (Gradle). Without it, such executions fail closed.
+func (s *Server) SetApprovalManager(mgr *application.ApprovalManager) {
+	s.approvalMgr = mgr
 }
 
 // SetReady marks the instance ready to serve authenticated traffic. Readiness must only be set once

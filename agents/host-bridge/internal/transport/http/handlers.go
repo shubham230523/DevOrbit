@@ -50,6 +50,7 @@ type Server struct {
 	pairingEngine      *security.PairingEngine
 	rateLimiter        *security.RateLimiter
 	idempotency        *security.IdempotencyManager
+	approvalMgr        *application.ApprovalManager
 	logger             *observability.Logger
 	metrics            *observability.Metrics
 	ready              atomic.Bool
@@ -556,6 +557,29 @@ func (s *Server) HandleExecuteProcess(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+
+	// Commands that execute project-defined code (the Gradle family) require an explicit,
+	// single-use authorization bound to this exact workspace, command and argument vector. Session
+	// permission alone is not sufficient, so scripted or AI-induced invocations cannot escalate.
+	if requiresApproval, reason := s.processSvc.RequiresApproval(&req.ProcessSpec); requiresApproval {
+		if err := s.consumeProcessApproval(authCtx.SessionID, authCtx.DeviceID, &req.ProcessSpec); err != nil {
+			status := http.StatusForbidden
+			if errors.Is(err, application.ErrApprovalMismatch) {
+				status = http.StatusForbidden
+			}
+			wipeApprovalToken(&req.ProcessSpec)
+			writeError(w, status, "approval_required: "+reason+"; obtain an approval token from /api/v1/processes/approvals and resubmit")
+			return
+		}
+		s.securityEvent(observability.LevelInfo, EventProcessApproved, map[string]any{
+			"command":   req.ProcessSpec.Command,
+			"arg_count": len(req.ProcessSpec.Args),
+			"workspace": req.ProcessSpec.WorkspaceID,
+		})
+		s.incrementMetric("devorbit_process_approvals_consumed_total")
+	}
+	// The token must never reach the child process or the response body.
+	wipeApprovalToken(&req.ProcessSpec)
 
 	info, err := s.processSvc.ExecuteProcess(r.Context(), &req.ProcessSpec)
 	if err != nil {

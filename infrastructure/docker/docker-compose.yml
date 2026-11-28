@@ -45,7 +45,12 @@ services:
     profiles: ["future-db"]
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-devorbit}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set for the future-db profile}
+      # Deliberately empty by default: Compose interpolates every service before profile filtering,
+      # so a required variable here would break `docker compose config` even when the profile is
+      # inactive (this was verified as a real failure in MP26.1). Production values come from
+      # infrastructure/docker/.env (git-ignored). The postgres image refuses to start without a
+      # non-empty password, so an unset value fails closed at runtime rather than opening access.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
       POSTGRES_DB: ${POSTGRES_DB:-devorbit_db}
     volumes:
       - devorbit_pg_data:/var/lib/postgresql/data

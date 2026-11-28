@@ -35,10 +35,16 @@ type commandFamily struct {
 	requireSubcommand bool
 	// allowedFlagOnly permits flag-only invocations such as `git --version` or `gradlew --version`.
 	allowedFlagOnly map[string]bool
-	// deniedFlags are rejected verbatim (lower-case).
-	deniedFlags map[string]bool
-	// deniedFlagPrefixes are rejected when an argument starts with them (lower-case).
-	deniedFlagPrefixes []string
+	// deniedShortFlags are rejected anywhere inside a short-option cluster, so `-c`, `-ckey=value`
+	// and clustered forms such as `-cf` are all rejected. Keys are single characters and matching is
+	// case-sensitive (`-i` and `-I` are different options).
+	deniedShortFlags map[byte]bool
+	// deniedLongFlags are rejected by option NAME, so `--init-script`, `--init-script=x` and
+	// `--init-script x` are all covered by one entry.
+	deniedLongFlags map[string]bool
+	// valueShortFlags consume the remainder of the token (or the next argument) as their value, so
+	// scanning stops there: `-m "fix -c handling"` must not inspect the message for option letters.
+	valueShortFlags map[byte]bool
 	// valueFlags are options that consume the following argument (validated, not treated as a
 	// sub-command), e.g. `adb -s <serial> devices`.
 	valueFlags map[string]bool
@@ -78,38 +84,35 @@ func NewDefaultCommandPolicy() *CommandPolicy {
 		},
 		requireSubcommand: true,
 		allowedFlagOnly:   map[string]bool{"--version": true, "-v": true},
-		deniedFlags: map[string]bool{
-			// -c / --config-env inject arbitrary configuration (including aliases and hooks).
-			"-c": true, "--config-env": true,
-			// Redirect repository discovery outside the jailed workspace.
-			"-C": true, "--git-dir": true, "--work-tree": true, "--namespace": true,
-			// Execute or expose arbitrary programs.
-			"--exec": true, "--upload-pack": true, "--receive-pack": true,
-			// Pager selection can execute an arbitrary program (`git log -p` patch output is fine).
-			"--open-files-in-pager": true,
-			"--exec-path": true,
-		},
-		deniedFlagPrefixes: []string{
-			"--git-dir=", "--work-tree=", "--config-env=", "--upload-pack=",
-			"--receive-pack=", "--open-files-in-pager=", "--exec-path=", "--exec=",
+		// `-c` and `-C` take a value, which is why the attached form `-cfoo=bar` is valid Git syntax
+		// and must be rejected by cluster scanning rather than exact-token matching.
+		deniedShortFlags: map[byte]bool{'c': true, 'C': true},
+		valueShortFlags:  map[byte]bool{'c': true, 'C': true, 'm': true, 'n': true, 'F': true, 'o': true},
+		deniedLongFlags: map[string]bool{
+			// Configuration injection (aliases, hooks, pager, sshCommand) and repository relocation.
+			"config-env": true, "git-dir": true, "work-tree": true, "namespace": true,
+			// Program execution surfaces.
+			"exec": true, "exec-path": true, "upload-pack": true, "receive-pack": true,
+			"open-files-in-pager": true,
+			// External diff/textconv drivers execute configured programs.
+			"ext-diff": true, "textconv": true,
+			// Reads or writes paths outside the workspace.
+			"no-index": true, "output": true,
 		},
 	}
 
 	gradle := &commandFamily{
 		name:               "gradle",
 		allowAnySubcommand: true, // task names are defined by the project
-		deniedFlags: map[string]bool{
+		// Case-sensitive: `-i` (info) stays legal while `-I` (init script) is rejected.
+		deniedShortFlags: map[byte]bool{'I': true, 'b': true, 'c': true, 'p': true, 'g': true},
+		valueShortFlags:  map[byte]bool{'I': true, 'b': true, 'c': true, 'p': true, 'g': true, 'P': true, 'D': true},
+		deniedLongFlags: map[string]bool{
 			// Script/build-file overrides execute arbitrary Groovy/Kotlin outside the build.
-			"-I": true, "--init-script": true, "-b": true, "--build-file": true,
-			"-c": true, "--settings-file": true,
-			// Relocate the project or included builds away from the jailed workspace.
-			"-p": true, "--project-dir": true, "--include-build": true,
-			"--gradle-user-home": true, "-g": true,
-			"--project-cache-dir": true,
-		},
-		deniedFlagPrefixes: []string{
-			"--init-script=", "--build-file=", "--settings-file=", "--project-dir=",
-			"--include-build=", "--gradle-user-home=", "--project-cache-dir=",
+			"init-script": true, "build-file": true, "settings-file": true,
+			// Relocate the project, included builds or the user home away from the jailed workspace.
+			"project-dir": true, "include-build": true, "gradle-user-home": true,
+			"project-cache-dir": true,
 		},
 	}
 
@@ -121,7 +124,8 @@ func NewDefaultCommandPolicy() *CommandPolicy {
 			"wait-for-device": true, "start-server": true, "kill-server": true,
 		},
 		requireSubcommand: true,
-		valueFlags:        map[string]bool{"-s": true, "-P": true, "-H": true},
+		valueShortFlags:  map[byte]bool{'s': true, 'P': true, 'H': true},
+		valueFlags:       map[string]bool{"-s": true, "-P": true, "-H": true},
 		validateValue: func(flag, value string) error {
 			if value == "" || len(value) > 128 {
 				return fmt.Errorf("%w: invalid value for %s", domain.ErrCommandNotAllowed, flag)
@@ -251,8 +255,20 @@ func (p *CommandPolicy) validateCommandName(command string) error {
 	return nil
 }
 
-// ResolveExecutable returns the executable path to run for command inside workDir, rejecting any
-// workspace-relative path that escapes the workspace root.
+// ResolveExecutable returns the executable path to run for command inside workDir.
+//
+// Containment is enforced on the REAL filesystem, not lexically. A workspace-relative wrapper is
+// accepted only when all of the following hold:
+//   - the lexical path stays inside the workspace root;
+//   - the workspace root itself is canonicalized (symlinked roots are resolved first);
+//   - the target exists as a regular file (dangling symlinks and directories are rejected);
+//   - after resolving every symlink, the real path still lives inside the canonicalized workspace,
+//     so a wrapper cannot redirect execution to a binary outside the jail (including nested links).
+//
+// Residual risk: this is a check-then-execute sequence, so a writable workspace can still swap the
+// file between validation and process start (TOCTOU). DevOrbit executes the resolved absolute path
+// and does not re-resolve links, which narrows but does not eliminate that window. Full elimination
+// requires OS-level primitives (openat/O_NOFOLLOW), which are platform-specific and out of scope.
 func (p *CommandPolicy) ResolveExecutable(command, workDir string) (string, error) {
 	if p == nil {
 		return "", fmt.Errorf("%w: no command policy configured", domain.ErrCommandNotAllowed)
@@ -262,14 +278,49 @@ func (p *CommandPolicy) ResolveExecutable(command, workDir string) (string, erro
 	}
 	name := strings.TrimSpace(command)
 	if !strings.ContainsAny(name, `/\`) {
+		// Bare allowlisted names are resolved through PATH by the OS; nothing to canonicalize.
 		return filepath.Base(name), nil
 	}
+
 	resolved := filepath.Clean(filepath.Join(workDir, name))
-	rel, err := filepath.Rel(workDir, resolved)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	if !isWithin(workDir, resolved) {
 		return "", fmt.Errorf("%w: executable path escapes the workspace", domain.ErrCommandNotAllowed)
 	}
-	return resolved, nil
+
+	realRoot, err := filepath.EvalSymlinks(workDir)
+	if err != nil {
+		return "", fmt.Errorf("%w: workspace root cannot be resolved", domain.ErrCommandNotAllowed)
+	}
+	realExecutable, err := filepath.EvalSymlinks(resolved)
+	if err != nil {
+		// Dangling symlink, missing file, or unresolvable path: fail closed.
+		return "", fmt.Errorf("%w: executable cannot be resolved inside the workspace", domain.ErrCommandNotAllowed)
+	}
+	if !isWithin(realRoot, realExecutable) {
+		return "", fmt.Errorf("%w: executable resolves outside the workspace", domain.ErrCommandNotAllowed)
+	}
+
+	info, err := os.Lstat(realExecutable)
+	if err != nil || !info.Mode().IsRegular() {
+		return "", fmt.Errorf("%w: executable is not a regular file", domain.ErrCommandNotAllowed)
+	}
+
+	return realExecutable, nil
+}
+
+// isWithin reports whether target is root itself or a descendant of root.
+func isWithin(root, target string) bool {
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return false
+	}
+	if rel == "." {
+		return true
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return !filepath.IsAbs(rel)
 }
 
 func (f *commandFamily) validate(args []string) error {
@@ -280,15 +331,8 @@ func (f *commandFamily) validate(args []string) error {
 		arg := args[i]
 		lower := strings.ToLower(arg)
 
-		// Exact option matching is case-sensitive: for Gradle `-i` (info) is harmless while `-I`
-		// (init script) executes arbitrary code.
-		if f.deniedFlags[arg] {
-			return fmt.Errorf("%w: option '%s' is not permitted for %s", domain.ErrCommandNotAllowed, arg, f.name)
-		}
-		for _, prefix := range f.deniedFlagPrefixes {
-			if strings.HasPrefix(lower, prefix) {
-				return fmt.Errorf("%w: option prefix '%s' is not permitted for %s", domain.ErrCommandNotAllowed, strings.TrimSuffix(prefix, "="), f.name)
-			}
+		if err := f.validateFlag(arg); err != nil {
+			return err
 		}
 
 		if f.valueFlags[arg] {
@@ -340,6 +384,65 @@ func (f *commandFamily) validate(args []string) error {
 	return nil
 }
 
+// validateFlag rejects prohibited option forms. It parses arguments structurally instead of matching
+// whole tokens, so every equivalent spelling of a dangerous option is covered:
+//
+//	--init-script / --init-script=x   -> long option name lookup
+//	-I script.gradle / -Iscript.gradle -> short-option cluster scan
+//	-cf / -Ic                          -> cluster scan reaches the denied letter
+//
+// Matching is case-sensitive because option semantics are: Gradle `-i` (info) differs from `-I`
+// (init script), and Git `-c` (config) differs from `-C` (directory). When a cluster contains an
+// option that consumes a value, scanning stops at that point so option-like text inside a value
+// (for example a commit message containing "-c") is not misinterpreted.
+func (f *commandFamily) validateFlag(arg string) error {
+	if arg == "--" || len(arg) < 2 || arg[0] != '-' {
+		return nil
+	}
+
+	if strings.HasPrefix(arg, "--") {
+		name := arg[2:]
+		if idx := strings.IndexByte(name, '='); idx >= 0 {
+			name = name[:idx]
+		}
+		if f.deniedLongFlags[name] {
+			return fmt.Errorf("%w: option '--%s' is not permitted for %s", domain.ErrCommandNotAllowed, name, f.name)
+		}
+		return nil
+	}
+
+	for i := 1; i < len(arg); i++ {
+		c := arg[i]
+		if f.deniedShortFlags[c] {
+			return fmt.Errorf("%w: option '-%c' is not permitted for %s", domain.ErrCommandNotAllowed, c, f.name)
+		}
+		if f.valueShortFlags[c] {
+			// The remainder of this token (or the next argument) is the option value.
+			return nil
+		}
+	}
+	return nil
+}
+
+// RequiresApproval reports whether executing the command needs an explicit, auditable user
+// authorization decision in addition to session permissions.
+//
+// Gradle always evaluates project-defined build scripts, so any task — including "help" or
+// "tasks" — can run arbitrary code supplied by the repository. Argument validation cannot make that
+// safe, therefore Gradle execution is approval-gated. Git and adb are inspection-scoped by the
+// argument policy and do not require approval.
+func (p *CommandPolicy) RequiresApproval(command string, args []string) (bool, string) {
+	if p == nil {
+		return true, "no command policy configured"
+	}
+	switch canonicalFamily(command) {
+	case "gradle":
+		return true, "gradle executes project-defined build logic"
+	default:
+		return false, ""
+	}
+}
+
 // deniedEnvironmentExact lists environment variables that redirect the dynamic loader, Git
 // repository discovery, or JVM option injection. They are removed before spawning allowlisted tools
 // so a caller cannot execute code or escape the workspace through the inherited environment.
@@ -350,6 +453,9 @@ var deniedEnvironmentExact = map[string]bool{
 	"GIT_OBJECT_DIRECTORY": true, "GIT_ALTERNATE_OBJECT_DIRECTORIES": true,
 	"GIT_SSH": true, "GIT_SSH_COMMAND": true, "GIT_ASKPASS": true, "SSH_ASKPASS": true,
 	"GIT_CONFIG": true, "GIT_CONFIG_GLOBAL": true, "GIT_CONFIG_SYSTEM": true, "GIT_CONFIG_COUNT": true,
+	// External diff/textconv/pager/editor programs are all execution surfaces.
+	"GIT_EXTERNAL_DIFF": true, "GIT_PAGER": true, "PAGER": true, "GIT_EDITOR": true,
+	"GIT_SEQUENCE_EDITOR": true, "GIT_TEMPLATE_DIR": true,
 	"BASH_ENV": true, "ENV": true, "PS4": true, "PROMPT_COMMAND": true,
 	"JAVA_TOOL_OPTIONS": true, "_JAVA_OPTIONS": true, "JDK_JAVA_OPTIONS": true,
 	"GRADLE_OPTS": true, "NODE_OPTIONS": true, "PYTHONSTARTUP": true, "PERL5OPT": true,

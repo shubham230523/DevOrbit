@@ -14,6 +14,9 @@ var (
 	ErrApprovalTokenNotFound = errors.New("approval error: token not found or already consumed")
 	ErrApprovalExpired       = errors.New("approval error: approval token has expired")
 	ErrApprovalMismatch      = errors.New("approval error: operation parameters do not match approved token")
+	// ErrApprovalRequirementMissing indicates an operation that requires an explicit user decision was
+	// submitted without an approval token.
+	ErrApprovalRequirementMissing = errors.New("approval error: this operation requires an approval token")
 )
 
 type ApprovalProposal struct {

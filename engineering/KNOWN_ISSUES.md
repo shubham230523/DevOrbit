@@ -36,6 +36,22 @@
   broker revocation propagation, broker session-only deauthorization; permission persistence, plaintext
   session secrets, HTTPS→HTTP mobile fallback, multi-valued `X-Forwarded-Proto`, Linux cross-compile.
 
+### Master Plan 26.1 (this session)
+
+- ~~Command-policy bypass via attached short-option values (`git -ccore.pager=sh`, `gradle -Ievil.gradle`,
+  `-bbuild.gradle`, `-p/tmp/x`, `-g/tmp/x`, clusters such as `-IPevil.gradle`)~~ — **RESOLVED**: structural
+  flag parsing (name-based long options, character-scan short clusters, value-consumption aware).
+- ~~Gradle executed over HTTP with only session permission while the agent path required approval~~ —
+  **RESOLVED**: Gradle is approval-gated on both paths via a session+device+workspace+command+args
+  bound, single-use, 10-minute token (`POST /api/v1/processes/approvals`).
+- ~~`ResolveExecutable` used a lexical containment check only~~ — **RESOLVED**: real-filesystem
+  containment with canonicalized root, resolved-target check and regular-file requirement.
+- ~~`docker compose config` failed even with the optional `future-db` profile inactive
+  (`POSTGRES_PASSWORD` required interpolation), which would also have failed the MP26 CI job~~ —
+  **RESOLVED**: password defaults to empty and the postgres image fails closed at runtime.
+- ~~`git --ext-diff`/`--textconv`/`--no-index`/`--output` escaped the policy; `GIT_EXTERNAL_DIFF`,
+  `GIT_PAGER`, `GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `GIT_TEMPLATE_DIR` were inherited~~ — **RESOLVED**.
+
 ## 2. Active Blockers & Environment Limitations
 
 - **Docker daemon unavailable on the implementation host** — `docker version` fails with
@@ -54,6 +70,23 @@
   `ANDROID_USER_HOME` before Gradle builds on the development host.
 
 ## 3. Accepted Residual Risks (documented, not fixed)
+
+- **Gradle two-step approval is a breaking API change for clients that ran builds in one call.**
+  `/api/v1/processes/execute` now returns `403 approval_required` for Gradle; the mobile client must
+  adopt `POST /api/v1/processes/approvals` then resubmit with `approval_token` (M3 UI work). This is
+  deliberate and fail-closed. See `docs/security/COMMAND_POLICY.md` §7.
+- **TOCTOU between executable validation and process start** — `ResolveExecutable` canonicalizes and
+  verifies the target, then the OS starts the resolved path; a writable workspace can swap the file
+  in between. Full elimination needs `openat`/`O_NOFOLLOW`, which is platform-specific.
+- **Repository-controlled Git configuration remains a code-execution surface** for diff drivers and
+  hooks in a repository the user has already trusted. Option and environment routes are blocked
+  (`--ext-diff`, `--textconv`, `GIT_EXTERNAL_DIFF`, `GIT_PAGER`), and hooks are never transferred by
+  a clone.
+- **`git push --force` remains permitted** (approval-gated where routed through the agent).
+- **Windows junction / reparse-point containment is not separately tested.** Containment is decided by
+  `filepath.EvalSymlinks`, which resolves junctions, but no Windows-specific junction test exists
+  (Windows symlink creation requires Developer Mode; the tests skip when unavailable).
+
 
 - **Command policy denies some legitimate advanced workflows** by design: `git config/credential/
   alias/filter-branch`, Gradle `-I/--init-script/-b/-p`, and every `adb shell/push/pull` operation.

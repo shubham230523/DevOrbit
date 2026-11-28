@@ -19,6 +19,13 @@ func (s *ProcessService) ExecuteProcess(ctx context.Context, spec *domain.Proces
 	return s.runner.ExecuteProcess(ctx, spec)
 }
 
+// RequiresApproval reports whether executing the spec needs an explicit user authorization decision
+// in addition to session permissions. The rule lives in the shared command policy so every entry
+// point (HTTP and agent tool execution) enforces the same requirement.
+func (s *ProcessService) RequiresApproval(spec *domain.ProcessSpec) (bool, string) {
+	return s.runner.RequiresApproval(spec)
+}
+
 func (s *ProcessService) GetProcessStatus(id string) (*domain.ProcessInfo, bool) {
 	return s.runner.GetProcessStatus(id)
 }
