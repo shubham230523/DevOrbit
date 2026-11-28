@@ -44,6 +44,44 @@ class AgentApiClient {
     );
   }
 
+  /// Fetches a process approval proposal so the task detail UI can show the exact command the AI
+  /// proposed. The response never contains an execution token.
+  Future<http.Response> getProcessApproval(String approvalId) {
+    return _sendProtected(
+      method: 'GET',
+      path: '/api/v1/processes/approvals/$approvalId',
+      timeout: const Duration(seconds: 5),
+    );
+  }
+
+  /// Submits the human decision for a process approval proposal.
+  Future<http.Response> decideProcessApproval({
+    required String approvalId,
+    required String decision,
+    required String commandDigest,
+  }) {
+    return _sendProtected(
+      method: 'POST',
+      path: '/api/v1/processes/approvals/$approvalId/decision',
+      body: jsonEncode({
+        'decision': decision,
+        if (commandDigest.isNotEmpty) 'command_digest': commandDigest,
+      }),
+      timeout: const Duration(seconds: 10),
+    );
+  }
+
+  /// Cancels a pending proposal on the host. Callers must only report cancellation on host
+  /// confirmation.
+  Future<http.Response> cancelProcessApproval(String approvalId) {
+    return _sendProtected(
+      method: 'POST',
+      path: '/api/v1/processes/approvals/$approvalId/cancel',
+      body: '{}',
+      timeout: const Duration(seconds: 10),
+    );
+  }
+
   Future<Map<String, dynamic>> createAgentTask({
     required String workspaceId,
     required String prompt,

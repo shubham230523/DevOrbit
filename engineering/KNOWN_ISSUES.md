@@ -100,10 +100,13 @@
 
 ## 3. Accepted Residual Risks (documented, not fixed)
 
-- **The agent task-detail UI does not yet perform the two-step Gradle approval.** The host contract is
-  complete and tested (proposal id + digest → decision → resume with the approval id), but the task
-  screen still assumes a single legacy approval token, so in-app approval of an AI-requested Gradle
-  command is not usable yet. This is the main outstanding item in the approval workstream.
+- ~~**The agent task-detail UI does not yet perform the two-step Gradle approval.**~~ — **RESOLVED in
+  MP26.3.1**: `TravelCodingScreen._approveTaskProposal` now detects a host-issued proposal
+  (`pappr-…`), loads it, shows the exact command/arguments/workspace/reason/expiry, submits the
+  digest-bound decision, and resumes the task only after the host confirms. The legacy `appr-…` path is
+  untouched for task-level approvals. See `docs/architecture/AGENT_PROCESS_APPROVAL_FLOW.md`.
+- **No background expiry notification for approvals.** Expiry is evaluated when the client loads or
+  acts on a proposal, or when the host consumes it; the UI does not push an expiry event.
 - **Process cancellation is confirmed by the host process runner, not by the OS reaping a tree.**
   `ProcessRunner.CancelProcess` kills the started process and reports success; child processes that
   detached from the started process are not guaranteed to be terminated.

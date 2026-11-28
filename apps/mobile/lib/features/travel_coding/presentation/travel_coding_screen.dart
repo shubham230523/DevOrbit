@@ -4,7 +4,10 @@ import '../../../core/network/api_client.dart';
 import '../../../core/network/agent_api_client.dart';
 import '../../../core/network/direct_e2e_http_client.dart';
 import '../../../core/security/secure_storage.dart';
+import '../../tasks/application/process_approval_controller.dart';
+import '../application/agent_process_approval_api.dart';
 import 'widgets/approval_dialog.dart';
+import 'widgets/process_approval_dialog.dart';
 
 class TravelCodingScreen extends StatefulWidget {
   final String hostBaseUrl;
@@ -214,6 +217,100 @@ class _TravelCodingScreenState extends State<TravelCodingScreen> {
     }
   }
 
+  /// Handles an approval request raised by the AI agent.
+  ///
+  /// Two distinct approval mechanisms exist and must not be confused:
+  ///  * task-level approvals (file edits, git/adb) use the legacy single token;
+  ///  * commands that execute project-defined code (the Gradle family) are authorized by the host's
+  ///    process approval service, which requires a pending proposal, an explicit decision carrying the
+  ///    proposal digest, and a task resume that consumes the authorization exactly once.
+  Future<void> _handleProcessApproval(String taskId, String approvalId) async {
+    final controller = ProcessApprovalController(AgentProcessApprovalApi(_agentClient));
+    controller.attachAgentTask(taskId, (task, token) async {
+      final res = await _agentClient.approveAgentTask(taskId: task, approvalToken: token);
+      return res['success'] == true;
+    });
+
+    await controller.loadProposal(approvalId);
+    if (!mounted) return;
+
+    if (controller.phase == ProcessApprovalPhase.expired) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('This approval request has expired. Ask the assistant to try again.'),
+          backgroundColor: Colors.orange,
+        ),
+      );
+      return;
+    }
+    if (controller.phase != ProcessApprovalPhase.awaitingDecision || controller.proposal == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Unable to load the approval request: ${controller.error ?? 'unknown error'}'),
+          backgroundColor: Colors.red,
+        ),
+      );
+      return;
+    }
+
+    final choice = await showDialog<ProcessApprovalChoice>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => ProcessApprovalDialog(proposal: controller.proposal!),
+    );
+    if (choice == null || !mounted) return;
+
+    switch (choice) {
+      case ProcessApprovalChoice.approve:
+        await controller.approve();
+        if (!mounted) return;
+        if (controller.phase == ProcessApprovalPhase.completed ||
+            controller.phase == ProcessApprovalPhase.approved) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Approved. The host is resuming the task...'),
+              backgroundColor: Colors.green,
+            ),
+          );
+          _startTaskPolling(taskId);
+        } else {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Approval failed: ${controller.error ?? 'the host did not authorize execution'}'),
+              backgroundColor: Colors.red,
+            ),
+          );
+        }
+        break;
+      case ProcessApprovalChoice.reject:
+        await controller.reject();
+        if (!mounted) return;
+        final rejected = controller.phase == ProcessApprovalPhase.rejected;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(rejected
+                ? 'Rejected. Nothing was executed.'
+                : 'Rejection could not be confirmed: ${controller.error ?? 'unknown error'}'),
+            backgroundColor: rejected ? Colors.orange : Colors.red,
+          ),
+        );
+        break;
+      case ProcessApprovalChoice.cancel:
+        await controller.cancel();
+        if (!mounted) return;
+        final cancelled = controller.phase == ProcessApprovalPhase.cancelled;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(cancelled
+                ? 'Approval cancelled on the host. Nothing was executed.'
+                : 'Cancellation was not confirmed by the host; the proposal may still expire.'),
+            backgroundColor: cancelled ? Colors.blueGrey : Colors.red,
+          ),
+        );
+        break;
+    }
+  }
+
   void _approveTaskProposal() async {
     if (_activeTask == null) return;
 
@@ -221,6 +318,13 @@ class _TravelCodingScreenState extends State<TravelCodingScreen> {
     final token = _activeTask!['approval_token'] as String?;
 
     if (token == null) return;
+
+    // Host-issued process approvals (Gradle family) are identified by their proposal id prefix and
+    // MUST go through the decision + resume flow rather than the legacy task approval.
+    if (token.startsWith('pappr-')) {
+      await _handleProcessApproval(taskId, token);
+      return;
+    }
 
     final events = _activeTask!['events'] as List<dynamic>? ?? [];
     Map<String, dynamic>? proposalData;

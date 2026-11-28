@@ -12,6 +12,8 @@ class _FakeApi implements ProcessApprovalApi {
     this.throwOnDecision = false,
     this.throwOnCancel = false,
     this.cancelConfirmed = true,
+    this.throwOnFetch = false,
+    this.fetchStatusCode = 200,
     this.expiresIn = const Duration(minutes: 10),
   });
 
@@ -23,8 +25,11 @@ class _FakeApi implements ProcessApprovalApi {
   bool throwOnDecision;
   bool throwOnCancel;
   bool cancelConfirmed;
+  bool throwOnFetch;
+  int fetchStatusCode;
   Duration expiresIn;
   int cancelCalls = 0;
+  int fetchCalls = 0;
 
   int requestCalls = 0;
   int decisionCalls = 0;
@@ -90,6 +95,30 @@ class _FakeApi implements ProcessApprovalApi {
     cancelCalls++;
     if (throwOnCancel) throw Exception('socket closed');
     return cancelConfirmed;
+  }
+
+  @override
+  Future<ProcessApprovalFetchResult> fetchProcessApproval({required String approvalId}) async {
+    fetchCalls++;
+    if (throwOnFetch) throw Exception('socket closed');
+    if (fetchStatusCode != 200) {
+      return ProcessApprovalFetchResult(
+        statusCode: fetchStatusCode,
+        error: fetchStatusCode == 403 ? 'forbidden' : 'unavailable',
+      );
+    }
+    return ProcessApprovalFetchResult(
+      statusCode: 200,
+      proposal: ProcessApprovalProposal(
+        approvalId: approvalId,
+        workspaceId: '/ws',
+        command: './gradlew',
+        args: const ['assembleRelease'],
+        reason: 'gradle executes project-defined build logic',
+        commandDigest: 'digest-abc',
+        expiresAt: DateTime.now().add(expiresIn),
+      ),
+    );
   }
 
   @override
@@ -316,6 +345,118 @@ void main() {
 
       expect(controller.phase, ProcessApprovalPhase.failed);
       expect(controller.result, isNull);
+    });
+
+    group('agent task flow', () {
+      test('loads a host-issued proposal without any execution capability', () async {
+        final api = _FakeApi();
+        final controller = ProcessApprovalController(api);
+
+        await controller.loadProposal('pappr-123');
+
+        expect(api.fetchCalls, 1);
+        expect(controller.phase, ProcessApprovalPhase.awaitingDecision);
+        expect(controller.proposal!.displayCommand, './gradlew assembleRelease');
+        expect(controller.proposal!.workspaceId, '/ws');
+        expect(controller.hasExecutionToken, isFalse);
+      });
+
+      test('approval sends the digest and resumes the task instead of executing', () async {
+        final api = _FakeApi();
+        final controller = ProcessApprovalController(api);
+        final resumed = <String>[];
+        controller.attachAgentTask('task-1', (taskId, token) async {
+          resumed.add('$taskId:$token');
+          return true;
+        });
+
+        await controller.loadProposal('pappr-123');
+        await controller.approve();
+
+        expect(api.lastDecision, 'approve');
+        expect(api.lastDigest, 'digest-abc');
+        expect(resumed, ['task-1:pappr-123']);
+        expect(api.executeCalls, 0, reason: 'agent execution happens on the host');
+        expect(controller.phase, ProcessApprovalPhase.completed);
+      });
+
+      test('a failed resume is reported as a failure, not a success', () async {
+        final api = _FakeApi();
+        final controller = ProcessApprovalController(api);
+        controller.attachAgentTask('task-1', (taskId, token) async => false);
+
+        await controller.loadProposal('pappr-123');
+        await controller.approve();
+
+        expect(controller.phase, ProcessApprovalPhase.failed);
+        expect(controller.error, isNotNull);
+      });
+
+      test('duplicate approve taps resume the task only once', () async {
+        final api = _FakeApi();
+        final controller = ProcessApprovalController(api);
+        var resumes = 0;
+        controller.attachAgentTask('task-1', (taskId, token) async {
+          resumes++;
+          return true;
+        });
+
+        await controller.loadProposal('pappr-123');
+        await Future.wait([controller.approve(), controller.approve()]);
+
+        expect(api.decisionCalls, 1);
+        expect(resumes, 1);
+      });
+
+      test('rejecting a loaded proposal prevents any resume', () async {
+        final api = _FakeApi();
+        final controller = ProcessApprovalController(api);
+        var resumes = 0;
+        controller.attachAgentTask('task-1', (taskId, token) async {
+          resumes++;
+          return true;
+        });
+
+        await controller.loadProposal('pappr-123');
+        await controller.reject();
+
+        expect(api.lastDecision, 'reject');
+        expect(controller.phase, ProcessApprovalPhase.rejected);
+        expect(resumes, 0);
+        expect(api.executeCalls, 0);
+      });
+
+      test('an expired proposal cannot be approved', () async {
+        final api = _FakeApi(expiresIn: const Duration(seconds: -1));
+        final controller = ProcessApprovalController(api);
+
+        await controller.loadProposal('pappr-123');
+
+        expect(controller.phase, ProcessApprovalPhase.expired);
+        await controller.approve();
+        expect(api.decisionCalls, 0);
+      });
+
+      test('a proposal the host refuses to serve fails closed', () async {
+        final api = _FakeApi(fetchStatusCode: 403);
+        final controller = ProcessApprovalController(api);
+
+        await controller.loadProposal('pappr-123');
+
+        expect(controller.phase, ProcessApprovalPhase.failed);
+        expect(controller.proposal, isNull);
+      });
+
+      test('a network failure while loading never yields a proposal', () async {
+        final api = _FakeApi(throwOnFetch: true);
+        final controller = ProcessApprovalController(api);
+
+        await controller.loadProposal('pappr-123');
+
+        expect(controller.phase, ProcessApprovalPhase.failed);
+        expect(controller.proposal, isNull);
+        expect(api.decisionCalls, 0);
+      });
     });
 
     test('the controller never exposes the execution token through its API', () async {

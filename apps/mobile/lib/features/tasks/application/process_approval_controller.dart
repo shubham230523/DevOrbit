@@ -123,6 +123,17 @@ class ProcessApprovalDecisionResult {
   bool get isApproved => executionToken != null && executionToken!.isNotEmpty;
 }
 
+/// Result of fetching an existing proposal (agent task flow).
+class ProcessApprovalFetchResult {
+  const ProcessApprovalFetchResult({this.proposal, this.statusCode = 0, this.error});
+
+  final ProcessApprovalProposal? proposal;
+  final int statusCode;
+  final String? error;
+
+  bool get isSuccess => proposal != null;
+}
+
 /// Result of submitting an execution.
 class ProcessExecutionResult {
   const ProcessExecutionResult({this.process, this.statusCode = 0, this.error});
@@ -157,6 +168,10 @@ abstract class ProcessApprovalApi {
 
   /// Asks the host to abandon a pending proposal. Returns true only when the host confirms it.
   Future<bool> cancelProcessApproval({required String approvalId});
+
+  /// Fetches an existing proposal by id (used when the proposal was created server-side by an agent
+  /// task rather than by this client).
+  Future<ProcessApprovalFetchResult> fetchProcessApproval({required String approvalId});
 }
 
 /// Drives the two-step approval protocol for one command.
@@ -171,6 +186,21 @@ class ProcessApprovalController {
   String? _error;
   Map<String, dynamic>? _result;
   bool _busy = false;
+
+  /// Optional resume hook for the agent task flow. When present, a successful approval resumes the
+  /// task instead of executing the command directly from this client: the host consumes the approval
+  /// authorization when the task runs.
+  Future<bool> Function(String taskId, String approvalToken)? _resumeTask;
+  String? _taskId;
+
+  /// Binds this controller to an agent task that must be resumed after approval.
+  void attachAgentTask(
+    String taskId,
+    Future<bool> Function(String taskId, String approvalToken) resumeTask,
+  ) {
+    _taskId = taskId;
+    _resumeTask = resumeTask;
+  }
 
   ProcessApprovalPhase get phase => _phase;
   ProcessApprovalProposal? get proposal => _proposal;
@@ -225,6 +255,36 @@ class ProcessApprovalController {
     }
   }
 
+  /// Loads a proposal created by the host (agent task flow) so the user can inspect and decide it.
+  Future<void> loadProposal(String approvalId) async {
+    if (_busy) return;
+    _busy = true;
+    _phase = ProcessApprovalPhase.requesting;
+    _proposal = null;
+    _executionToken = null;
+    _error = null;
+
+    try {
+      final result = await _api.fetchProcessApproval(approvalId: approvalId);
+      if (result.isSuccess) {
+        _proposal = result.proposal;
+        _phase = result.proposal!.isExpired
+            ? ProcessApprovalPhase.expired
+            : ProcessApprovalPhase.awaitingDecision;
+      } else if (result.statusCode == 410) {
+        _phase = ProcessApprovalPhase.expired;
+      } else {
+        _phase = ProcessApprovalPhase.failed;
+        _error = result.error ?? 'Unable to load the approval proposal.';
+      }
+    } catch (e) {
+      _phase = ProcessApprovalPhase.failed;
+      _error = 'Network error while loading the proposal: $e';
+    } finally {
+      _busy = false;
+    }
+  }
+
   /// Records the human approval decision. Requires a pending proposal with a server-issued digest.
   Future<void> approve() async {
     final proposal = _proposal;
@@ -245,6 +305,20 @@ class ProcessApprovalController {
       if (decision.isApproved) {
         _executionToken = decision.executionToken;
         _phase = ProcessApprovalPhase.approved;
+
+        // Agent task flow: the host consumes the authorization when the task resumes, so the client
+        // resumes the task instead of executing the command directly.
+        final resume = _resumeTask;
+        final taskId = _taskId;
+        if (resume != null && taskId != null) {
+          _phase = ProcessApprovalPhase.executing;
+          final resumed = await resume(taskId, proposal.approvalId);
+          _executionToken = null;
+          _phase = resumed ? ProcessApprovalPhase.completed : ProcessApprovalPhase.failed;
+          if (!resumed) {
+            _error = 'The host did not resume the task after approval.';
+          }
+        }
       } else if (decision.statusCode == 410) {
         _phase = ProcessApprovalPhase.expired;
       } else {

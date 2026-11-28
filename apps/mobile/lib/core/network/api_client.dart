@@ -36,6 +36,27 @@ class HostBridgeProcessApprovalApi implements ProcessApprovalApi {
       _client.cancelProcessApproval(approvalId: approvalId);
 
   @override
+  Future<ProcessApprovalFetchResult> fetchProcessApproval({required String approvalId}) async {
+    try {
+      final res = await _client.getProcessApproval(approvalId);
+      if (res.statusCode == 200) {
+        return ProcessApprovalFetchResult(
+          statusCode: 200,
+          proposal: ProcessApprovalProposal.fromJson(
+            jsonDecode(res.body) as Map<String, dynamic>,
+          ),
+        );
+      }
+      return ProcessApprovalFetchResult(
+        statusCode: res.statusCode,
+        error: _client.errorMessage(res.body),
+      );
+    } catch (e) {
+      return ProcessApprovalFetchResult(statusCode: 0, error: e.toString());
+    }
+  }
+
+  @override
   Future<ProcessExecutionResult> executeProcess({
     required String workspaceId,
     required String command,
@@ -339,6 +360,19 @@ class HostBridgeApiClient {
       return ProcessApprovalDecisionResult(statusCode: 0, error: e.toString());
     }
   }
+
+  /// Fetches a proposal by id. Used by the agent task detail flow, where the proposal was created by
+  /// the host on behalf of an AI tool call.
+  Future<http.Response> getProcessApproval(String approvalId) {
+    return _sendProtected(
+      method: 'GET',
+      path: '/api/v1/processes/approvals/$approvalId',
+      timeout: const Duration(seconds: 5),
+    );
+  }
+
+  /// Exposes the server error message for callers that need to surface it.
+  String errorMessage(String body) => _errorMessage(body);
 
   /// Cancels a pending approval on the host. Returns true only when the host confirms the proposal is
   /// no longer actionable, so the UI never claims a cancellation that did not happen.
