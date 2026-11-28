@@ -190,6 +190,7 @@ func (bc *BrokerClient) provisionSessionInternal(sessionID, deviceID, sessionSec
 		bc.mu.Unlock()
 		return security.ErrSessionRevoked
 	}
+	prevDevRevokedAt, devWasRevoked := bc.revokedDevices[deviceID]
 	delete(bc.revokedDevices, deviceID)
 
 	// Clean up existing session with the same sessionID if any
@@ -213,6 +214,8 @@ func (bc *BrokerClient) provisionSessionInternal(sessionID, deviceID, sessionSec
 		cancel:       sessCancel,
 	}
 
+	prevSessionID := bc.SessionID
+	prevE2ESession := bc.E2ESession
 	bc.sessions[sessionID] = ds
 	if _, ok := bc.deviceSessions[deviceID]; !ok {
 		bc.deviceSessions[deviceID] = make(map[string]bool)
@@ -247,6 +250,28 @@ func (bc *BrokerClient) provisionSessionInternal(sessionID, deviceID, sessionSec
 			}
 		}
 	}
+
+	if persistErr != nil {
+		// Roll back in-memory session cleanly so failed provisioning never leaks a live session loop.
+		sessCancel()
+		ds.MasterSecret = ""
+		delete(bc.sessions, sessionID)
+		if m, ok := bc.deviceSessions[deviceID]; ok {
+			delete(m, sessionID)
+			if len(m) == 0 {
+				delete(bc.deviceSessions, deviceID)
+			}
+		}
+		bc.SessionID = prevSessionID
+		bc.E2ESession = prevE2ESession
+		if devWasRevoked {
+			// Re-pairing clears device revocation, but a failed provisioning must not silently drop the
+			// existing device tombstone from memory.
+			bc.revokedDevices[deviceID] = prevDevRevokedAt
+		}
+		bc.mu.Unlock()
+		return persistErr
+	}
 	bc.mu.Unlock()
 
 	// Launch dedicated, concurrent session loop for this device session
@@ -254,7 +279,7 @@ func (bc *BrokerClient) provisionSessionInternal(sessionID, deviceID, sessionSec
 
 	log.Printf("BrokerClient: Authenticated independent session provisioned for session=%s device=%s (total active: %d)",
 		sessionID, deviceID, bc.ActiveSessionCount())
-	return persistErr
+	return nil
 }
 
 const persistedBrokerStoreVersion = 2
@@ -422,10 +447,29 @@ func (bc *BrokerClient) LoadPersistedSessions() error {
 	return errors.Join(loadErrs...)
 }
 
-func (bc *BrokerClient) RevokeSession(sessionID string) {
+// RevokeSession revokes sessionID in BrokerClient, persists the broker tombstone, and syncs
+// the Host Bridge SessionStore, propagating any persistence errors.
+func (bc *BrokerClient) RevokeSession(sessionID string) error {
+	return bc.revokeSessionInternal(sessionID, true)
+}
+
+// RevokeBrokerSession revokes sessionID in BrokerClient and persists its tombstone without
+// calling back into SessionStore (used when SessionStore revocation was already applied).
+func (bc *BrokerClient) RevokeBrokerSession(sessionID string) error {
+	return bc.revokeSessionInternal(sessionID, false)
+}
+
+func (bc *BrokerClient) revokeSessionInternal(sessionID string, syncSessionStore bool) error {
+	if strings.TrimSpace(sessionID) == "" {
+		return errors.New("session_id is required")
+	}
 	now := time.Now().UTC()
+	var errs []error
+
 	bc.mu.Lock()
-	bc.revokedSessions[sessionID] = now
+	if _, alreadyTombstoned := bc.revokedSessions[sessionID]; !alreadyTombstoned {
+		bc.revokedSessions[sessionID] = now
+	}
 
 	ds, ok := bc.sessions[sessionID]
 	if ok {
@@ -439,7 +483,7 @@ func (bc *BrokerClient) RevokeSession(sessionID string) {
 
 		if bc.persistSecrets && bc.secretStore != nil && ds.SecretRef != "" {
 			if err := bc.secretStore.Delete("broker_session", sessionID, ds.SecretRef); err != nil {
-				log.Printf("BrokerClient Warning: failed removing secret for revoked session %s: %v", sessionID, err)
+				errs = append(errs, fmt.Errorf("%w: %w", security.ErrPersistenceFailed, err))
 			}
 		}
 		ds.MasterSecret = ""
@@ -464,26 +508,48 @@ func (bc *BrokerClient) RevokeSession(sessionID string) {
 		}
 	}
 	if err := bc.saveSessionsToDiskLocked(); err != nil {
-		log.Printf("BrokerClient Warning: failed persisting session revocation for %s: %v", sessionID, err)
+		errs = append(errs, err)
 	}
 	bc.mu.Unlock()
 
-	if bc.Server != nil {
+	if syncSessionStore && bc.Server != nil {
 		if _, err := bc.Server.SessionStore().RevokeSession(sessionID); err != nil {
-			log.Printf("BrokerClient Warning: failed persisting Host Bridge revocation for session %s: %v", sessionID, err)
+			errs = append(errs, err)
 		}
 	}
 	log.Printf("BrokerClient: Session %s revoked and disconnected (remaining active: %d)", sessionID, bc.ActiveSessionCount())
+	return errors.Join(errs...)
 }
 
-func (bc *BrokerClient) RevokeDevice(deviceID string) {
+// RevokeDevice revokes all sessions for deviceID in BrokerClient, persists tombstones, and syncs
+// the Host Bridge SessionStore, propagating any persistence errors.
+func (bc *BrokerClient) RevokeDevice(deviceID string) error {
+	return bc.revokeDeviceInternal(deviceID, true)
+}
+
+// RevokeBrokerDevice revokes all sessions for deviceID in BrokerClient and persists tombstones
+// without calling back into SessionStore (used when SessionStore revocation was already applied).
+func (bc *BrokerClient) RevokeBrokerDevice(deviceID string) error {
+	return bc.revokeDeviceInternal(deviceID, false)
+}
+
+func (bc *BrokerClient) revokeDeviceInternal(deviceID string, syncSessionStore bool) error {
+	if strings.TrimSpace(deviceID) == "" {
+		return errors.New("device_id is required")
+	}
 	now := time.Now().UTC()
+	var errs []error
+
 	bc.mu.Lock()
-	bc.revokedDevices[deviceID] = now
+	if _, alreadyTombstoned := bc.revokedDevices[deviceID]; !alreadyTombstoned {
+		bc.revokedDevices[deviceID] = now
+	}
 
 	if sessionIDs, ok := bc.deviceSessions[deviceID]; ok {
 		for sID := range sessionIDs {
-			bc.revokedSessions[sID] = now
+			if _, already := bc.revokedSessions[sID]; !already {
+				bc.revokedSessions[sID] = now
+			}
 			if ds, exists := bc.sessions[sID]; exists {
 				ds.cancel()
 				ds.mu.Lock()
@@ -494,7 +560,7 @@ func (bc *BrokerClient) RevokeDevice(deviceID string) {
 				ds.mu.Unlock()
 				if bc.persistSecrets && bc.secretStore != nil && ds.SecretRef != "" {
 					if err := bc.secretStore.Delete("broker_session", sID, ds.SecretRef); err != nil {
-						log.Printf("BrokerClient Warning: failed deleting secret for device session %s: %v", sID, err)
+						errs = append(errs, fmt.Errorf("%w: %w", security.ErrPersistenceFailed, err))
 					}
 				}
 				ds.MasterSecret = ""
@@ -515,16 +581,17 @@ func (bc *BrokerClient) RevokeDevice(deviceID string) {
 		}
 	}
 	if err := bc.saveSessionsToDiskLocked(); err != nil {
-		log.Printf("BrokerClient Warning: failed persisting device revocation for %s: %v", deviceID, err)
+		errs = append(errs, err)
 	}
 	bc.mu.Unlock()
 
-	if bc.Server != nil {
+	if syncSessionStore && bc.Server != nil {
 		if _, err := bc.Server.SessionStore().RevokeDevice(deviceID); err != nil {
-			log.Printf("BrokerClient Warning: failed persisting Host Bridge device revocation for %s: %v", deviceID, err)
+			errs = append(errs, err)
 		}
 	}
 	log.Printf("BrokerClient: Device %s and all its sessions revoked (remaining active: %d)", deviceID, bc.ActiveSessionCount())
+	return errors.Join(errs...)
 }
 
 func (bc *BrokerClient) runSessionLoop(ctx context.Context, ds *DeviceSession) {
@@ -540,7 +607,9 @@ func (bc *BrokerClient) runSessionLoop(ctx context.Context, ds *DeviceSession) {
 
 		if time.Now().UTC().After(ds.ExpiresAt) {
 			log.Printf("HostBridge BrokerClient: Session %s expired. Terminating session worker.", ds.SessionID)
-			bc.RevokeSession(ds.SessionID)
+			if revErr := bc.RevokeSession(ds.SessionID); revErr != nil {
+				log.Printf("HostBridge BrokerClient Warning: failed persisting expiry revocation for %s: %v", ds.SessionID, revErr)
+			}
 			return
 		}
 
@@ -562,7 +631,9 @@ func (bc *BrokerClient) runSessionLoop(ctx context.Context, ds *DeviceSession) {
 			}
 			if res != nil && (res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden) {
 				log.Printf("HostBridge BrokerClient: Connection rejected by broker with HTTP %d for session %s (revoked or expired). Disconnecting.", res.StatusCode, ds.SessionID)
-				bc.RevokeSession(ds.SessionID)
+				if revErr := bc.RevokeSession(ds.SessionID); revErr != nil {
+					log.Printf("HostBridge BrokerClient Warning: failed persisting rejection revocation for %s: %v", ds.SessionID, revErr)
+				}
 				return
 			}
 			time.Sleep(backoff)

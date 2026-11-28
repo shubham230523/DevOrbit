@@ -196,7 +196,9 @@ func TestBrokerClient_ProvisionSessionLifecycleAndRevocation(t *testing.T) {
 	}
 
 	// Revoke session -> must disconnect and clear E2ESession
-	client.RevokeSession(sessionID)
+	if err := client.RevokeSession(sessionID); err != nil {
+		t.Fatalf("RevokeSession failed: %v", err)
+	}
 	client.mu.RLock()
 	revokedSessID := client.SessionID
 	revokedE2E := client.E2ESession
@@ -269,7 +271,9 @@ func TestBrokerClient_IndependentSimultaneousDeviceSessions(t *testing.T) {
 	}
 
 	// 3. Revoke Device 1: Device 2 must remain connected and active
-	client.RevokeDevice("phone-01")
+	if err := client.RevokeDevice("phone-01"); err != nil {
+		t.Fatalf("RevokeDevice failed: %v", err)
+	}
 
 	if client.ActiveSessionCount() != 1 {
 		t.Fatalf("Expected 1 active session after revoking phone-01, got %d", client.ActiveSessionCount())
@@ -339,7 +343,9 @@ func TestBrokerClient_PersistenceNoPlaintextLegacyRejectAndRevocationRestart(t *
 		t.Fatalf("SECURITY FAILURE: BrokerClient persistence wrote plaintext session_secret to disk")
 	}
 
-	bc1.RevokeSession("sess-b1")
+	if err := bc1.RevokeSession("sess-b1"); err != nil {
+		t.Fatalf("RevokeSession sess-b1 failed: %v", err)
+	}
 	bc1.Stop()
 
 	// Restart into bc2: only sess-b2 is restored; sess-b1 stays revoked
@@ -372,4 +378,80 @@ func TestBrokerClient_PersistenceNoPlaintextLegacyRejectAndRevocationRestart(t *
 	if bcLegacy.ActiveSessionCount() != 0 {
 		t.Fatalf("legacy plaintext broker sessions must not be restored")
 	}
+}
+
+type failingBrokerSecretStore struct {
+	available bool
+	storeErr  error
+	deleteErr error
+	secrets   map[string]string
+}
+
+func (f *failingBrokerSecretStore) Name() string    { return "failing-broker-store" }
+func (f *failingBrokerSecretStore) Available() bool { return f.available }
+func (f *failingBrokerSecretStore) Store(scope, id string, secret []byte) (string, error) {
+	if f.storeErr != nil {
+		return "", f.storeErr
+	}
+	f.secrets[scope+":"+id] = string(secret)
+	return "ref:" + scope + ":" + id, nil
+}
+func (f *failingBrokerSecretStore) Load(scope, id, ref string) ([]byte, error) {
+	v, ok := f.secrets[scope+":"+id]
+	if !ok {
+		return nil, security.ErrSecretNotFound
+	}
+	return []byte(v), nil
+}
+func (f *failingBrokerSecretStore) Delete(scope, id, ref string) error {
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	delete(f.secrets, scope+":"+id)
+	return nil
+}
+
+func TestBrokerClient_PersistenceAndRevocationErrorPropagation(t *testing.T) {
+	ss := &failingBrokerSecretStore{available: true, secrets: make(map[string]string)}
+	persistPath := filepath.Join(t.TempDir(), "host_sessions.json")
+
+	// 1. ProvisionSession persistence failure must roll back in-memory session cleanly
+	bcFailProv := NewBrokerClient("ws://127.0.0.1:18081", "mach-fp", "", "host-token-32b", nil)
+	bcFailProv.SetSecretStore(ss)
+	_ = bcFailProv.EnableSessionPersistence(persistPath)
+	ss.storeErr = errors.New("keyring store failure")
+	if err := bcFailProv.ProvisionSession("sess-fp", "dev-fp", "secret-fp-32bytes-0123456789012!", time.Hour); !errors.Is(err, security.ErrPersistenceFailed) {
+		t.Fatalf("expected ErrPersistenceFailed on ProvisionSession, got: %v", err)
+	}
+	if bcFailProv.ActiveSessionCount() != 0 {
+		t.Fatalf("failed ProvisionSession must roll back in-memory session, got count=%d", bcFailProv.ActiveSessionCount())
+	}
+	bcFailProv.Stop()
+
+	// 2. RevokeSession & RevokeDevice persistence failure must still revoke in-memory AND return error
+	ss.storeErr = nil
+	bcRev := NewBrokerClient("ws://127.0.0.1:18081", "mach-fr", "", "host-token-32b", nil)
+	bcRev.SetSecretStore(ss)
+	_ = bcRev.EnableSessionPersistence(persistPath)
+	if err := bcRev.ProvisionSession("sess-fr1", "dev-fr1", "secret-fr1-32bytes-01234567890!", time.Hour); err != nil {
+		t.Fatalf("ProvisionSession fr1 failed: %v", err)
+	}
+	if err := bcRev.ProvisionSession("sess-fr2", "dev-fr2", "secret-fr2-32bytes-01234567890!", time.Hour); err != nil {
+		t.Fatalf("ProvisionSession fr2 failed: %v", err)
+	}
+
+	ss.deleteErr = errors.New("keyring delete failure")
+	if err := bcRev.RevokeBrokerSession("sess-fr1"); !errors.Is(err, security.ErrPersistenceFailed) {
+		t.Fatalf("expected ErrPersistenceFailed from RevokeBrokerSession, got: %v", err)
+	}
+	if bcRev.ActiveSessionCount() != 1 {
+		t.Fatalf("RevokeBrokerSession must still remove session in memory on persistence error, got count=%d", bcRev.ActiveSessionCount())
+	}
+	if err := bcRev.RevokeBrokerDevice("dev-fr2"); !errors.Is(err, security.ErrPersistenceFailed) {
+		t.Fatalf("expected ErrPersistenceFailed from RevokeBrokerDevice, got: %v", err)
+	}
+	if bcRev.ActiveSessionCount() != 0 {
+		t.Fatalf("RevokeBrokerDevice must still remove device sessions in memory on persistence error, got count=%d", bcRev.ActiveSessionCount())
+	}
+	bcRev.Stop()
 }

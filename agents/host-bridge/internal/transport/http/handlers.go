@@ -19,11 +19,12 @@ import (
 )
 
 type SessionProvisioner func(sessionID, deviceID, masterSecret string, expiresAt time.Time) error
-type SessionRevoker func(sessionID, deviceID string)
+type SessionRevoker func(sessionID, deviceID string) error
 
 type BrokerAuthorizer interface {
 	AuthorizeSession(ctx context.Context, machineID, deviceID, sessionID, clientToken, hostToken string, expiresAt time.Time) error
 	RevokeDevice(ctx context.Context, machineID, deviceID string) error
+	CloseSession(ctx context.Context, machineID, sessionID string) error
 }
 
 type resourceOwner struct {
@@ -236,23 +237,44 @@ func (s *Server) HandleRevokeSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	store := s.ensureSessionStore()
+	var localErrs []error
+	var remoteErrs []error
+
 	if req.SessionID != "" {
 		if _, err := store.RevokeSession(req.SessionID); err != nil {
-			writeError(w, http.StatusInternalServerError, "session revoked in memory but failed persisting durable revocation: "+err.Error())
-			return
+			localErrs = append(localErrs, err)
 		}
 	}
 	if req.DeviceID != "" {
 		if _, err := store.RevokeDevice(req.DeviceID); err != nil {
-			writeError(w, http.StatusInternalServerError, "device revoked in memory but failed persisting durable revocation: "+err.Error())
-			return
+			localErrs = append(localErrs, err)
 		}
 	}
 	if s.sessionRevoker != nil {
-		s.sessionRevoker(req.SessionID, req.DeviceID)
+		if err := s.sessionRevoker(req.SessionID, req.DeviceID); err != nil {
+			localErrs = append(localErrs, err)
+		}
 	}
-	if s.brokerAuthorizer != nil && req.DeviceID != "" && s.pairingEngine != nil {
-		_ = s.brokerAuthorizer.RevokeDevice(r.Context(), s.pairingEngine.HostID(), req.DeviceID)
+	if s.brokerAuthorizer != nil && s.pairingEngine != nil {
+		if req.DeviceID != "" {
+			if err := s.brokerAuthorizer.RevokeDevice(r.Context(), s.pairingEngine.HostID(), req.DeviceID); err != nil {
+				remoteErrs = append(remoteErrs, err)
+			}
+		} else if req.SessionID != "" {
+			if err := s.brokerAuthorizer.CloseSession(r.Context(), s.pairingEngine.HostID(), req.SessionID); err != nil {
+				remoteErrs = append(remoteErrs, err)
+			}
+		}
+	}
+
+	if len(localErrs) > 0 {
+		allErrs := append(localErrs, remoteErrs...)
+		writeError(w, http.StatusInternalServerError, "revoked in memory but failed durable persistence: "+errors.Join(allErrs...).Error())
+		return
+	}
+	if len(remoteErrs) > 0 {
+		writeError(w, http.StatusBadGateway, "revoked locally but failed remote broker revocation: "+errors.Join(remoteErrs...).Error())
+		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})

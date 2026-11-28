@@ -331,6 +331,48 @@ func (b *Broker) RevokeDevice(machineID, deviceID string) {
 	}
 }
 
+// RevokeSession revokes exactly one authorized session. It deletes the session's client
+// authorization token and expiry (so a revoked session cannot re-authorize a new tunnel),
+// closes any live host/client tunnels for it, and notifies a connected client with a revoked
+// frame. Sibling sessions belonging to the same device keep their authorization and connections.
+func (b *Broker) RevokeSession(machineID, sessionID string) {
+	if machineID == "" || sessionID == "" {
+		return
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	for key := range b.authorizedClientTokens {
+		parts := strings.SplitN(key, ":", 3)
+		if len(parts) != 3 || parts[0] != machineID || parts[2] != sessionID {
+			continue
+		}
+		delete(b.authorizedClientTokens, key)
+		delete(b.authorizedExpiries, key)
+	}
+	delete(b.sessionExpiries, sessionID)
+
+	sess, ok := b.sessions[sessionID]
+	if !ok || sess.MachineID != machineID {
+		return
+	}
+
+	if sess.ClientConn != nil {
+		revokedFrame := &FrameEnvelope{
+			ProtocolVersion: "1.2",
+			SessionID:       sess.ID,
+			Type:            "revoked",
+			Status:          "revoked",
+			Timestamp:       time.Now().UnixMicro(),
+		}
+		sess.mu.Lock()
+		_ = sess.ClientConn.WriteJSON(revokedFrame)
+		sess.mu.Unlock()
+	}
+	b.closeSessionLocked(sessionID)
+}
+
 func (b *Broker) RegisterHostConnection(machineID, sessionID, token string, conn *websocket.Conn) (*Session, bool, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -883,7 +925,7 @@ func (b *Broker) HandleRevoke(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.SessionID != "" {
-		b.CloseSession(req.SessionID)
+		b.RevokeSession(req.MachineID, req.SessionID)
 	}
 
 	w.Header().Set("Content-Type", "application/json")

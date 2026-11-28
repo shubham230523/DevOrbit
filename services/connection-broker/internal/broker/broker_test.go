@@ -607,3 +607,113 @@ func TestBroker_ConcurrentRelayAndLifecycleStress(t *testing.T) {
 		<-done
 	}
 }
+
+func TestBroker_SessionOnlyRevocationIsolatedFromSiblingSessions(t *testing.T) {
+	adminSecret := "broker-service-secret-sess-revoke!"
+	b := NewBrokerWithSecret(adminSecret)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/internal/sessions/authorize", b.HandleAuthorizeSession)
+	mux.HandleFunc("/api/v1/internal/devices/revoke", b.HandleRevoke)
+	mux.HandleFunc("/ws/host", b.HandleHostWebSocket)
+	mux.HandleFunc("/ws/client", b.HandleClientWebSocket)
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	wsURL := strings.Replace(server.URL, "http://", "ws://", 1)
+	machineID := "mach-sess-rev"
+	deviceID := "dev-sess-rev"
+	hostToken := "host-token-sess-rev-32bytes"
+	type sessSpec struct {
+		sessionID   string
+		clientToken string
+	}
+	sessions := []sessSpec{
+		{sessionID: "sess-rev-a", clientToken: "client-token-rev-a-32bytes"},
+		{sessionID: "sess-rev-b", clientToken: "client-token-rev-b-32bytes"},
+	}
+
+	for _, s := range sessions {
+		authBody := fmt.Sprintf(`{
+			"machine_id": "%s",
+			"device_id": "%s",
+			"session_id": "%s",
+			"client_token": "%s",
+			"host_token": "%s",
+			"ttl_seconds": 3600
+		}`, machineID, deviceID, s.sessionID, s.clientToken, hostToken)
+		req, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/internal/sessions/authorize", strings.NewReader(authBody))
+		req.Header.Set("Authorization", "Bearer "+adminSecret)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("Failed to authorize %s: %v", s.sessionID, err)
+		}
+		resp.Body.Close()
+	}
+
+	clientHeader := func(token string) http.Header {
+		return http.Header{"Authorization": []string{"Bearer " + token}}
+	}
+	hostHeader := clientHeader(hostToken)
+	clientDialURL := func(sessionID string) string {
+		return fmt.Sprintf("%s/ws/client?machine_id=%s&device_id=%s&session_id=%s", wsURL, machineID, deviceID, sessionID)
+	}
+
+	// Bring both sessions fully online (host + client) on the same device.
+	for _, s := range sessions {
+		hostConn, _, err := websocket.DefaultDialer.Dial(fmt.Sprintf("%s/ws/host?machine_id=%s&session_id=%s", wsURL, machineID, s.sessionID), hostHeader)
+		if err != nil {
+			t.Fatalf("Failed to connect host for %s: %v", s.sessionID, err)
+		}
+		defer hostConn.Close()
+
+		clientConn, _, err := websocket.DefaultDialer.Dial(clientDialURL(s.sessionID), clientHeader(s.clientToken))
+		if err != nil {
+			t.Fatalf("Failed to connect client for %s: %v", s.sessionID, err)
+		}
+
+		var ack FrameEnvelope
+		if err := clientConn.ReadJSON(&ack); err != nil || ack.Type != "session_ready" {
+			t.Fatalf("Expected session_ready for %s, got: %v, err: %v", s.sessionID, ack, err)
+		}
+		// Client tunnels are closed here so post-revocation reconnects are not rejected by the
+		// broker's single-live-client guard; host tunnels stay connected for both sessions.
+		clientConn.Close()
+	}
+
+	// Allow the broker to observe the closed client tunnels before re-dialing.
+	time.Sleep(100 * time.Millisecond)
+
+	if b.ActiveSessionCount() != 2 {
+		t.Fatalf("Expected 2 active sessions before revocation, got %d", b.ActiveSessionCount())
+	}
+
+	// Revoke ONLY sess-rev-a via the service-to-service API.
+	revokeBody := fmt.Sprintf(`{"machine_id":"%s","session_id":"%s"}`, machineID, "sess-rev-a")
+	reqRevoke, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/internal/devices/revoke", strings.NewReader(revokeBody))
+	reqRevoke.Header.Set("Authorization", "Bearer "+adminSecret)
+	reqRevoke.Header.Set("Content-Type", "application/json")
+	resRevoke, err := http.DefaultClient.Do(reqRevoke)
+	if err != nil || resRevoke.StatusCode != http.StatusOK {
+		t.Fatalf("Expected HTTP 200 for session revocation, got: %v, err: %v", resRevoke, err)
+	}
+	resRevoke.Body.Close()
+
+	// The revoked session's tunnels are closed and its client token is deauthorized.
+	if b.ActiveSessionCount() != 1 {
+		t.Fatalf("Expected 1 active session after single-session revocation, got %d", b.ActiveSessionCount())
+	}
+	_, resRevokedClient, err := websocket.DefaultDialer.Dial(clientDialURL("sess-rev-a"), clientHeader(sessions[0].clientToken))
+	if err == nil || resRevokedClient == nil || resRevokedClient.StatusCode != http.StatusForbidden {
+		t.Fatalf("Expected HTTP 403 for revoked session reconnect, got: %v", resRevokedClient)
+	}
+
+	// The sibling session on the same device keeps its authorization and can reconnect.
+	siblingConn, resSibling, err := websocket.DefaultDialer.Dial(clientDialURL("sess-rev-b"), clientHeader(sessions[1].clientToken))
+	if err != nil {
+		t.Fatalf("Expected sibling session sess-rev-b to remain authorized, dial err: %v (resp %v)", err, resSibling)
+	}
+	siblingConn.Close()
+}

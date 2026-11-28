@@ -136,13 +136,19 @@ func main() {
 	serverEngine.SetSessionProvisioner(func(sessionID, deviceID, sessionSecret string, expiry time.Time) error {
 		return brokerClient.ProvisionSession(sessionID, deviceID, sessionSecret, expiry)
 	})
-	serverEngine.SetSessionRevoker(func(sessionID, deviceID string) {
+	serverEngine.SetSessionRevoker(func(sessionID, deviceID string) error {
+		var errs []error
 		if sessionID != "" {
-			brokerClient.RevokeSession(sessionID)
+			if err := brokerClient.RevokeBrokerSession(sessionID); err != nil {
+				errs = append(errs, err)
+			}
 		}
 		if deviceID != "" {
-			brokerClient.RevokeDevice(deviceID)
+			if err := brokerClient.RevokeBrokerDevice(deviceID); err != nil {
+				errs = append(errs, err)
+			}
 		}
+		return errors.Join(errs...)
 	})
 
 	brokerClient.Start(context.Background())

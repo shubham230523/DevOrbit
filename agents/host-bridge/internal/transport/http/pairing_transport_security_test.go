@@ -2,11 +2,14 @@ package http_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -434,5 +437,229 @@ func TestPairingTransport_MultiValuedForwardedProtoAndRevokePersistenceFailure(t
 	}
 	if _, activeErr := store.GetActiveSession("sess-rev-err", "dev-rev-err"); activeErr != security.ErrSessionRevoked {
 		t.Fatalf("expected session to still be revoked immediately in memory despite persistence failure, got: %v", activeErr)
+	}
+}
+
+type mockSecStoreHTTP struct {
+	deleteErr error
+	secrets   map[string]string
+}
+
+func (m *mockSecStoreHTTP) Name() string    { return "mock-http-sec-store" }
+func (m *mockSecStoreHTTP) Available() bool { return true }
+func (m *mockSecStoreHTTP) Store(scope, id string, secret []byte) (string, error) {
+	m.secrets[scope+":"+id] = string(secret)
+	return "ref:" + scope + ":" + id, nil
+}
+func (m *mockSecStoreHTTP) Load(scope, id, ref string) ([]byte, error) {
+	v, ok := m.secrets[scope+":"+id]
+	if !ok {
+		return nil, security.ErrSecretNotFound
+	}
+	return []byte(v), nil
+}
+func (m *mockSecStoreHTTP) Delete(scope, id, ref string) error {
+	if m.deleteErr != nil {
+		return m.deleteErr
+	}
+	delete(m.secrets, scope+":"+id)
+	return nil
+}
+
+type mockBrokerAuthorizerHTTP struct {
+	authErr          error
+	revokeDevErr     error
+	closeSessErr     error
+	revokeDevCalled  []string
+	closeSessCalled  []string
+	lastAuthSessID   string
+	lastAuthToken    string
+}
+
+func (m *mockBrokerAuthorizerHTTP) AuthorizeSession(ctx context.Context, machineID, deviceID, sessionID, clientToken, hostToken string, expiresAt time.Time) error {
+	m.lastAuthSessID = sessionID
+	m.lastAuthToken = clientToken
+	return m.authErr
+}
+
+func (m *mockBrokerAuthorizerHTTP) RevokeDevice(ctx context.Context, machineID, deviceID string) error {
+	m.revokeDevCalled = append(m.revokeDevCalled, deviceID)
+	return m.revokeDevErr
+}
+
+func (m *mockBrokerAuthorizerHTTP) CloseSession(ctx context.Context, machineID, sessionID string) error {
+	m.closeSessCalled = append(m.closeSessCalled, sessionID)
+	return m.closeSessErr
+}
+
+func TestPairingRollbackAndBrokerRevocationErrorPropagation(t *testing.T) {
+	srv, engine, _, tlsSrv, _, hostSecret := newProdPairingSecEnv(t)
+	persistPath := filepath.Join(t.TempDir(), "sessions.json")
+	ss := &mockSecStoreHTTP{secrets: make(map[string]string)}
+	srv.SessionStore().SetSecretStore(ss)
+	if err := srv.SessionStore().EnablePersistence(persistPath); err != nil {
+		t.Fatalf("EnablePersistence failed: %v", err)
+	}
+
+	makeConfirmBody := func(devID, nonce string) []byte {
+		ch, _ := engine.CreateChallenge(5 * time.Minute)
+		ts := strconv.FormatInt(time.Now().UTC().UnixMicro(), 10)
+		proof, _ := engine.GenerateProofForChallenge(ch.ID, devID, ts, nonce)
+		b, _ := json.Marshal(map[string]string{
+			"challenge_id":    ch.ID,
+			"device_id":       devID,
+			"device_name":     "Phone",
+			"timestamp":       ts,
+			"nonce":           nonce,
+			"proof_signature": proof,
+		})
+		return b
+	}
+
+	// 1. Broker authorization fails AFTER local RegisterSession -> rollback writes durable tombstone
+	authMock := &mockBrokerAuthorizerHTTP{authErr: errors.New("broker authorize unreachable")}
+	srv.SetBrokerAuthorizer(authMock)
+	respAuthFail, err := tlsSrv.Client().Post(tlsSrv.URL+"/api/v1/pairing/confirm", "application/json", bytes.NewReader(makeConfirmBody("dev-rb-auth", "nonce-rb-auth-0001")))
+	if err != nil {
+		t.Fatalf("Post confirm failed: %v", err)
+	}
+	authFailBody, _ := io.ReadAll(respAuthFail.Body)
+	respAuthFail.Body.Close()
+	if respAuthFail.StatusCode != http.StatusBadGateway {
+		t.Fatalf("expected 502 on broker auth failure, got %d (%s)", respAuthFail.StatusCode, string(authFailBody))
+	}
+	if authMock.lastAuthSessID == "" {
+		t.Fatalf("expected AuthorizeSession to be called with generated session ID")
+	}
+	// Restart store against persistPath -> rolled-back session MUST be rejected as revoked
+	restarted1 := security.NewSessionStore()
+	restarted1.SetSecretStore(ss)
+	_ = restarted1.EnablePersistence(persistPath)
+	_ = restarted1.LoadPersistedSessions()
+	if _, authErr := restarted1.AuthenticateBearer(authMock.lastAuthToken, authMock.lastAuthSessID, "dev-rb-auth"); authErr != security.ErrSessionRevoked {
+		t.Fatalf("expected rolled-back session to remain revoked after restart, got: %v", authErr)
+	}
+
+	// 2. SessionProvisioner fails AFTER AuthorizeSession -> revokes BrokerClient session, remote device, & rolls back local store
+	authMock.authErr = nil
+	var revokedViaCallback []string
+	srv.SetSessionRevoker(func(sessionID, deviceID string) error {
+		revokedViaCallback = append(revokedViaCallback, sessionID+":"+deviceID)
+		return nil
+	})
+	srv.SetSessionProvisioner(func(sessionID, deviceID, masterSecret string, expiresAt time.Time) error {
+		return errors.New("local broker client provisioning failed")
+	})
+	respProvFail, err := tlsSrv.Client().Post(tlsSrv.URL+"/api/v1/pairing/confirm", "application/json", bytes.NewReader(makeConfirmBody("dev-rb-prov", "nonce-rb-prov-0001")))
+	if err != nil {
+		t.Fatalf("Post confirm failed: %v", err)
+	}
+	provFailBody, _ := io.ReadAll(respProvFail.Body)
+	respProvFail.Body.Close()
+	if respProvFail.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected 500 on sessionProvisioner failure, got %d (%s)", respProvFail.StatusCode, string(provFailBody))
+	}
+	if len(revokedViaCallback) != 1 || !strings.HasPrefix(revokedViaCallback[0], authMock.lastAuthSessID+":") {
+		t.Fatalf("expected sessionRevoker callback for %s, got %v", authMock.lastAuthSessID, revokedViaCallback)
+	}
+	if len(authMock.revokeDevCalled) != 1 || authMock.revokeDevCalled[0] != "dev-rb-prov" {
+		t.Fatalf("expected remote RevokeDevice rollback call for dev-rb-prov, got %v", authMock.revokeDevCalled)
+	}
+
+	// 3. Rollback error during provisioning failure preserves original error + rollback error without leaking secret
+	ss.deleteErr = errors.New("secret delete permission failure")
+	srv.SetSessionProvisioner(func(sessionID, deviceID, masterSecret string, expiresAt time.Time) error {
+		return errors.New("provision boom")
+	})
+	respRBErr, err := tlsSrv.Client().Post(tlsSrv.URL+"/api/v1/pairing/confirm", "application/json", bytes.NewReader(makeConfirmBody("dev-rb-delfail", "nonce-rb-df-0001")))
+	if err != nil {
+		t.Fatalf("Post confirm failed: %v", err)
+	}
+	rbErrBody, _ := io.ReadAll(respRBErr.Body)
+	respRBErr.Body.Close()
+	if respRBErr.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", respRBErr.StatusCode)
+	}
+	if !strings.Contains(string(rbErrBody), "provision boom") || !strings.Contains(string(rbErrBody), "rollback errors") {
+		t.Fatalf("expected original + rollback error in response, got: %s", string(rbErrBody))
+	}
+	if strings.Contains(string(rbErrBody), authMock.lastAuthToken) {
+		t.Fatalf("error response leaked session token!")
+	}
+	ss.deleteErr = nil
+
+	// 4. BrokerClient / BrokerAuthorizer revocation error propagation on /api/v1/sessions/revoke
+	_, _ = srv.SessionStore().RegisterSession("sess-prop-1", "dev-prop-1", "tok-prop-1-32bytes-secret!", "sec-prop-1-32bytes-master-01!", time.Now().UTC().Add(time.Hour), security.NewFullSessionPermissions())
+	_, _ = srv.SessionStore().RegisterSession("sess-prop-2", "dev-prop-2", "tok-prop-2-32bytes-secret!", "sec-prop-2-32bytes-master-01!", time.Now().UTC().Add(time.Hour), security.NewFullSessionPermissions())
+
+	// 4a. sessionRevoker error -> 500, session STILL revoked in memory
+	srv.SetSessionRevoker(func(sessionID, deviceID string) error {
+		return errors.New("broker client disk failure")
+	})
+	reqRevA, _ := http.NewRequest(http.MethodPost, tlsSrv.URL+"/api/v1/sessions/revoke", strings.NewReader(`{"session_id":"sess-prop-1"}`))
+	reqRevA.Header.Set("Authorization", "Bearer "+hostSecret)
+	respRevA, err := tlsSrv.Client().Do(reqRevA)
+	if err != nil {
+		t.Fatalf("Do revoke failed: %v", err)
+	}
+	respRevA.Body.Close()
+	if respRevA.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected 500 when sessionRevoker fails, got %d", respRevA.StatusCode)
+	}
+	if _, activeErr := srv.SessionStore().GetActiveSession("sess-prop-1", "dev-prop-1"); activeErr != security.ErrSessionRevoked {
+		t.Fatalf("expected sess-prop-1 to still be revoked in memory, got: %v", activeErr)
+	}
+
+	// 4b. Remote CloseSession error on session-only revoke -> 502 (and CloseSession invoked, NOT RevokeDevice)
+	srv.SetSessionRevoker(func(sessionID, deviceID string) error { return nil })
+	authMock.revokeDevCalled = nil
+	authMock.closeSessCalled = nil
+	authMock.closeSessErr = errors.New("broker remote close timeout")
+	reqRevB, _ := http.NewRequest(http.MethodPost, tlsSrv.URL+"/api/v1/sessions/revoke", strings.NewReader(`{"session_id":"sess-prop-2"}`))
+	reqRevB.Header.Set("Authorization", "Bearer "+hostSecret)
+	respRevB, err := tlsSrv.Client().Do(reqRevB)
+	if err != nil {
+		t.Fatalf("Do revoke failed: %v", err)
+	}
+	respRevB.Body.Close()
+	if respRevB.StatusCode != http.StatusBadGateway {
+		t.Fatalf("expected 502 when remote CloseSession fails, got %d", respRevB.StatusCode)
+	}
+	if len(authMock.closeSessCalled) != 1 || authMock.closeSessCalled[0] != "sess-prop-2" || len(authMock.revokeDevCalled) != 0 {
+		t.Fatalf("expected CloseSession(sess-prop-2) only, got close=%v revDev=%v", authMock.closeSessCalled, authMock.revokeDevCalled)
+	}
+
+	// 4c. Remote RevokeDevice error on device-wide revoke -> 502
+	authMock.closeSessErr = nil
+	authMock.revokeDevErr = errors.New("broker remote device revoke error")
+	reqRevC, _ := http.NewRequest(http.MethodPost, tlsSrv.URL+"/api/v1/sessions/revoke", strings.NewReader(`{"device_id":"dev-prop-2"}`))
+	reqRevC.Header.Set("Authorization", "Bearer "+hostSecret)
+	respRevC, err := tlsSrv.Client().Do(reqRevC)
+	if err != nil {
+		t.Fatalf("Do revoke failed: %v", err)
+	}
+	respRevC.Body.Close()
+	if respRevC.StatusCode != http.StatusBadGateway {
+		t.Fatalf("expected 502 when remote RevokeDevice fails, got %d", respRevC.StatusCode)
+	}
+
+	// 4d. Absent-from-memory session revoke via HTTP writes durable tombstone and returns 200
+	authMock.revokeDevErr = nil
+	reqRevAbs, _ := http.NewRequest(http.MethodPost, tlsSrv.URL+"/api/v1/sessions/revoke", strings.NewReader(`{"session_id":"sess-never-loaded"}`))
+	reqRevAbs.Header.Set("Authorization", "Bearer "+hostSecret)
+	respRevAbs, err := tlsSrv.Client().Do(reqRevAbs)
+	if err != nil {
+		t.Fatalf("Do revoke absent failed: %v", err)
+	}
+	respRevAbs.Body.Close()
+	if respRevAbs.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 when absent session tombstone persists cleanly, got %d", respRevAbs.StatusCode)
+	}
+	restarted2 := security.NewSessionStore()
+	restarted2.SetSecretStore(ss)
+	_ = restarted2.EnablePersistence(persistPath)
+	_ = restarted2.LoadPersistedSessions()
+	if _, err := restarted2.GetActiveSession("sess-never-loaded", "any-dev"); err != security.ErrSessionRevoked {
+		t.Fatalf("expected ErrSessionRevoked after restart for HTTP-revoked absent session, got: %v", err)
 	}
 }

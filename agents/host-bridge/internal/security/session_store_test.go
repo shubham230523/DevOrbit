@@ -559,3 +559,265 @@ func TestSessionStore_PersistenceFailuresAndUnavailableSecureStore(t *testing.T)
 		}
 	})
 }
+
+func TestSessionStore_AbsentSessionRevocationTombstoneAndRollback(t *testing.T) {
+	t.Run("revoking absent session persists durable tombstone across restarts and resists stale reload", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		persistPath := filepath.Join(tmpDir, "sessions.json")
+		mockSS := newMockSecretStore(true)
+
+		// 1. store1 creates a valid session and saves JSON
+		store1 := NewSessionStore()
+		store1.SetSecretStore(mockSS)
+		if err := store1.EnablePersistence(persistPath); err != nil {
+			t.Fatalf("EnablePersistence store1 failed: %v", err)
+		}
+		tok := "tok-absent-rev-32bytes-01234567!"
+		if _, err := store1.RegisterSession("sess-abs-01", "dev-abs-01", tok, "master-abs-01-32bytes-012345678!", time.Now().UTC().Add(time.Hour), NewFullSessionPermissions()); err != nil {
+			t.Fatalf("RegisterSession failed: %v", err)
+		}
+		staleJSON, err := os.ReadFile(persistPath)
+		if err != nil {
+			t.Fatalf("ReadFile failed: %v", err)
+		}
+
+		// 2. store2 loads with OS secret store UNAVAILABLE -> sess-abs-01 fails to load and is absent from memory
+		mockSS.available = false
+		store2 := NewSessionStore()
+		store2.SetSecretStore(mockSS)
+		if err := store2.EnablePersistence(persistPath); !errors.Is(err, ErrSecureStoreUnavailable) {
+			t.Fatalf("expected ErrSecureStoreUnavailable, got: %v", err)
+		}
+		loadErr := store2.LoadPersistedSessions()
+		if !errors.Is(loadErr, ErrSecureStoreUnavailable) {
+			t.Fatalf("expected ErrSecureStoreUnavailable during LoadPersistedSessions, got: %v", loadErr)
+		}
+
+		// 3. Revoke absent session -> returns (false, nil) meaning absent from memory, tombstone persisted
+		wasActive, err := store2.RevokeSession("sess-abs-01")
+		if err != nil {
+			t.Fatalf("expected tombstone persistence to succeed for absent session, got err: %v", err)
+		}
+		if wasActive {
+			t.Fatalf("expected wasActive=false for session absent from memory")
+		}
+
+		// Repeating revoke is idempotent and stays revoked
+		wasActiveRepeat, errRepeat := store2.RevokeSession("sess-abs-01")
+		if errRepeat != nil || wasActiveRepeat {
+			t.Fatalf("expected idempotent repeat revoke (false, nil), got (%v, %v)", wasActiveRepeat, errRepeat)
+		}
+
+		// 4. Restore secret store availability and restart into store3 -> session must remain revoked
+		mockSS.available = true
+		store3 := NewSessionStore()
+		store3.SetSecretStore(mockSS)
+		if err := store3.EnablePersistence(persistPath); err != nil {
+			t.Fatalf("EnablePersistence store3 failed: %v", err)
+		}
+		if err := store3.LoadPersistedSessions(); err != nil {
+			t.Fatalf("LoadPersistedSessions store3 failed: %v", err)
+		}
+		if _, authErr := store3.AuthenticateBearer(tok, "sess-abs-01", "dev-abs-01"); authErr != ErrSessionRevoked {
+			t.Fatalf("expected ErrSessionRevoked after restart with tombstone, got: %v", authErr)
+		}
+
+		// 5. Even if an attacker/backup restores the original stale JSON without tombstones and reloads store3,
+		//    existing tombstone in memory must NOT be overridden.
+		if err := os.WriteFile(persistPath, staleJSON, 0600); err != nil {
+			t.Fatalf("WriteFile staleJSON failed: %v", err)
+		}
+		_ = store3.LoadPersistedSessions()
+		if _, authErr := store3.AuthenticateBearer(tok, "sess-abs-01", "dev-abs-01"); authErr != ErrSessionRevoked {
+			t.Fatalf("stale JSON overrode active tombstone in store3! got: %v", authErr)
+		}
+	})
+
+	t.Run("revoking empty sessionID returns error and tombstone write failure returns ErrPersistenceFailed", func(t *testing.T) {
+		store := NewSessionStore()
+		if _, err := store.RevokeSession(""); err == nil {
+			t.Fatalf("expected error for empty sessionID")
+		}
+
+		badPath := filepath.Join(t.TempDir(), "dir_blocking_tombstone")
+		_ = os.MkdirAll(badPath, 0700)
+		storeFail := NewSessionStore()
+		storeFail.SetSecretStore(newMockSecretStore(true))
+		_ = storeFail.EnablePersistence(badPath)
+		wasActive, err := storeFail.RevokeSession("sess-absent-write-fail")
+		if wasActive || !errors.Is(err, ErrPersistenceFailed) {
+			t.Fatalf("expected (false, ErrPersistenceFailed) when tombstone write fails, got (%v, %v)", wasActive, err)
+		}
+	})
+
+	t.Run("RemoveSession records tombstone and propagates delete/write failures", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		persistPath := filepath.Join(tmpDir, "sessions.json")
+		mockSS := newMockSecretStore(true)
+
+		store := NewSessionStore()
+		store.SetSecretStore(mockSS)
+		_ = store.EnablePersistence(persistPath)
+		_, _ = store.RegisterSession("sess-rb-1", "dev-rb", "tok-rb-1", "master-rb-32-bytes-01234567890!", time.Now().UTC().Add(time.Hour), NewFullSessionPermissions())
+
+		if err := store.RemoveSession("sess-rb-1"); err != nil {
+			t.Fatalf("RemoveSession failed: %v", err)
+		}
+
+		// Restart -> rolled-back session cannot be resurrected or re-registered
+		store2 := NewSessionStore()
+		store2.SetSecretStore(mockSS)
+		_ = store2.EnablePersistence(persistPath)
+		_ = store2.LoadPersistedSessions()
+		if _, err := store2.AuthenticateBearer("tok-rb-1", "sess-rb-1", "dev-rb"); err != ErrSessionRevoked {
+			t.Fatalf("expected ErrSessionRevoked for rolled-back session after restart, got: %v", err)
+		}
+
+		// Delete error during RemoveSession must propagate
+		store3 := NewSessionStore()
+		store3.SetSecretStore(mockSS)
+		_ = store3.EnablePersistence(filepath.Join(tmpDir, "sessions3.json"))
+		_, _ = store3.RegisterSession("sess-rb-err", "dev-rb", "tok-rb-err", "master-rb-err-32bytes-012345678!", time.Now().UTC().Add(time.Hour), NewFullSessionPermissions())
+		mockSS.deleteErr = errors.New("secret delete permission denied")
+		if err := store3.RemoveSession("sess-rb-err"); !errors.Is(err, ErrPersistenceFailed) {
+			t.Fatalf("expected ErrPersistenceFailed on RemoveSession delete error, got: %v", err)
+		}
+	})
+}
+
+// TestSessionStore_AbsentRevocationDestroysPersistedSealedSecret proves that revoking a session that is
+// absent from memory still destroys the sealed secret referenced only by persisted state. Without this,
+// a failed atomic JSON replacement could leave a recoverable ciphertext reference on disk.
+func TestSessionStore_AbsentRevocationDestroysPersistedSealedSecret(t *testing.T) {
+	tmpDir := t.TempDir()
+	persistPath := filepath.Join(tmpDir, "sessions.json")
+	mockSS := newMockSecretStore(true)
+
+	store1 := NewSessionStore()
+	store1.SetSecretStore(mockSS)
+	if err := store1.EnablePersistence(persistPath); err != nil {
+		t.Fatalf("EnablePersistence failed: %v", err)
+	}
+	tokOne := "tok-absorb-1-32bytes-0123456789ab"
+	tokTwo := "tok-absorb-2-32bytes-0123456789ab"
+	if _, err := store1.RegisterSession("sess-absorb-1", "dev-absorb-1", tokOne, "master-absorb-1-32bytes-0123456!", time.Now().UTC().Add(time.Hour), NewFullSessionPermissions()); err != nil {
+		t.Fatalf("RegisterSession sess-absorb-1 failed: %v", err)
+	}
+	if _, err := store1.RegisterSession("sess-absorb-2", "dev-absorb-2", tokTwo, "master-absorb-2-32bytes-0123456!", time.Now().UTC().Add(time.Hour), NewFullSessionPermissions()); err != nil {
+		t.Fatalf("RegisterSession sess-absorb-2 failed: %v", err)
+	}
+	for _, id := range []string{"http_session:sess-absorb-1", "http_session:sess-absorb-2"} {
+		if _, ok := mockSS.secrets[id]; !ok {
+			t.Fatalf("expected sealed secret %s to exist before revocation", id)
+		}
+	}
+
+	staleJSON, err := os.ReadFile(persistPath)
+	if err != nil {
+		t.Fatalf("ReadFile stale snapshot failed: %v", err)
+	}
+
+	// store2 never loads persisted sessions: both records are absent from memory but still referenced on disk.
+	store2 := NewSessionStore()
+	store2.SetSecretStore(mockSS)
+	if err := store2.EnablePersistence(persistPath); err != nil {
+		t.Fatalf("EnablePersistence store2 failed: %v", err)
+	}
+
+	wasActive, revErr := store2.RevokeSession("sess-absorb-1")
+	if revErr != nil || wasActive {
+		t.Fatalf("expected (false, nil) for absent session revocation, got (%v, %v)", wasActive, revErr)
+	}
+	if _, stillPresent := mockSS.secrets["http_session:sess-absorb-1"]; stillPresent {
+		t.Fatalf("revoking an unloaded session must destroy its persisted sealed secret")
+	}
+
+	// Device-wide revocation must likewise destroy sealed secrets of unloaded sessions on that device.
+	if _, devErr := store2.RevokeDevice("dev-absorb-2"); devErr != nil {
+		t.Fatalf("RevokeDevice failed: %v", devErr)
+	}
+	if _, stillPresent := mockSS.secrets["http_session:sess-absorb-2"]; stillPresent {
+		t.Fatalf("device revocation must destroy the persisted sealed secret of an unloaded session")
+	}
+
+	// Replaying the pre-revocation JSON snapshot must not restore either session.
+	if err := os.WriteFile(persistPath, staleJSON, 0600); err != nil {
+		t.Fatalf("WriteFile staleJSON failed: %v", err)
+	}
+	store3 := NewSessionStore()
+	store3.SetSecretStore(mockSS)
+	if err := store3.EnablePersistence(persistPath); err != nil {
+		t.Fatalf("EnablePersistence store3 failed: %v", err)
+	}
+	if loadErr := store3.LoadPersistedSessions(); loadErr == nil {
+		t.Fatalf("expected persisted reload to fail closed once sealed secrets were destroyed")
+	}
+	if _, authErr := store3.AuthenticateBearer(tokOne, "sess-absorb-1", "dev-absorb-1"); authErr != ErrSessionNotFound {
+		t.Fatalf("expected ErrSessionNotFound for revoked session restored from stale JSON, got: %v", authErr)
+	}
+	if _, authErr := store3.AuthenticateBearer(tokTwo, "sess-absorb-2", "dev-absorb-2"); authErr != ErrSessionNotFound {
+		t.Fatalf("expected ErrSessionNotFound for device-revoked session restored from stale JSON, got: %v", authErr)
+	}
+}
+
+// TestSessionStore_RevocationPreservesUnloadedPersistedSessions proves that revoking (or rolling back)
+// a single session while other durable sessions are not loaded into memory cannot silently wipe the rest
+// of the persisted session set.
+func TestSessionStore_RevocationPreservesUnloadedPersistedSessions(t *testing.T) {
+	persistPath := filepath.Join(t.TempDir(), "sessions.json")
+	mockSS := newMockSecretStore(true)
+
+	store1 := NewSessionStore()
+	store1.SetSecretStore(mockSS)
+	if err := store1.EnablePersistence(persistPath); err != nil {
+		t.Fatalf("EnablePersistence failed: %v", err)
+	}
+	keepTok := "tok-keep-unloaded-32bytes-012345"
+	delTok := "tok-del-unloaded-32bytes-0123456"
+	if _, err := store1.RegisterSession("sess-keep", "dev-keep", keepTok, "master-keep-unloaded-32bytes-012!", time.Now().UTC().Add(time.Hour), NewFullSessionPermissions()); err != nil {
+		t.Fatalf("RegisterSession keep failed: %v", err)
+	}
+	if _, err := store1.RegisterSession("sess-del", "dev-del", delTok, "master-del-unloaded-32bytes-0123!", time.Now().UTC().Add(time.Hour), NewFullSessionPermissions()); err != nil {
+		t.Fatalf("RegisterSession del failed: %v", err)
+	}
+
+	// A store that never loaded persisted sessions revokes and rolls back individual sessions.
+	store2 := NewSessionStore()
+	store2.SetSecretStore(mockSS)
+	if err := store2.EnablePersistence(persistPath); err != nil {
+		t.Fatalf("EnablePersistence store2 failed: %v", err)
+	}
+	if _, err := store2.RevokeSession("sess-del"); err != nil {
+		t.Fatalf("RevokeSession sess-del failed: %v", err)
+	}
+
+	// Restart with secure-store access restored: the untouched session must still be restored.
+	store3 := NewSessionStore()
+	store3.SetSecretStore(mockSS)
+	if err := store3.EnablePersistence(persistPath); err != nil {
+		t.Fatalf("EnablePersistence store3 failed: %v", err)
+	}
+	if err := store3.LoadPersistedSessions(); err != nil {
+		t.Fatalf("LoadPersistedSessions store3 failed: %v", err)
+	}
+	if _, err := store3.AuthenticateBearer(keepTok, "sess-keep", "dev-keep"); err != nil {
+		t.Fatalf("unrelated persisted session must survive an unloaded revocation, got: %v", err)
+	}
+	if _, err := store3.AuthenticateBearer(delTok, "sess-del", "dev-del"); err != ErrSessionRevoked {
+		t.Fatalf("expected revoke tombstone to block sess-del after restart, got: %v", err)
+	}
+
+	// RemoveSession (pairing rollback) must behave the same way for unloaded siblings.
+	if err := store3.RemoveSession("sess-keep"); err != nil {
+		t.Fatalf("RemoveSession sess-keep failed: %v", err)
+	}
+	store4 := NewSessionStore()
+	store4.SetSecretStore(mockSS)
+	_ = store4.EnablePersistence(persistPath)
+	if err := store4.LoadPersistedSessions(); err != nil {
+		t.Fatalf("LoadPersistedSessions store4 failed: %v", err)
+	}
+	if _, err := store4.AuthenticateBearer(keepTok, "sess-keep", "dev-keep"); err != ErrSessionRevoked {
+		t.Fatalf("expected rolled-back session to stay revoked after restart, got: %v", err)
+	}
+}

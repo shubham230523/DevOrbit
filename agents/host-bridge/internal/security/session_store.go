@@ -244,6 +244,35 @@ func (s *SessionStore) EnablePersistence(customPath string) error {
 	return nil
 }
 
+// readPersistedEntries parses the sealed session entries recorded in the persisted store file.
+// A missing file yields no entries; malformed or incompatible payloads return an error.
+func readPersistedEntries(path string) ([]PersistedSessionEntry, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || trimmed[0] == '[' {
+		return nil, ErrCorruptPersistedState
+	}
+	var stored persistedSessionStoreFile
+	if err := json.Unmarshal(trimmed, &stored); err != nil {
+		return nil, err
+	}
+	if stored.Version != persistedStoreVersion {
+		return nil, ErrCorruptPersistedState
+	}
+	return stored.Sessions, nil
+}
+
+// saveLocked atomically rewrites the persisted store. Entries for sessions that are known only to
+// persisted state (never loaded by this process, e.g. because the OS secret store was unavailable at
+// startup) are preserved unless they are tombstoned, device-revoked, or expired. Without this merge,
+// a single revocation performed while sessions were unloaded would silently drop every other durable
+// session and force every device to re-pair.
 func (s *SessionStore) saveLocked() error {
 	if s.storePath == "" {
 		return nil
@@ -251,6 +280,26 @@ func (s *SessionStore) saveLocked() error {
 	now := time.Now().UTC()
 	entries := make([]PersistedSessionEntry, 0)
 	if s.persistSecrets {
+		if preserved, err := readPersistedEntries(s.storePath); err == nil {
+			for _, e := range preserved {
+				if e.SessionID == "" || e.DeviceID == "" || e.TokenHash == "" || e.SecretRef == "" {
+					continue
+				}
+				if now.After(e.ExpiresAt) {
+					continue
+				}
+				if _, revSess := s.revokedSessions[e.SessionID]; revSess {
+					continue
+				}
+				if _, revDev := s.revokedDevices[e.DeviceID]; revDev {
+					continue
+				}
+				if _, inMemory := s.sessions[e.SessionID]; inMemory {
+					continue
+				}
+				entries = append(entries, e)
+			}
+		}
 		for _, rec := range s.sessions {
 			if rec.Revoked || now.After(rec.ExpiresAt) || rec.SecretRef == "" || rec.TokenHash == "" {
 				continue
@@ -344,10 +393,19 @@ func (s *SessionStore) LoadPersistedSessions() error {
 
 	s.mu.Lock()
 	for k, ts := range stored.RevokedSessions {
-		s.revokedSessions[k] = ts
+		if _, exists := s.revokedSessions[k]; !exists {
+			s.revokedSessions[k] = ts
+		}
+		if rec, exists := s.sessions[k]; exists && !rec.Revoked {
+			rec.Revoked = true
+			rec.RevokedAt = ts
+			rec.destroyKeysLocked()
+		}
 	}
 	for k, ts := range stored.RevokedDevices {
-		s.revokedDevices[k] = ts
+		if _, exists := s.revokedDevices[k]; !exists {
+			s.revokedDevices[k] = ts
+		}
 	}
 	s.mu.Unlock()
 
@@ -406,6 +464,40 @@ func zeroBytesSlice(b []byte) {
 	for i := range b {
 		b[i] = 0
 	}
+}
+
+// persistedSecretRef identifies a sealed per-session secret referenced by persisted state.
+type persistedSecretRef struct {
+	SessionID string
+	SecretRef string
+}
+
+// persistedSecretRefsLocked returns the sealed secret references recorded in the persisted store
+// file for entries matching keep. Callers must hold s.mu.
+//
+// Read failures are propagated so callers can report honestly that stale sealed secrets could not be
+// removed. Unreadable/legacy payloads deliberately return no references and no error: saveLocked
+// fully rewrites the file, so no persisted entry can reference those secrets afterwards.
+func (s *SessionStore) persistedSecretRefsLocked(keep func(PersistedSessionEntry) bool) ([]persistedSecretRef, error) {
+	if s.storePath == "" {
+		return nil, nil
+	}
+	entries, err := readPersistedEntries(s.storePath)
+	if err != nil {
+		if errors.Is(err, ErrCorruptPersistedState) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("%w: %w", ErrPersistenceFailed, err)
+	}
+
+	var refs []persistedSecretRef
+	for _, e := range entries {
+		if e.SessionID == "" || e.SecretRef == "" || !keep(e) {
+			continue
+		}
+		refs = append(refs, persistedSecretRef{SessionID: e.SessionID, SecretRef: e.SecretRef})
+	}
+	return refs, nil
 }
 
 func clonePermissionsOrDefault(perms *SessionPermissions) *SessionPermissions {
@@ -642,36 +734,62 @@ func (s *SessionStore) GetActiveSession(sessionID, deviceID string) (*SessionRec
 	return rec, nil
 }
 
-// RevokeSession permanently revokes a session, destroys its keys, deletes any stored secret,
-// and persists the revocation tombstone. In-memory revocation always takes effect even if persistence fails;
-// any persistence error is returned to the caller so callers never silently assume durable revocation.
+// RevokeSession idempotently revokes sessionID in memory (if loaded), destroys any sealed secret
+// referenced by memory or by persisted state, and records a durable revocation tombstone even when
+// sessionID is currently absent from memory (e.g. after a restart without secret-store availability).
+// The returned boolean indicates whether an active (non-revoked) in-memory session transitioned to
+// revoked during this call; false means the session was not active in memory (already revoked, or
+// never loaded), which is not an error. Any secret-deletion or tombstone-persistence failure is
+// returned via err after in-memory revocation has been applied.
 func (s *SessionStore) RevokeSession(sessionID string) (bool, error) {
-	if sessionID == "" {
-		return false, nil
+	if strings.TrimSpace(sessionID) == "" {
+		return false, errors.New("session_id is required")
 	}
 	now := time.Now().UTC()
 
 	s.mu.Lock()
 	rec, ok := s.sessions[sessionID]
-	if !ok {
-		s.mu.Unlock()
-		return false, nil
+	wasActive := false
+	var oldRef, devID string
+	if ok {
+		wasActive = !rec.Revoked
+		oldRef = rec.SecretRef
+		devID = rec.DeviceID
+		rec.Revoked = true
+		if rec.RevokedAt.IsZero() {
+			rec.RevokedAt = now
+		}
+		rec.destroyKeysLocked()
 	}
-	oldRef := rec.SecretRef
-	devID := rec.DeviceID
-	rec.Revoked = true
-	rec.RevokedAt = now
-	rec.destroyKeysLocked()
-	s.revokedSessions[sessionID] = now
+	if _, alreadyTombstoned := s.revokedSessions[sessionID]; !alreadyTombstoned {
+		s.revokedSessions[sessionID] = now
+	}
 	cb := s.onSessionRevoked
 	ss := s.secretStore
 	persistSecrets := s.persistSecrets
 	hasStorePath := s.storePath != ""
 
 	var errs []error
-	if hasStorePath && persistSecrets && ss != nil && oldRef != "" {
-		if err := ss.Delete("http_session", sessionID, oldRef); err != nil {
-			errs = append(errs, err)
+	if hasStorePath && persistSecrets && ss != nil {
+		refToDelete := oldRef
+		if refToDelete == "" {
+			// The record may be absent from memory (e.g. restart without the OS secret store) or its
+			// in-memory ref may already be cleared. Fall back to the persisted reference so the sealed
+			// secret is destroyed before the tombstone is written; even if the atomic tombstone write
+			// then fails, stale persisted state can no longer unseal the credentials.
+			persisted, readErr := s.persistedSecretRefsLocked(func(e PersistedSessionEntry) bool {
+				return e.SessionID == sessionID
+			})
+			if readErr != nil {
+				errs = append(errs, readErr)
+			} else if len(persisted) > 0 {
+				refToDelete = persisted[0].SecretRef
+			}
+		}
+		if refToDelete != "" {
+			if err := ss.Delete("http_session", sessionID, refToDelete); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
 	if err := s.saveLocked(); err != nil {
@@ -679,17 +797,19 @@ func (s *SessionStore) RevokeSession(sessionID string) (bool, error) {
 	}
 	s.mu.Unlock()
 
-	if cb != nil {
+	if cb != nil && wasActive {
 		cb(sessionID, devID)
 	}
 	if len(errs) > 0 {
-		return true, fmt.Errorf("%w: %w", ErrPersistenceFailed, errors.Join(errs...))
+		return wasActive, fmt.Errorf("%w: %w", ErrPersistenceFailed, errors.Join(errs...))
 	}
-	return true, nil
+	return wasActive, nil
 }
 
-// RevokeDevice permanently revokes all sessions belonging to deviceID, deletes stored secrets,
-// and persists the device/session revocation tombstones.
+// RevokeDevice permanently revokes all sessions belonging to deviceID, destroys the sealed secrets of
+// both loaded and persisted-only sessions on that device, and persists the device/session revocation
+// tombstones. In-memory revocation always applies; any secret-deletion or persistence failure is
+// returned so callers never assume durable revocation.
 func (s *SessionStore) RevokeDevice(deviceID string) (int, error) {
 	if deviceID == "" {
 		return 0, nil
@@ -727,6 +847,19 @@ func (s *SessionStore) RevokeDevice(deviceID string) (int, error) {
 
 	var errs []error
 	if hasStorePath && persistSecrets && ss != nil {
+		// Also destroy sealed secrets only referenced by persisted state so device revocation does
+		// not leave recoverable ciphertext behind for sessions that were not loaded into memory.
+		persisted, readErr := s.persistedSecretRefsLocked(func(e PersistedSessionEntry) bool {
+			return e.DeviceID == deviceID
+		})
+		if readErr != nil {
+			errs = append(errs, readErr)
+		}
+		for _, p := range persisted {
+			if _, exists := oldRefs[p.SessionID]; !exists {
+				oldRefs[p.SessionID] = p.SecretRef
+			}
+		}
 		for sessID, ref := range oldRefs {
 			if err := ss.Delete("http_session", sessID, ref); err != nil {
 				errs = append(errs, err)
@@ -749,28 +882,53 @@ func (s *SessionStore) RevokeDevice(deviceID string) (int, error) {
 	return count, nil
 }
 
-// RemoveSession deletes a session (used for rollback when downstream provisioning fails).
+// RemoveSession removes a partially or freshly provisioned session during pairing rollback,
+// destroys its in-memory keys, deletes any stored secret, and records a durable revocation
+// tombstone so stale persisted state can never resurrect the rolled-back session ID.
 func (s *SessionStore) RemoveSession(sessionID string) error {
+	if strings.TrimSpace(sessionID) == "" {
+		return errors.New("session_id is required")
+	}
+	now := time.Now().UTC()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rec, ok := s.sessions[sessionID]
-	if !ok {
-		return nil
+	if _, alreadyTombstoned := s.revokedSessions[sessionID]; !alreadyTombstoned {
+		s.revokedSessions[sessionID] = now
 	}
-	oldRef := rec.SecretRef
-	rec.destroyKeysLocked()
-	if m, exists := s.deviceSessions[rec.DeviceID]; exists {
-		delete(m, sessionID)
-		if len(m) == 0 {
-			delete(s.deviceSessions, rec.DeviceID)
+
+	var oldRef string
+	if rec, ok := s.sessions[sessionID]; ok {
+		oldRef = rec.SecretRef
+		rec.Revoked = true
+		rec.RevokedAt = now
+		rec.destroyKeysLocked()
+		if m, exists := s.deviceSessions[rec.DeviceID]; exists {
+			delete(m, sessionID)
+			if len(m) == 0 {
+				delete(s.deviceSessions, rec.DeviceID)
+			}
 		}
+		delete(s.sessions, sessionID)
 	}
-	delete(s.sessions, sessionID)
 
 	var errs []error
-	if s.storePath != "" && s.persistSecrets && s.secretStore != nil && oldRef != "" {
-		if err := s.secretStore.Delete("http_session", sessionID, oldRef); err != nil {
-			errs = append(errs, err)
+	if s.storePath != "" && s.persistSecrets && s.secretStore != nil {
+		refToDelete := oldRef
+		if refToDelete == "" {
+			persisted, readErr := s.persistedSecretRefsLocked(func(e PersistedSessionEntry) bool {
+				return e.SessionID == sessionID
+			})
+			if readErr != nil {
+				errs = append(errs, readErr)
+			} else if len(persisted) > 0 {
+				refToDelete = persisted[0].SecretRef
+			}
+		}
+		if refToDelete != "" {
+			if err := s.secretStore.Delete("http_session", sessionID, refToDelete); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
 	if err := s.saveLocked(); err != nil {

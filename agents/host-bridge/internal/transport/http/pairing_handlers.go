@@ -301,7 +301,11 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 	// Register session in Host Bridge SessionStore first (enforces direct HTTP & Broker authN/authZ)
 	store := s.ensureSessionStore()
 	if _, err := store.RegisterSession(sessionID, req.DeviceID, token, sessionSecret, expiry, security.NewFullSessionPermissions()); err != nil {
-		_ = store.RemoveSession(sessionID)
+		if rbErr := store.RemoveSession(sessionID); rbErr != nil {
+			s.pairingEngine.UnconsumeChallenge(req.ChallengeID)
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to register host session: %v (rollback error: %v)", err, rbErr))
+			return
+		}
 		s.pairingEngine.UnconsumeChallenge(req.ChallengeID)
 		writeError(w, http.StatusInternalServerError, "failed to register host session: "+err.Error())
 		return
@@ -319,8 +323,12 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 			expiry,
 		)
 		if err != nil {
-			_ = store.RemoveSession(sessionID)
+			rbErr := store.RemoveSession(sessionID)
 			s.pairingEngine.UnconsumeChallenge(req.ChallengeID)
+			if rbErr != nil {
+				writeError(w, http.StatusBadGateway, fmt.Sprintf("failed to register session authorization with connection broker: %v (rollback error: %v)", err, rbErr))
+				return
+			}
 			writeError(w, http.StatusBadGateway, "failed to register session authorization with connection broker: "+err.Error())
 			return
 		}
@@ -329,11 +337,25 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 	// 2. Provision session on Host Bridge BrokerClient using exact authoritative expiry timestamp
 	if s.sessionProvisioner != nil {
 		if err := s.sessionProvisioner(sessionID, req.DeviceID, sessionSecret, expiry); err != nil {
-			if s.brokerAuthorizer != nil {
-				_ = s.brokerAuthorizer.RevokeDevice(r.Context(), s.pairingEngine.HostID(), req.DeviceID)
+			var rollbackErrs []error
+			if s.sessionRevoker != nil {
+				if revErr := s.sessionRevoker(sessionID, ""); revErr != nil {
+					rollbackErrs = append(rollbackErrs, fmt.Errorf("broker client rollback: %w", revErr))
+				}
 			}
-			_ = store.RemoveSession(sessionID)
+			if s.brokerAuthorizer != nil {
+				if authRevErr := s.brokerAuthorizer.RevokeDevice(r.Context(), s.pairingEngine.HostID(), req.DeviceID); authRevErr != nil {
+					rollbackErrs = append(rollbackErrs, fmt.Errorf("remote broker rollback: %w", authRevErr))
+				}
+			}
+			if rmErr := store.RemoveSession(sessionID); rmErr != nil {
+				rollbackErrs = append(rollbackErrs, fmt.Errorf("local store rollback: %w", rmErr))
+			}
 			s.pairingEngine.UnconsumeChallenge(req.ChallengeID)
+			if len(rollbackErrs) > 0 {
+				writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to provision session on host bridge: %v (rollback errors: %v)", err, errors.Join(rollbackErrs...)))
+				return
+			}
 			writeError(w, http.StatusInternalServerError, "failed to provision session on host bridge: "+err.Error())
 			return
 		}
