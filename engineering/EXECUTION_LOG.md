@@ -137,3 +137,20 @@
   - Live TLS + physical device validation → **BLOCKED** (no DNS/cert/proxy host/devices).
 - **Environment defect discovered (not a code defect):** Gradle failed with `AndroidLocationsException: Several environment variables … contain different paths to the Android Preferences folder` while both `ANDROID_PREFS_ROOT` and `ANDROID_USER_HOME` were exported. Builds succeed after unsetting those variables. Documented in `KNOWN_ISSUES.md`.
 - **Stage Status:** M1 repository scope `IMPLEMENTED`, `TESTED`; external-evidence scope `BLOCKED`. Verdict: **M1 PARTIALLY COMPLETE**.
+
+---
+
+### Entry 9 — MP25 M1 Commit, Push & Remote Verification
+- **M1 Implementation Commit:** `678c923575bd29b4e49b71fc848db0da38752929` (27 files, +2423/−480).
+- **Push Commands and Observed Results:**
+  - `git push origin security/atomic-agent-task-execution` → `6e93ea4..678c923  security/atomic-agent-task-execution -> security/atomic-agent-task-execution` (exit 0).
+  - `git push origin HEAD:quality/autonomous-15min-improvement` → `6e93ea4..678c923  HEAD -> quality/autonomous-15min-improvement` (exit 0).
+- **`git ls-remote origin` (verified after push, exit 0):**
+  ```text
+  c49804547aef7dc1100b8b444ee32695f353e7e6        refs/heads/main
+  678c923575bd29b4e49b71fc848db0da38752929        refs/heads/quality/autonomous-15min-improvement
+  678c923575bd29b4e49b71fc848db0da38752929        refs/heads/security/atomic-agent-task-execution
+  ```
+  Both engineering branches matched local `HEAD` (`678c923…`); `refs/heads/main` remained `c49804547aef7dc1100b8b444ee32695f353e7e6` (untouched). No force-push used.
+- **Note:** this Entry 9 is a documentation-only commit following `678c923`; both engineering branches were re-pushed and re-verified afterwards.
+- **External evidence still outstanding (unchanged):** physical Android device, macOS/Xcode + iPhone, DNS + CA-trusted certificate + proxy host, Android upload keystore and CI signing secrets, Linux `-race` execution on the pushed workflow.
