@@ -1,6 +1,10 @@
 openapi: 3.0.3
 info:
-  title: DevOrbit Control Plane, Host Bridge & Connection Broker API
+  title: DevOrbit Host Bridge & Connection Broker API
+  # NOTE (Master Plan 26): the former Control Plane service was removed. Any control-plane paths
+  # documented below are deprecated and no longer served; pairing, session authorization and
+  # revocation are provided by the Host Bridge and Connection Broker.
+  deprecated: false
   version: 1.2.0
   description: Official OpenAPI contract governing DevOrbit mobile client, control plane, host bridge, and connection broker RPC/REST endpoints.
 

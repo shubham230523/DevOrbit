@@ -11,6 +11,15 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	// Public minimal health endpoint (returns full metadata only when authenticated)
 	mux.HandleFunc("/api/v1/health", s.HandleHealth)
 
+	// Liveness/readiness endpoints for orchestrators. Neither exposes configuration or secrets:
+	// readiness reports 503 until security initialisation has completed.
+	mux.HandleFunc("/api/v1/health/live", s.HandleHealthLive)
+	mux.HandleFunc("/api/v1/health/ready", s.HandleHealthReady)
+
+	// Operational metrics are host-admin protected: production must never expose an
+	// unauthenticated administrative surface.
+	mux.HandleFunc("/metrics", s.withHostAdmin(http.MethodGet, s.HandleMetrics))
+
 	// Host-admin-only pairing challenge generation (returns ephemeral pairing_secret)
 	mux.HandleFunc("/api/v1/pairing/challenge", s.withHostAdmin(http.MethodPost, s.HandleCreatePairingChallenge))
 

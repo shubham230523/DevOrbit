@@ -171,7 +171,6 @@ DevOrbit follows a host-centric architecture.
 | Component | Technology | Responsibility |
 |---|---|---|
 | Mobile application | Flutter / Dart | Android and iOS interface |
-| Control plane | Go | Authentication, devices, sessions, permissions |
 | Connection broker | Go | Secure remote connectivity and routing |
 | Host bridge | Go | Host-side filesystem and development operations |
 | Database | PostgreSQL | Server-side application state |
@@ -181,7 +180,15 @@ DevOrbit follows a host-centric architecture.
 | Agent integration | ACP and supported official interfaces | AI coding-agent communication |
 | Source control | Git CLI and GitHub API | Repository operations |
 
-The architecture must maintain strict separation between control-plane authorization and host-side execution permissions.
+> **Removed in Master Plan 26:** the unauthenticated `services/control-plane` module was deleted. It
+> was unused by the mobile app and by the broker, and exposed device enumeration, token issuance and
+> session-secret responses. Pairing, authorization and revocation are owned by the Host Bridge
+> (permission-scoped sessions) and the Connection Broker (header-only bearer authentication).
+>
+> The **Database (PostgreSQL)** component is not yet in the runtime path: no Go service imports an
+> SQL driver. It is reserved for Master Plan M4 (identity and persistence).
+
+The architecture must maintain strict separation between pairing/authorisation and host-side execution permissions.
 
 The host bridge independently validates every filesystem and process operation.
 
@@ -304,7 +311,6 @@ devorbit/
 │       └── lib/
 │
 ├── services/
-│   ├── control-plane/
 │   └── connection-broker/
 │
 ├── hosts/

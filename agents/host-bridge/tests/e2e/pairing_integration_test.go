@@ -28,6 +28,32 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// readDataFrame reads frames until an encrypted application data frame arrives, skipping broker
+// control frames. This mirrors the protocol handling implemented by the mobile client, which treats
+// session_ready/session_pending as control messages rather than application responses.
+func readDataFrame(t *testing.T, conn *websocket.Conn) transport.FrameEnvelope {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("failed to set read deadline: %v", err)
+	}
+	for i := 0; i < 10; i++ {
+		var frame transport.FrameEnvelope
+		if err := conn.ReadJSON(&frame); err != nil {
+			t.Fatalf("failed to read frame while waiting for data: %v", err)
+		}
+		switch frame.Type {
+		case "data":
+			return frame
+		case "session_ready", "session_pending":
+			continue
+		default:
+			t.Fatalf("unexpected frame type %q received before an application data frame", frame.Type)
+		}
+	}
+	t.Fatalf("no application data frame received after control frames")
+	return transport.FrameEnvelope{}
+}
+
 func TestDevOrbit_FullProductionPairingSessionLifecycle(t *testing.T) {
 	// 1. Setup temporary workstation workspace
 	tempWorkspace, err := os.MkdirTemp("", "devorbit_pairing_e2e_*")
@@ -230,10 +256,9 @@ func TestDevOrbit_FullProductionPairingSessionLifecycle(t *testing.T) {
 		t.Fatalf("Failed to write frame from client 1: %v", err)
 	}
 
-	var respFrame1 transport.FrameEnvelope
-	if err := client1Conn.ReadJSON(&respFrame1); err != nil {
-		t.Fatalf("Client 1 failed to read response frame: %v", err)
-	}
+	// The canonical broker emits control frames (session_ready/session_pending) before relaying
+	// data, exactly like the real mobile client handles them. Consume them before the response.
+	respFrame1 := readDataFrame(t, client1Conn)
 
 	decryptedRespBytes1, err := client1E2E.Decrypt(security.DirHostToClient, respFrame1.EncryptedData, respFrame1.SeqNum, respFrame1.Timestamp)
 	if err != nil {

@@ -2,69 +2,80 @@
 
 ## 1. Closed / Remediated
 
-### Master Plan 25 · M1 (this session)
+### Master Plan 26 / M2 (this session)
 
-- ~~**G-12** `ConnectionManager` simulated connectivity (artificial delay + debug-only heartbeat, unused in production)~~ — **RESOLVED**: rewritten as a real supervisor over `BrokerWebSocketClient`; `isTransportAuthenticated` requires a broker `session_ready`; revocation is terminal; duplicate sockets and stale events are impossible via in-flight + generation guards; backoff is bounded with jitter. Dashboard now renders exclusively from this supervised state.
-- ~~**G-H3/G-28** Android release builds signed with the debug keystore~~ — **RESOLVED**: credential-driven release signing; `release.signingConfig` is `null` without credentials and a Gradle task-graph guard fails the build (verified: refusal message observed; success observed with an ephemeral keystore).
-- ~~Release label `devorbit_mobile`, unrestricted backup of credential storage, no network security policy~~ — **RESOLVED**: `android:label="DevOrbit"`, `allowBackup=false` + exclusion rules, `networkSecurityConfig` with release cleartext disabled and a debug-only LAN exception.
-- ~~**G-29 (partial)** missing iOS local-network declaration / undefined ATS policy~~ — **RESOLVED**: `NSLocalNetworkUsageDescription` added; ATS limited to `NSAllowsLocalNetworking` (no `NSAllowsArbitraryLoads`).
-- ~~**G-27** CI ignored `security/**` and `quality/**`, had no `vet`, no race job, no cross-builds, no Android build, no scanning~~ — **RESOLVED** in `.github/workflows/ci.yml` (race on ubuntu-latest with CGO, cross-builds, Android debug + gated signed release with debug-key rejection, gitleaks, govulncheck, least-privilege permissions).
-- ~~**G-10 (repo part)** no reverse-proxy/TLS deployment artifacts, no validation procedure~~ — **RESOLVED** in repository: `Caddyfile`, `env.example`, deployment README, executable validation procedure.
+- ~~**C1** Control Plane exposed unauthenticated machine enumeration/registration, token issuance,
+  revocation and `session_secret` responses~~ — **RESOLVED by removal**: `services/control-plane` and
+  its Dockerfile deleted; compose service and CI matrices updated; README/OpenAPI annotated. Zero
+  external imports existed.
+- ~~Duplicate broker implementation with divergent security behaviour~~ — **RESOLVED**: canonical broker
+  is `services/connection-broker/pkg/broker`; `internal/broker` deleted. The Host Bridge E2E now
+  consumes the v1.2 `session_ready`/`session_pending` control frames like the mobile client.
+- ~~Broad binary-name-only command allowlist (`git`/`gradle`/`adb` could execute arbitrary code via
+  `-c`, `-I`, `adb shell`)~~ — **RESOLVED**: centralized argument-aware policy with per-family
+  sub-command allowlists, denied options/prefixes, path/identity containment, size/UTF-8/control-char
+  limits and environment sanitisation.
+- ~~No structured security logging / no secret-redaction guarantees~~ — **RESOLVED**:
+  `pkg/observability` JSON logger with name+value redaction, used by both services.
+- ~~No metrics/health semantics; health endpoint returned static JSON~~ — **RESOLVED**: dependency-free
+  Prometheus registry, `/metrics` behind admin auth, `live`/`ready` separated; readiness is 503 until
+  security initialisation completes.
+- ~~Compose: committed DB password, unused control-plane service, broker published on all interfaces,
+  Dockerfile Go version mismatch (`golang:1.24` vs `go 1.26`), root container~~ — **RESOLVED**:
+  loopback-only publish, required broker secret (fail-fast), Go 1.26 image, non-root user, read-only
+  rootfs, healthcheck, Postgres behind `future-db` profile.
 
-### Master Plan 24.1
+### Master Plan 25 / M1
 
-- Session tombstone durability, Windows DPAPI per-session deletion, rollback error propagation, broker revocation propagation, broker session-only deauthorization (see `EXECUTION_LOG.md` Entry 6).
+- `ConnectionManager` simulated connectivity (G-12); Android debug signing (G-H3/G-28); missing iOS
+  local-network declaration (G-29); CI coverage gaps (G-27); TLS deployment prerequisites (G-10).
 
-### Master Plan 24 closure
+### Master Plan 24.1 / 24
 
-- Empty-permission escalation, plaintext `session_secret`, HTTPS→HTTP mobile fallback, multi-valued `X-Forwarded-Proto`, Linux cross-compile (see Entry 5).
+- Session tombstone durability, Windows DPAPI per-session deletion, rollback error propagation,
+  broker revocation propagation, broker session-only deauthorization; permission persistence, plaintext
+  session secrets, HTTPS→HTTP mobile fallback, multi-valued `X-Forwarded-Proto`, Linux cross-compile.
 
 ## 2. Active Blockers & Environment Limitations
 
-- **Android builds require sanitised Android env vars (environment defect, not code):** with both
-  `ANDROID_PREFS_ROOT` and `ANDROID_USER_HOME` exported, Gradle aborts with
-  `AndroidLocationsException: Several environment variables and/or system properties contain different
-  paths to the Android Preferences folder`. Workaround used for all verified builds:
-  `Remove-Item Env:ANDROID_PREFS_ROOT; Remove-Item Env:ANDROID_USER_HOME` before
-  `flutter build …`. CI (ubuntu-latest) does not set these, so CI is unaffected.
-- **Go `-race` on this Windows host (`BLOCKED`):** only 32-bit MinGW (`C:\MinGW\bin\gcc.exe`) is
-  installed → `cc1.exe: sorry, unimplemented: 64-bit mode not compiled in`. The CI `go-race` job runs
-  it on ubuntu-latest with `CGO_ENABLED=1`; local evidence remains blocked.
-- **iOS compile/sign/TestFlight (`BLOCKED`):** no macOS/Xcode, no Apple account. Configuration is
-  implemented and documented in `apps/mobile/ios/IOS_STORE_READINESS.md`.
-- **Live TLS + physical device validation (`BLOCKED`):** no DNS name, no CA-trusted certificate, no
-  reachable proxy host, no attached physical Android/iOS devices. Procedure:
-  `docs/testing/LIVE_TLS_VALIDATION_PROCEDURE.md` (all rows currently PENDING).
-- **Android signed-release *production* evidence (`BLOCKED`):** repository verification used an
-  **ephemeral temporary keystore** (created in `%TEMP%`, deleted immediately, never committed). A real
-  upload keystore plus Play Console access is required for store evidence.
-- **Headless Linux Secret Service UX:** without an active D-Bus Secret Service the Host Bridge refuses
-  plaintext secret persistence (`ErrSecureStoreUnavailable`), persists tombstones only, and devices
-  must re-pair after restart.
+- **Docker daemon unavailable on the implementation host** — `docker version` fails with
+  `failed to connect to the docker API at npipe:////./pipe/dockerDesktopLinuxEngine`. Container-topology
+  E2E, `docker compose config` and image build could not be executed locally; CI jobs
+  (`deployment-validate`, `broker-binary-e2e`) are the intended evidence path.
+- **No GitHub CLI / authenticated API access** — workflow run results for the pushed commit could not
+  be inspected; Task I (CI execution verification) remains pending external observation.
+- **Go `-race` locally (`BLOCKED`)** — 32-bit-only MinGW (`cc1.exe: 64-bit mode not compiled in`).
+  CI `go-race` job uses `ubuntu-latest` with `CGO_ENABLED=1`; first execution unverified.
+- **iOS compile/TestFlight (`BLOCKED`)** — no macOS/Xcode/Apple account.
+- **Live TLS + physical device validation (`BLOCKED`)** — no DNS/CA certificate/proxy host/devices.
+- **Android production signing evidence (`BLOCKED`)** — no upload keystore; M1 verification used an
+  ephemeral temporary keystore that was deleted.
+- **Android builds require sanitised Android env vars** — unset `ANDROID_PREFS_ROOT` and
+  `ANDROID_USER_HOME` before Gradle builds on the development host.
 
-## 3. Accepted Residual Risks (documented, not fixed in M1)
+## 3. Accepted Residual Risks (documented, not fixed)
 
-- **R8/minify disabled for release.** Enabling it without a device-validated release risks stripping
-  reflectively loaded plugin classes. Rules are prepared in `app/proguard-rules.pro`.
-- **iOS local networking only via `NSAllowsLocalNetworking`.** LAN HTTP remains possible for developer
-  setups by design; production deployments must use HTTPS (Host Bridge enforces this in
-  `DEVORBIT_ENV=production`).
-- **No notifications implemented**, therefore `POST_NOTIFICATIONS` is deliberately **not** declared.
-- **Foreground-only task streaming on iOS** (no `UIBackgroundModes`); the app re-polls state on resume.
-- **No physical erasure of deleted DPAPI secret files**; deleting removes OS-level access only.
-- **Orphaned sealed-secret files** may remain if `SecretStore.Delete` fails while the tombstone write
-  succeeds (unreachable from persisted state, same-user-sealed only).
-- **`services/connection-broker/pkg/broker`** remains a legacy duplicate without the `RevokeSession`
-  deauthorization fix; it is compiled but unused by `cmd/connection-broker` (M2 cleanup).
-- **Control Plane remains unauthenticated and is not deployed** (M2 decision: rewrite or delete).
-- **No page-level UI tests for the rewired dashboard connection states.** Connection state is covered
-  by 12 transport-level tests; widget-level coverage of the new binding is a follow-up.
+- **Command policy denies some legitimate advanced workflows** by design: `git config/credential/
+  alias/filter-branch`, Gradle `-I/--init-script/-b/-p`, and every `adb shell/push/pull` operation.
+  Widening these requires an explicit, reviewed policy change plus approval-gating evidence.
+- **`git push --force` remains permitted** (approval-gated where routed through the agent); destructive
+  intent is a user decision, not a policy bypass.
+- **Broker state is single-process and file-persisted**; no distributed registry (M5).
+- **Metrics are unlabelled** — deliberate to bound cardinality; per-device/per-session breakdowns are
+  not available.
+- **No request/trace correlation ids on every log line** — `request_id` appears where the flow carries
+  one (idempotency), not universally.
+- **R8/minify remains disabled** for Android release pending device validation.
+- **iOS LAN HTTP** permitted only via `NSAllowsLocalNetworking`; production must use HTTPS.
+- **No notifications** (`POST_NOTIFICATIONS` intentionally not declared).
+- **Foreground-only task streaming on iOS**.
+- **DPAPI orphaned sealed-blob cleanup** still outstanding (M6).
+- **PostgreSQL schema remains unused**; moved behind a `future-db` compose profile (M4).
 
 ## 4. Protocol & Scope Notes (Deferred / Unchanged)
 
-- **Development-mode LAN HTTP pairing** stays enabled when `DEVORBIT_ENV != production`; production
-  blocks plaintext pairing/host-admin endpoints (403).
-- **`device_public_key`** retained for wire compatibility only.
-- **`packages/design-tokens`, `packages/domain-models`** remain 4-line stubs (deferred).
-- **`services/control-plane` schema (`infrastructure/database/schema.sql`)** is unused: no Go module
-  imports any SQL driver. Persistence is planned for M4.
+- Development-mode LAN HTTP pairing stays enabled when `DEVORBIT_ENV != production`.
+- `device_public_key` retained for wire compatibility only.
+- `packages/design-tokens`, `packages/domain-models` remain stubs.
+- `packages/api-contracts/openapi.yaml` still documents some removed control-plane paths; annotated as
+  deprecated in M2 and scheduled for a full contract rewrite in M4.

@@ -42,7 +42,6 @@ jobs:
           - agents/ai-router
           - agents/acp-adapter
           - services/connection-broker
-          - services/control-plane
     steps:
       - uses: actions/checkout@v4
 
@@ -75,7 +74,6 @@ jobs:
           - agents/ai-router
           - agents/acp-adapter
           - services/connection-broker
-          - services/control-plane
     steps:
       - uses: actions/checkout@v4
 
@@ -314,7 +312,6 @@ jobs:
           - agents/ai-router
           - agents/acp-adapter
           - services/connection-broker
-          - services/control-plane
     steps:
       - uses: actions/checkout@v4
 
@@ -328,3 +325,65 @@ jobs:
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
           "$(go env GOPATH)/bin/govulncheck" ./...
+
+  # ---------------------------------------------------------------------------------------------
+  # End-to-end: real broker binary (build-tagged e2e). Proves fail-closed configuration, health
+  # semantics, admin-protected metrics and process lifecycle without any mocks.
+  # ---------------------------------------------------------------------------------------------
+  broker-binary-e2e:
+    name: Broker binary E2E
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: services/connection-broker/go.sum
+
+      - name: Run real-binary E2E
+        working-directory: services/connection-broker
+        run: go test -tags=e2e -count=1 -timeout=300s ./tests/e2e/ -v
+
+  # ---------------------------------------------------------------------------------------------
+  # Deployment validation: compose file must parse and the broker image must build.
+  # Container-topology E2E (broker + host bridge + client over TLS) requires a reverse proxy and
+  # real devices; see docs/testing/LIVE_TLS_VALIDATION_PROCEDURE.md.
+  # ---------------------------------------------------------------------------------------------
+  deployment-validate:
+    name: Deployment configuration validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate compose configuration
+        env:
+          DEVORBIT_BROKER_SECRET: ci-compose-validation-secret-32bytes
+        run: docker compose -f infrastructure/docker/docker-compose.yml config --quiet
+
+      - name: Build broker image
+        run: docker build -f infrastructure/docker/Dockerfile.connection-broker -t devorbit-broker:ci .
+
+      - name: Container smoke test (liveness + protected metrics)
+        env:
+          DEVORBIT_BROKER_SECRET: ci-container-smoke-secret-32bytes
+        run: |
+          set -euo pipefail
+          docker run -d --name devorbit-broker-ci -p 127.0.0.1:18081:8081 \
+            -e DEVORBIT_ENV=development \
+            -e DEVORBIT_BROKER_SECRET="$DEVORBIT_BROKER_SECRET" \
+            devorbit-broker:ci
+          trap 'docker logs devorbit-broker-ci || true; docker rm -f devorbit-broker-ci || true' EXIT
+          for i in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:18081/api/v1/health/live >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:18081/api/v1/health/live
+          curl -fsS http://127.0.0.1:18081/api/v1/health/ready
+          status=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18081/metrics)
+          test "$status" = "401"
+          curl -fsS -H "Authorization: Bearer $DEVORBIT_BROKER_SECRET" http://127.0.0.1:18081/metrics | grep -q devorbit_broker_active_sessions

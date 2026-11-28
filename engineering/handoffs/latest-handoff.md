@@ -4,27 +4,30 @@
 **Repository:** `https://github.com/shubham230523/DevOrbit`
 **Feature Branch:** `security/atomic-agent-task-execution`
 **Target Remote Branch:** `quality/autonomous-15min-improvement`
-**Verified Starting HEAD (MP25 M1):** `6e93ea43d815182bddcc6497df90c16f8aebcbda`
-**Historical Checkpoints:** MP23 `efee2c9`, MP24 initial `7ba545d`, MP0 `7aed096`, MP0.1 `be4ec8a`, MP24 closure `2425cc8`, MP24.1 `76ca228`
+**Verified Starting HEAD (MP26 M2):** `881c7dce958ffd2723ba4a7880613a89939fd33d`
+**Historical checkpoints:** `efee2c9`, `7ba545d`, `7aed096`, `be4ec8a`, `2425cc8`, `76ca228`, `678c923`, `881c7dc`
 
 ## 1. Current Plan & Phase
 
-- **Master Plan 25 assessment:** `COMPLETED` (read-only, 17 parts, gap matrix G-01…G-41).
-- **Master Plan 25 · M1** (verification closure, release-build integrity, store-critical platform config): **repository scope `IMPLEMENTED` + `TESTED`; external evidence `BLOCKED`. Verdict: M1 PARTIALLY COMPLETE.**
-- **M2–M6:** not started (hardening/observability, execution completeness, identity/persistence/compliance, scale, distribution).
+- MP0/0.1, MP23, MP24 (A–H), MP24.1, MP25 assessment: `COMPLETED`/`PUSHED`.
+- MP25 M1: `PARTIALLY COMPLETE` (external device/Xcode/TLS evidence blocked).
+- **MP26 M2: repository scope `IMPLEMENTED` + `TESTED`; container E2E and CI-run inspection `BLOCKED`. Verdict: M2 PARTIALLY COMPLETE.**
+- MP25 M3–M6 not started.
 
 ## 2. Last Completed Action
 
-Implemented MP25 M1 Tasks A–F:
+Executed MP26 M2 Tasks A–I:
 
-1. **A — Connectivity truthfulness:** `ConnectionManager` rewritten as a real supervisor over `BrokerWebSocketClient` (transport-derived status, terminal revocation, duplicate-connect prevention, generation guards, jittered bounded backoff, network-path switch). Transport hardened (`autoReconnect`, jitter, generation guards, config-vs-auth error classification, closure surfacing). Dashboard bound to the supervised state. **12 new tests against real loopback WebSocket servers.**
-2. **B — Android release integrity:** credential-driven signing (env vars or git-ignored `key.properties`), **release refuses to build without credentials** (verified), `android:label="DevOrbit"`, `allowBackup=false` + exclusion rules, network security config (release cleartext off, debug-only LAN exception), camera feature optional, `minSdk ≥ 24`, `KEYSTORE_SETUP.md` + `key.properties.example` + ProGuard rules.
-3. **C — iOS:** `NSLocalNetworkUsageDescription`, ATS restricted to `NSAllowsLocalNetworking`, expanded camera rationale, `IOS_STORE_READINESS.md`.
-4. **D — CI:** rewritten workflow (correct triggers, `vet`+`test` matrix, **`-race` with CGO on ubuntu-latest**, cross-builds, Flutter analyze/test, Android debug build + artifact, gated signed release with debug-key rejection, gitleaks, govulncheck, least privilege).
-5. **E — TLS prerequisites:** `Caddyfile`, `env.example`, deployment README, `docs/testing/LIVE_TLS_VALIDATION_PROCEDURE.md`.
-6. **F — Hygiene/continuity:** confirmed no tracked binaries/secrets; removed empty local `tests/` dir; continuity docs updated.
+1. **A — Control Plane removed** (`services/control-plane/**`, `Dockerfile.control-plane`); compose + CI matrices + README/OpenAPI updated.
+2. **B — Broker consolidated** into `services/connection-broker/pkg/broker` (canonical); `internal/broker` deleted; Host Bridge E2E aligned to v1.2 control frames.
+3. **C — Command policy centralised**: executable identity + per-family sub-command allowlists + denied options + arg limits + workspace containment + env sanitisation (`internal/security/command_policy.go`), enforced by `ProcessRunner`.
+4. **D/E — Observability**: shared `services/connection-broker/pkg/observability` (JSON security/operational logs with redaction; dependency-free Prometheus metrics), `/metrics` admin-protected, `/api/v1/health/live|ready` on both services (ready = 503 until security init).
+5. **F — Deployment hardened**: Go 1.26 non-root broker image, loopback-only publish, required secret (fail-fast), read-only rootfs, healthcheck, Postgres behind `future-db` profile.
+6. **G — Real-binary E2E** (`go test -tags=e2e ./tests/e2e/`) passing locally; container scenarios delegated to new CI jobs.
+7. **H — Contract tests**: 16 protected + 3 admin routes, error envelope, no-secret responses, readiness semantics, unknown-field tolerance.
+8. **I — CI updated** (+ `broker-binary-e2e`, `deployment-validate`); run inspection blocked.
 
-Verification: 5/5 Go modules `vet`+`test` PASS; linux/windows cross-builds PASS; `flutter analyze` clean; `flutter test` **49/49**; Android debug APK built; release refused without creds; release built with an ephemeral (deleted) keystore.
+Verification: host-bridge (14 pkgs), broker (+e2e tag), ai-router, acp-adapter all `vet`+`test` PASS; linux/windows cross-builds PASS; `flutter analyze` clean; `flutter test` 49/49.
 
 ## 3. Exact Next Action
 
@@ -33,59 +36,46 @@ git status --short --branch
 git push origin security/atomic-agent-task-execution
 git push origin HEAD:quality/autonomous-15min-improvement
 git rev-parse HEAD
-git ls-remote origin \
-  refs/heads/security/atomic-agent-task-execution \
-  refs/heads/quality/autonomous-15min-improvement \
-  refs/heads/main
+git ls-remote origin refs/heads/security/atomic-agent-task-execution refs/heads/quality/autonomous-15min-improvement refs/heads/main
 ```
 
-Confirm both engineering heads equal `HEAD` and `refs/heads/main` is still
-`c49804547aef7dc1100b8b444ee32695f353e7e6`; append the observed SHAs as `EXECUTION_LOG.md` Entry 9.
-If `ls-remote` fails for network reasons, record **BLOCKED** — never substitute remote-tracking refs.
-
-Then: configure the 4 Android signing secrets, run `docs/testing/LIVE_TLS_VALIDATION_PROCEDURE.md`, and
-run `flutter build ios --release --no-codesign` on macOS.
+Then, with GitHub access and a running Docker daemon:
+1. Inspect the Actions run for the pushed commit and record results for `go-test`, `go-race`, `go-cross-build`, `flutter-analyze-test`, `android-debug-build`, `broker-binary-e2e`, `deployment-validate`, `secret-scan`, `dependency-scan` → closes Task I.
+2. Run `docker compose -f infrastructure/docker/docker-compose.yml config` and the container smoke test locally → closes the container half of Task G.
+3. Execute `docs/testing/LIVE_TLS_VALIDATION_PROCEDURE.md` for MP24 Criterion I.
+4. Begin M3 (execution completeness).
 
 ## 4. What Must NOT Be Repeated
 
-- **Do NOT** re-audit MP23/24/24.1/25 or re-implement their fixes without regression evidence.
-- **Do NOT** reintroduce a simulated/local connection state: `isTransportAuthenticated` must only be
-  true after a broker `session_ready`/`auth_ack`.
-- **Do NOT** make release signing fall back to the debug keystore, or commit `key.properties`, `*.jks`,
-  `*.keystore`, keystore passwords, or CI secrets.
-- **Do NOT** add `NSAllowsArbitraryLoads`, `POST_NOTIFICATIONS` without a notification implementation,
-  or `UIBackgroundModes` without real background support.
-- **Do NOT** weaken fail-closed persistence, E2E encryption, pairing proof verification, or broker
-  header-only authentication.
-- **Do NOT** modify `main` or force-push any branch.
+- Do NOT reintroduce `services/control-plane` or any unauthenticated administrative endpoint.
+- Do NOT restore a second broker implementation, or bypass `pkg/broker` from `cmd/connection-broker`.
+- Do NOT widen the command policy without tests proving no authorization/approval bypass.
+- Do NOT weaken: pairing proof/expiry/replay checks, HKDF derivation, AES-256-GCM E2E, constant-time
+  comparisons, header-only broker auth, durable revocation, fail-closed secret persistence, workspace
+  jail/symlink protection, permission authorization, approval gating, MP25 connection supervision,
+  Android release signing guards, production cleartext restrictions.
+- Do NOT log secrets or user content; keep `pkg/observability` redaction tests green.
+- Do NOT expose `/metrics` without admin authentication.
+- Do NOT modify `main` or force-push.
 
 ## 5. Relevant Files
 
-- Mobile: `apps/mobile/lib/core/network/{connection_manager,broker_websocket_client}.dart`,
-  `apps/mobile/lib/features/dashboard/presentation/dashboard_screen.dart`,
-  `apps/mobile/test/connection_manager_test.dart`,
-  `apps/mobile/android/app/build.gradle.kts`, `apps/mobile/android/app/src/main/AndroidManifest.xml`,
-  `apps/mobile/android/app/src/{main,debug}/res/xml/*`, `apps/mobile/android/KEYSTORE_SETUP.md`,
-  `apps/mobile/ios/Runner/Info.plist`, `apps/mobile/ios/IOS_STORE_READINESS.md`
-- CI/deploy: `.github/workflows/ci.yml`, `infrastructure/deployment/{Caddyfile,env.example,README.md}`,
-  `docs/testing/LIVE_TLS_VALIDATION_PROCEDURE.md`
-- Host/broker (unchanged in M1, must not regress): `agents/host-bridge/internal/{security,transport}`,
-  `services/connection-broker/internal/broker`
+- Host Bridge: `internal/security/command_policy.go` (+test), `internal/infrastructure/process/runner.go`,
+  `internal/transport/http/{observability_handlers.go,router.go,handlers.go,pairing_handlers.go,auth_middleware.go,contract_test.go}`,
+  `cmd/host-bridge/main.go`, `tests/e2e/pairing_integration_test.go`
+- Broker: `pkg/broker/broker.go` (+tests), `pkg/observability/{logger,metrics}.go` (+test),
+  `cmd/connection-broker/main.go`, `tests/e2e/binary_e2e_test.go`
+- Deployment/CI: `infrastructure/docker/{Dockerfile.connection-broker,docker-compose.yml,.env.example}`,
+  `infrastructure/deployment/{Caddyfile,env.example,README.md}`, `.github/workflows/ci.yml`
 
 ## 6. Verification Commands
 
 ```bash
-for m in agents/host-bridge agents/ai-router agents/acp-adapter services/connection-broker services/control-plane; do
-  (cd "$m" && go vet ./... && go test -count=1 -timeout=180s ./...)
-done
-
-(cd agents/host-bridge && GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./... && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build ./...)
-
-(cd apps/mobile && flutter pub get && flutter analyze && flutter test)
-
-# Local Android builds on this Windows host require:
-#   Remove-Item Env:ANDROID_PREFS_ROOT; Remove-Item Env:ANDROID_USER_HOME
-(cd apps/mobile && flutter build apk --debug)
-
-# Race detector: BLOCKED locally (32-bit MinGW); CI job runs it on ubuntu-latest.
+(cd agents/host-bridge && go vet ./... && go test -count=1 -timeout=180s ./...)
+(cd services/connection-broker && go vet ./... && go test -count=1 -timeout=180s ./...)
+(cd services/connection-broker && go test -tags=e2e -count=1 -timeout=300s ./tests/e2e/ -v)
+(cd agents/ai-router && go vet ./... && go test ./...)
+(cd agents/acp-adapter && go vet ./... && go test ./...)
+(cd apps/mobile && flutter analyze && flutter test)
+DEVORBIT_BROKER_SECRET=ci-secret docker compose -f infrastructure/docker/docker-compose.yml config --quiet
 ```

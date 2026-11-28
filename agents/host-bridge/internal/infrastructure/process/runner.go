@@ -5,18 +5,56 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"devorbit.net/agents/host-bridge/internal/domain"
 	"devorbit.net/agents/host-bridge/internal/security"
+	"devorbit.net/services/connection-broker/pkg/observability"
 )
+
+// recordPolicyRejection emits a security event and metric for a denied command execution.
+// Only the executable base name and a stable reason are recorded: arguments may contain user
+// content or secrets and must never be logged.
+func (r *ProcessRunner) recordPolicyRejection(spec *domain.ProcessSpec, err error) {
+	r.mu.RLock()
+	logger := r.logger
+	metrics := r.metrics
+	r.mu.RUnlock()
+
+	if metrics != nil {
+		metrics.Inc("devorbit_command_policy_rejections_total")
+	}
+	if logger == nil {
+		return
+	}
+	fields := map[string]any{
+		"command":     filepath.Base(spec.Command),
+		"arg_count":   len(spec.Args),
+		"workspace":   spec.WorkspaceID,
+		"reason_code": "command_policy_rejected",
+		"detail":      err.Error(),
+	}
+	logger.SecurityEvent(observability.LevelWarn, "command_policy_rejected", fields)
+}
 
 type ProcessRunner struct {
 	policy    *security.CommandPolicy
 	jail      *security.WorkspaceJail
 	mu        sync.RWMutex
 	processes map[string]*activeProcess
+	// Observability is optional and nil-safe; a runner without it behaves exactly as before.
+	logger  *observability.Logger
+	metrics *observability.Metrics
+}
+
+// SetObservability installs structured logging and metrics for command execution decisions.
+func (r *ProcessRunner) SetObservability(logger *observability.Logger, metrics *observability.Metrics) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.logger = logger
+	r.metrics = metrics
 }
 
 type activeProcess struct {
@@ -35,11 +73,19 @@ func NewProcessRunner(policy *security.CommandPolicy, jail *security.WorkspaceJa
 
 func (r *ProcessRunner) ExecuteProcess(ctx context.Context, spec *domain.ProcessSpec) (*domain.ProcessInfo, error) {
 	if err := r.policy.ValidateCommand(spec.Command, spec.Args); err != nil {
+		r.recordPolicyRejection(spec, err)
 		return nil, err
 	}
 
 	workDir, err := r.jail.ResolveAndValidate(spec.WorkspaceID, ".")
 	if err != nil {
+		return nil, err
+	}
+
+	// Resolve a workspace-relative executable inside the jail, and refuse anything that escapes it.
+	executable, err := r.policy.ResolveExecutable(spec.Command, workDir)
+	if err != nil {
+		r.recordPolicyRejection(spec, err)
 		return nil, err
 	}
 
@@ -50,8 +96,11 @@ func (r *ProcessRunner) ExecuteProcess(ctx context.Context, spec *domain.Process
 
 	pCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 
-	cmd := exec.CommandContext(pCtx, spec.Command, spec.Args...)
+	cmd := exec.CommandContext(pCtx, executable, spec.Args...)
 	cmd.Dir = workDir
+	// Inherited environment is sanitised: loader/Git/JVM redirection variables are removed so an
+	// allowlisted binary cannot be turned into an arbitrary code execution primitive.
+	cmd.Env = security.SanitizeEnvironment(nil)
 
 	var stdoutBuf, stderrBuf bytes.Buffer
 	cmd.Stdout = &stdoutBuf

@@ -2,99 +2,103 @@
 
 **Last Updated:** 2026-11-28
 **Current Branch:** `security/atomic-agent-task-execution`
-**Verified Starting HEAD (MP25 M1):** `6e93ea43d815182bddcc6497df90c16f8aebcbda`
-**Milestone SHAs:** MP24 closure `2425cc8`, MP24.1 `76ca228` (+ docs `d711662`, `6e93ea4`), MP25 assessment read-only.
-**Baseline for this file's verification runs:** `6e93ea4` + uncommitted M1 work (see `EXECUTION_LOG.md` Entry 8).
+**Verified Starting HEAD (MP26 M2):** `881c7dce958ffd2723ba4a7880613a89939fd33d`
+**Milestone SHAs:** MP24 closure `2425cc8`, MP24.1 `76ca228`, MP25 M1 `678c923` (+ docs `881c7dc`).
 
 ## 1. Stage Status Matrix
 
 | Workstream | Status | Notes |
 |---|---|---|
-| Master Plan 23 (Host Bridge HTTP Auth & Trust Boundary) | `IMPLEMENTED`, `TESTED`, `COMMITTED`, `PUSHED` | `efee2c9` |
-| Master Plan 0 / 0.1 (Continuity Infrastructure) | `COMPLETED` | `7aed096` / `be4ec8a` |
-| Master Plan 24 Criteria A–H | `IMPLEMENTED`, `TESTED`, `REVIEWED`, `COMMITTED`, `PUSHED` | `2425cc8` |
-| MP24 Criterion I (live TLS + physical devices) | `BLOCKED` | procedure written; execution needs DNS/cert/proxy host/devices |
-| Master Plan 24.1 (revocation durability, DPAPI deletion, rollback errors) | `IMPLEMENTED`, `TESTED`, `REVIEWED`, `COMMITTED`, `PUSHED` | `76ca228` |
-| Master Plan 25 assessment | `COMPLETED` (read-only) | `DEVORBIT_PRODUCTION_READINESS_MASTER_ASSESSMENT.md` |
-| **Master Plan 25 · M1** | **`IMPLEMENTED`, `TESTED` (repo) / `BLOCKED` (external evidence)** | Verdict: **M1 PARTIALLY COMPLETE** |
+| MP23 Host Bridge HTTP auth & trust boundary | `IMPLEMENTED`, `TESTED`, `PUSHED` | `efee2c9` |
+| MP24 A–H | `IMPLEMENTED`, `TESTED`, `PUSHED` | `2425cc8` |
+| MP24 Criterion I (live TLS + devices) | `BLOCKED` | procedure written, not executed |
+| MP24.1 revocation durability | `IMPLEMENTED`, `TESTED`, `PUSHED` | `76ca228` |
+| MP25 assessment | `COMPLETED` (read-only) | gap matrix G-01…G-41 |
+| MP25 M1 | `PARTIALLY COMPLETE` | repo scope verified; device/Xcode/TLS/keystore blocked |
+| **MP26 M2** | **`IMPLEMENTED`, `TESTED` (repo) / `BLOCKED` (container E2E, CI-run inspection)** | verdict **M2 PARTIALLY COMPLETE** |
 
-## 2. M1 Deliverables (verified in this session)
+## 2. Architecture after M2
 
-### 2.1 Connectivity truthfulness (G-12)
+**Components (4 Go modules + 1 Flutter app):**
 
-- `apps/mobile/lib/core/network/connection_manager.dart` — rewritten from a *simulated* state machine
-  (artificial delay + debug-only heartbeat, zero production usages) into a real supervisor over
-  `BrokerWebSocketClient`:
-  - `isTransportAuthenticated` is true only after a broker `session_ready`/`auth_ack`.
-  - Revoked/expired are terminal; `connect()` refuses until `resetAfterRePairing()`.
-  - Duplicate connect attempts are refused (no duplicate sockets).
-  - Generation counter discards events from superseded sockets.
-  - Bounded exponential backoff with jitter (`computeBackoffDelay`), plus `reconnect(brokerUrl:, mode:)`
-    for Wi-Fi ↔ mobile-network transitions.
-- `broker_websocket_client.dart` — added `autoReconnect`/backoff/jitter/Random injection, generation
-  guards on every async callback, in-flight connect guard, sticky terminal states, config-error vs
-  auth-error classification, and `connectionFailed` surfacing on unexpected closure when
-  self-reconnect is disabled.
-- `dashboard_screen.dart` — all connection status now flows from `ConnectionManager`; requests are
-  blocked unless the transport is authenticated.
+| Component | Path | Notes |
+|---|---|---|
+| Mobile (Android/iOS) | `apps/mobile` | unchanged in M2 |
+| Host Bridge | `agents/host-bridge` | command policy + observability + health/metrics |
+| AI Router | `agents/ai-router` | unchanged |
+| ACP Adapter | `agents/acp-adapter` | unchanged |
+| Connection Broker | `services/connection-broker` | canonical broker in `pkg/broker`, shared `pkg/observability` |
 
-### 2.2 Android release integrity (G-H3/G-28)
+**Removed in M2:** `services/control-plane` (unused, unauthenticated), `services/connection-broker/internal/broker` (duplicate), `infrastructure/docker/Dockerfile.control-plane`.
 
-- Signing credentials resolved from env vars (`DEVORBIT_ANDROID_*`) or a git-ignored
-  `key.properties`; **release builds fail closed** when absent (verified).
-- `android:label="DevOrbit"`, `allowBackup=false`, backup/data-extraction rules exclude secure
-  storage, `networkSecurityConfig` (release cleartext **disabled**, debug source set scoped for LAN),
-  camera feature optional, `minSdk ≥ 24`.
-- Documentation: `apps/mobile/android/KEYSTORE_SETUP.md`, `key.properties.example`, `proguard-rules.pro`
-  (R8 rules prepared; minify intentionally off until device validation).
+## 3. M2 Security & Operations Changes
 
-### 2.3 iOS store-critical config (G-29)
+### 3.1 Command execution policy (`internal/security/command_policy.go`)
+Single argument-aware policy used by both execution boundaries (direct HTTP and the agent
+`execute_command` tool):
+- Executable identity: bare allowlisted name or `./wrapper` only. Absolute paths, drive letters, UNC,
+  sub-directory paths (`bin/git`) and traversal are rejected.
+- Families: **git** (37 allowed sub-commands; `config`/`credential`/`alias`/`filter-branch`/`daemon`
+  etc. rejected), **gradle** (project-defined tasks allowed; `-I/--init-script/-b/--build-file/-p/
+  --project-dir/--include-build/--gradle-user-home/-c/--settings-file/--project-cache-dir` rejected),
+  **adb** (inspection only; `shell/push/pull/install/root/remount/forward/reverse/tcpip/connect/
+  logcat/reboot/sideload` rejected).
+- Argument limits: 64 args, 4096 bytes/arg, UTF-8 validated, shell metacharacters and control
+  characters rejected; errors never echo argument values.
+- `ResolveExecutable` keeps workspace-relative executables inside the jail.
+- `SanitizeEnvironment` strips loader/Git/JVM redirection variables before spawn.
 
-- `NSLocalNetworkUsageDescription` added; ATS `NSAllowsLocalNetworking=true` only (no
-  `NSAllowsArbitraryLoads`); expanded camera rationale; no background modes claimed.
-- `apps/mobile/ios/IOS_STORE_READINESS.md` documents prerequisites and the blocked compile state.
+### 3.2 Structured logging & metrics (`services/connection-broker/pkg/observability`)
+- JSON-line logger: `kind=security|operational`, service/version/env, level filtering, **field-name and
+  value-shape redaction** (`[REDACTED]`), truncation, composite summarisation, nil-safe, concurrency-safe.
+- Metrics: dependency-free Prometheus text registry; strict low-cardinality names (invalid names are
+  rejected and counted); counters + callback gauges.
+- Wired security events: pairing success/failure (with reason codes), rate limiting,
+  authentication/authorization denials, revocation success/failure, command-policy rejection,
+  broker auth rejection, startup/shutdown.
 
-### 2.4 CI (G-27)
+### 3.3 Health & metrics endpoints
+| Endpoint | Host Bridge | Broker | Protection |
+|---|---|---|---|
+| `/api/v1/health` | yes | yes | public (minimal) |
+| `/api/v1/health/live` | yes | yes | public, no configuration disclosed |
+| `/api/v1/health/ready` | 503 until security init completes | 503 if production secret missing | public |
+| `/metrics` | host-admin bearer + confidential transport in prod | broker admin bearer | never public |
 
-`.github/workflows/ci.yml` now runs: `go vet` + `go test` matrix over 5 modules; **`go test -race`
-with `CGO_ENABLED=1` on ubuntu-latest**; linux/windows cross-builds; `flutter analyze`/`flutter test`;
-Android debug build + artifact; signed release build gated to `push` + secret presence with
-`apksigner` debug-key rejection; gitleaks; `govulncheck`. Least-privilege `permissions`, concurrency
-cancellation, triggers for `main`, `security/**`, `quality/**`, `feature/**`.
+### 3.4 Deployment
+- `Dockerfile.connection-broker`: Go 1.26 build (matches `go.mod`), `-trimpath -s -w`, non-root user,
+  liveness `HEALTHCHECK`.
+- `docker-compose.yml`: broker published on `127.0.0.1:8081` only, `DEVORBIT_BROKER_SECRET` required
+  (fail-fast), read-only rootfs, `no-new-privileges`, tmpfs `/tmp`; PostgreSQL moved behind the
+  `future-db` profile (unused until M4); control-plane service removed.
+- `infrastructure/docker/.env.example` added; `infrastructure/deployment/Caddyfile` unchanged from M1
+  (verified against `DEVORBIT_*` names).
 
-### 2.5 TLS deployment prerequisites (G-10)
-
-`infrastructure/deployment/Caddyfile` (TLS/HSTS, `wss` upgrade, health checks, single
-`X-Forwarded-Proto`), `env.example`, rewritten `deployment/README.md`, and
-`docs/testing/LIVE_TLS_VALIDATION_PROCEDURE.md` (executable, evidence table PENDING).
-
-## 3. Verified Verification Results (this session, after the final edit)
+## 4. Verified Verification Results (this session, after the final edit)
 
 | Command | Result |
 |---|---|
-| `go vet ./...` + `go test -count=1 ./...` — all 5 Go modules | **PASS** (exit 0) |
-| `GOOS=linux`/`windows` `go build ./...` — host-bridge, connection-broker | **PASS** |
+| `go vet ./...` + `go test -count=1 ./...` — host-bridge (14 packages) | **PASS** |
+| `go vet ./...` + `go test -count=1 ./...` — connection-broker | **PASS** |
+| `go test -tags=e2e -count=1 ./tests/e2e/` — real broker binary | **PASS** (2 scenarios, 9.5 s) |
+| `go vet`/`go test` — ai-router, acp-adapter | **PASS** |
+| `GOOS=linux`/`windows` `go build ./...` — host-bridge, broker, ai-router | **PASS** |
 | `flutter analyze` | **PASS** — `No issues found!` |
-| `flutter test` | **PASS** — `+49: All tests passed!` (37 existing + 12 new) |
-| `flutter build apk --debug` | **PASS** — `app-debug.apk` built |
-| `flutter build apk --release` (no signing creds) | **PASS (expected refusal)** — `DevOrbit release build refused: no release signing credentials configured.` |
-| `flutter build apk --release` (ephemeral temp keystore, deleted) | **PASS** — `app-release.apk (14.5MB)` |
-| `go test -race` (this Windows host) | **BLOCKED** — 32-bit-only MinGW (`cc1.exe: 64-bit mode not compiled in`); CI job added |
-| iOS compile / TestFlight | **BLOCKED** — no macOS/Xcode |
-| Live TLS + physical devices | **BLOCKED** — no DNS/cert/proxy host/devices |
+| `flutter test` | **PASS** — `+49: All tests passed!` |
+| Docker / container E2E locally | **BLOCKED** — daemon not running |
+| GitHub Actions run inspection | **BLOCKED** — no `gh` CLI / authenticated API access |
 
-## 4. Environment defect (not a code defect)
+## 5. Blockers
 
-Gradle aborts with
-`AndroidLocationsException: Several environment variables … contain different paths to the Android Preferences folder`
-when both `ANDROID_PREFS_ROOT` and `ANDROID_USER_HOME` are exported. Unsetting them makes debug and
-release builds succeed. Recorded in `KNOWN_ISSUES.md` §2.
+1. **Docker daemon not running on this host** (`npipe:////./pipe/dockerDesktopLinuxEngine` missing) →
+   container-topology E2E, compose config validation and image build not executed locally. CI jobs
+   (`deployment-validate`, `broker-binary-e2e`) cover them; results unverified.
+2. **No authenticated GitHub access** → workflow run results for the pushed commit not inspected.
+3. **M1 external dependencies unchanged:** physical Android/iOS devices, macOS/Xcode, CA-trusted TLS
+   with DNS + proxy host, Android upload keystore + CI signing secrets, Linux `-race` execution.
 
-## 5. Remaining Blockers
-
-1. Android upload keystore + 4 CI secrets (`KEYSTORE_SETUP.md`) and a physical Android device.
-2. macOS + Xcode + Apple account, and a physical iPhone.
-3. DNS name, reachable host and Caddy for CA-trusted TLS; physical devices for the pairing/revocation
-   steps.
-4. Linux 64-bit CGO CI runner for `-race` (job exists; must actually run on push).
-5. M2–M6 remain entirely outstanding (identity, persistence, observability, scale, distribution).
+## 6. Known gaps carried into M3+
+- Task persistence/resumption, push streaming, change-set rollback (M3).
+- Identity, database, account deletion, audit trail, compliance artefacts (M4).
+- Usage/cost accounting, quotas, distributed rate limiting, broker registry/scale-out (M5).
+- Host installers/auto-update, notifications, backups/DR, DPAPI blob cleanup (M6).

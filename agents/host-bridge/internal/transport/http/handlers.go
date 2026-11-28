@@ -10,12 +10,14 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"devorbit.net/agents/ai-router/pkg/router"
 	"devorbit.net/agents/host-bridge/internal/application"
 	"devorbit.net/agents/host-bridge/internal/domain"
 	"devorbit.net/agents/host-bridge/internal/security"
+	"devorbit.net/services/connection-broker/pkg/observability"
 )
 
 type SessionProvisioner func(sessionID, deviceID, masterSecret string, expiresAt time.Time) error
@@ -48,6 +50,9 @@ type Server struct {
 	pairingEngine      *security.PairingEngine
 	rateLimiter        *security.RateLimiter
 	idempotency        *security.IdempotencyManager
+	logger             *observability.Logger
+	metrics            *observability.Metrics
+	ready              atomic.Bool
 	sessionStoreMu     sync.Mutex
 	sessionStore       *security.SessionStore
 	sessionRevoker     SessionRevoker
@@ -269,13 +274,28 @@ func (s *Server) HandleRevokeSession(w http.ResponseWriter, r *http.Request) {
 
 	if len(localErrs) > 0 {
 		allErrs := append(localErrs, remoteErrs...)
+		s.securityEvent(observability.LevelError, EventRevocationFailed, map[string]any{
+			"stage":  "durable_persistence",
+			"reason": "persistence_failed",
+		})
+		s.incrementMetric("devorbit_revocation_failures_total")
 		writeError(w, http.StatusInternalServerError, "revoked in memory but failed durable persistence: "+errors.Join(allErrs...).Error())
 		return
 	}
 	if len(remoteErrs) > 0 {
+		s.securityEvent(observability.LevelError, EventRevocationFailed, map[string]any{
+			"stage":  "remote_broker",
+			"reason": "remote_revocation_failed",
+		})
+		s.incrementMetric("devorbit_revocation_failures_total")
 		writeError(w, http.StatusBadGateway, "revoked locally but failed remote broker revocation: "+errors.Join(remoteErrs...).Error())
 		return
 	}
+
+	s.securityEvent(observability.LevelInfo, EventSessionRevoked, map[string]any{
+		"scope": revokedScope(req.DeviceID, req.SessionID),
+	})
+	s.incrementMetric("devorbit_session_revoked_total")
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
 }

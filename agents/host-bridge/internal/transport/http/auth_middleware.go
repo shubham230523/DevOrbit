@@ -326,24 +326,24 @@ func (s *Server) tryAuthenticateOptional(r *http.Request) (*AuthenticatedContext
 
 func (s *Server) authorizeHostAdmin(w http.ResponseWriter, r *http.Request) bool {
 	if s.isProduction && !s.isTransportConfidential(r) {
-		writeError(w, http.StatusForbidden, "host-admin operations require HTTPS or trusted reverse proxy in production")
+		s.denySecurity(w, r, "insecure_transport", http.StatusForbidden, "host-admin operations require HTTPS or trusted reverse proxy in production")
 		return false
 	}
 	if s.hostToken == "" {
-		writeError(w, http.StatusUnauthorized, "host admin secret not configured")
+		s.denySecurity(w, r, "host_secret_not_configured", http.StatusUnauthorized, "host admin secret not configured")
 		return false
 	}
 	token, err := extractBearerToken(r)
 	if err != nil {
 		if errors.Is(err, errQueryCreds) {
-			writeError(w, http.StatusBadRequest, err.Error())
+			s.denySecurity(w, r, "query_credentials_rejected", http.StatusBadRequest, err.Error())
 		} else {
-			writeError(w, http.StatusUnauthorized, err.Error())
+			s.denySecurity(w, r, "missing_credentials", http.StatusUnauthorized, err.Error())
 		}
 		return false
 	}
 	if subtle.ConstantTimeCompare([]byte(token), []byte(s.hostToken)) != 1 {
-		writeError(w, http.StatusUnauthorized, "invalid host admin credentials")
+		s.denySecurity(w, r, "invalid_host_admin_credentials", http.StatusUnauthorized, "invalid host admin credentials")
 		return false
 	}
 	return true

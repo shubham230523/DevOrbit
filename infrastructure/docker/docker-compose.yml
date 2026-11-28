@@ -1,47 +1,60 @@
-version: '3.8'
+# DevOrbit development topology.
+#
+# Scope: the Connection Broker only. The Host Bridge runs on the developer's own machine (Linux or
+# Windows) and is not containerised here. The Control Plane was removed in MP26 (Task A) because it
+# was unused and exposed unauthenticated endpoints.
+#
+# Secrets are NEVER hardcoded: provide DEVORBIT_BROKER_SECRET via `infrastructure/docker/.env`
+# (git-ignored through *.env) or the shell environment. Compose fails fast if it is missing.
+#
+# For production, use infrastructure/deployment/Caddyfile in front of this service; see
+# infrastructure/deployment/README.md.
 
 services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: devorbit-postgres
-    environment:
-      POSTGRES_USER: devorbit
-      POSTGRES_PASSWORD: devorbit_password
-      POSTGRES_DB: devorbit_db
-    ports:
-      - "5432:5432"
-    volumes:
-      - devorbit_pg_data:/var/lib/postgresql/data
-      - ../database/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U devorbit -d devorbit_db"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-  control-plane:
-    build:
-      context: ../../
-      dockerfile: infrastructure/docker/Dockerfile.control-plane
-    container_name: devorbit-control-plane
-    ports:
-      - "8080:8080"
-    environment:
-      DATABASE_URL: "postgres://devorbit:devorbit_password@postgres:5432/devorbit_db?sslmode=disable"
-      JWT_SECRET: "devorbit_development_jwt_secret_key"
-    depends_on:
-      postgres:
-        condition: service_healthy
-
   connection-broker:
     build:
       context: ../../
       dockerfile: infrastructure/docker/Dockerfile.connection-broker
     container_name: devorbit-connection-broker
+    environment:
+      DEVORBIT_ENV: ${DEVORBIT_ENV:-development}
+      DEVORBIT_BROKER_PORT: "8081"
+      DEVORBIT_BROKER_SECRET: ${DEVORBIT_BROKER_SECRET:?DEVORBIT_BROKER_SECRET must be set (see infrastructure/docker/.env.example)}
+    # Publish on loopback only: the broker must be reached through the TLS reverse proxy, never
+    # directly from the network.
     ports:
-      - "8081:8081"
-    depends_on:
-      - control-plane
+      - "127.0.0.1:8081:8081"
+    healthcheck:
+      test: ["CMD", "/bin/sh", "-c", "wget -qO- http://127.0.0.1:8081/api/v1/health/live >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+
+  # Reserved for Master Plan M4 (identity/persistence). Not used by any current service, therefore
+  # it is NOT started by default. Enable explicitly with: docker compose --profile future-db up
+  postgres:
+    image: postgres:16-alpine
+    container_name: devorbit-postgres
+    profiles: ["future-db"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-devorbit}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set for the future-db profile}
+      POSTGRES_DB: ${POSTGRES_DB:-devorbit_db}
+    volumes:
+      - devorbit_pg_data:/var/lib/postgresql/data
+      - ../database/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
 volumes:
   devorbit_pg_data:

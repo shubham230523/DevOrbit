@@ -1,13 +1,29 @@
-FROM golang:1.24-alpine AS builder
+# Build stage — must match the `go` directive in services/connection-broker/go.mod (1.26).
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /app
+
+# Dependency layer first for build cache reuse.
+COPY services/connection-broker/go.mod services/connection-broker/go.sum ./
+RUN go mod download
 
 COPY services/connection-broker/ ./
-RUN go mod download
-RUN CGO_ENABLED=0 GOOS=linux go build -o connection-broker ./cmd/connection-broker
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o connection-broker ./cmd/connection-broker
 
-FROM alpine:latest
+# Runtime stage — distroless-style minimal Alpine, non-root, no shell tooling beyond busybox.
+FROM alpine:3.20
+
+RUN addgroup -S devorbit && adduser -S -G devorbit -h /app devorbit
 WORKDIR /app
 COPY --from=builder /app/connection-broker .
+RUN chown -R devorbit:devorbit /app
+USER devorbit
+
 EXPOSE 8081
+
+# Liveness only: readiness is an orchestrator/proxy concern and is checked over HTTP with credentials
+# where required. Using the minimal binary keeps the container free of extra packages.
+HEALTHCHECK --interval=15s --timeout=3s --start-period=5s --retries=3 \
+  CMD ["/bin/sh", "-c", "wget -qO- http://127.0.0.1:8081/api/v1/health/live >/dev/null || exit 1"]
+
 CMD ["./connection-broker"]

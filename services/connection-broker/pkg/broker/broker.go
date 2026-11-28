@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -16,13 +17,14 @@ import (
 )
 
 var (
-	ErrSessionNotFound          = errors.New("session not found or host offline")
-	ErrUnauthorizedSession      = errors.New("unauthorized connection or invalid session token")
-	ErrFrameTooLarge            = errors.New("frame size exceeds broker maximum limit")
-	ErrInvalidOrigin            = errors.New("websocket connection rejected due to untrusted origin")
-	ErrQueryCredentialsRejected = errors.New("credentials supplied via URL query parameters are rejected")
-	ErrMissingCredentials       = errors.New("missing authentication credentials in headers")
-	ErrSessionExpired           = errors.New("session expired")
+	ErrSessionNotFound           = errors.New("session not found or host offline")
+	ErrUnauthorizedSession       = errors.New("unauthorized connection or invalid session token")
+	ErrFrameTooLarge             = errors.New("frame size exceeds broker maximum limit")
+	ErrInvalidOrigin             = errors.New("websocket connection rejected due to untrusted origin")
+	ErrQueryCredentialsRejected  = errors.New("credentials supplied via URL query parameters are rejected")
+	ErrSubprotocolTokensRejected = errors.New("credentials supplied via Sec-WebSocket-Protocol are rejected")
+	ErrMissingCredentials        = errors.New("missing authentication credentials in headers")
+	ErrSessionExpired            = errors.New("session expired")
 )
 
 const MaxFrameSizeBytes = 10 * 1024 * 1024 // 10 MB
@@ -37,9 +39,10 @@ const (
 type FrameEnvelope struct {
 	ProtocolVersion string `json:"v"`
 	SessionID       string `json:"session_id"`
-	Type            string `json:"type"` // "data", "ping", "pong", "close"
-	EncryptedData   string `json:"encrypted_payload"`
-	SeqNum          int64  `json:"seq_num"`
+	Type            string `json:"type"` // "data", "session_ready", "session_pending", "host_disconnected", "revoked", "ping", "pong", "close", "error"
+	Status          string `json:"status,omitempty"` // "ready", "waiting_for_host", "revoked", "expired"
+	EncryptedData   string `json:"encrypted_payload,omitempty"`
+	SeqNum          int64  `json:"seq_num,omitempty"`
 	Timestamp       int64  `json:"timestamp"`
 }
 
@@ -60,11 +63,12 @@ type Broker struct {
 	sessions               map[string]*Session            // Key: SessionID
 	hostSessions           map[string]map[string]*Session // Key: MachineID -> map[SessionID]*Session
 	authorizedDev          map[string]bool                // Key: MachineID + ":" + DeviceID
-	authorizedHost         map[string]string             // Key: MachineID -> Expected Token
-	authorizedClientTokens map[string]string             // Key: MachineID + ":" + DeviceID + ":" + SessionID -> Token
-	authorizedExpiries     map[string]time.Time          // Key: MachineID + ":" + DeviceID + ":" + SessionID -> Expiration
-	sessionExpiries        map[string]time.Time          // Key: SessionID -> Authoritative Expiration
+	authorizedHost         map[string]string              // Key: MachineID -> Expected Token
+	authorizedClientTokens map[string]string              // Key: MachineID + ":" + DeviceID + ":" + SessionID -> Token
+	authorizedExpiries     map[string]time.Time           // Key: MachineID + ":" + DeviceID + ":" + SessionID -> Expiration
+	sessionExpiries        map[string]time.Time           // Key: SessionID -> Authoritative Expiration (never cleared by connection drops)
 	allowedOrigins         map[string]bool                // Key: Origin domain / authority
+	strictOriginMode       bool                           // true when AddAllowedOrigin has been called explicitly
 	environment            string
 	adminSecret            string
 }
@@ -80,10 +84,15 @@ func NewBrokerWithSecret(adminSecret string) *Broker {
 	}
 
 	origins := map[string]bool{
-		"localhost":        true,
-		"127.0.0.1":        true,
-		"10.0.2.2":         true,
-		"app.devorbit.net": true,
+		"https://app.devorbit.net": true,
+	}
+
+	if env != "production" {
+		origins["http://localhost"] = true
+		origins["http://localhost:8081"] = true
+		origins["http://127.0.0.1"] = true
+		origins["http://127.0.0.1:8081"] = true
+		origins["http://10.0.2.2:8081"] = true
 	}
 
 	if envOrigins := os.Getenv("DEVORBIT_ALLOWED_ORIGINS"); envOrigins != "" {
@@ -91,6 +100,10 @@ func NewBrokerWithSecret(adminSecret string) *Broker {
 			o = strings.TrimSpace(o)
 			if o != "" {
 				origins[strings.ToLower(o)] = true
+				if u, err := url.Parse(o); err == nil && u.Scheme != "" && u.Host != "" {
+					norm := strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host)
+					origins[norm] = true
+				}
 			}
 		}
 	}
@@ -120,6 +133,25 @@ func (b *Broker) AddAllowedOrigin(origin string) {
 }
 
 func extractToken(r *http.Request) (string, error) {
+	// 1. Explicitly reject credentials supplied through URL query parameters
+	if r.URL.Query().Get("token") != "" || r.URL.Query().Has("token") ||
+		r.URL.Query().Get("credential") != "" || r.URL.Query().Has("credential") ||
+		r.URL.Query().Get("secret") != "" || r.URL.Query().Has("secret") {
+		return "", ErrQueryCredentialsRejected
+	}
+
+	// 2. Reject subprotocol tokens
+	if subprotocol := r.Header.Get("Sec-WebSocket-Protocol"); subprotocol != "" {
+		protocols := strings.Split(subprotocol, ",")
+		for _, p := range protocols {
+			p = strings.TrimSpace(p)
+			if strings.HasPrefix(p, "devorbit-token.") {
+				return "", ErrSubprotocolTokensRejected
+			}
+		}
+	}
+
+	// 3. Extract Bearer token from Authorization header
 	if authHeader := r.Header.Get("Authorization"); authHeader != "" {
 		parts := strings.SplitN(authHeader, " ", 2)
 		if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
@@ -130,26 +162,18 @@ func extractToken(r *http.Request) (string, error) {
 		}
 	}
 
-	if subprotocol := r.Header.Get("Sec-WebSocket-Protocol"); subprotocol != "" {
-		protocols := strings.Split(subprotocol, ",")
-		for _, p := range protocols {
-			p = strings.TrimSpace(p)
-			if strings.HasPrefix(p, "devorbit-token.") {
-				return strings.TrimPrefix(p, "devorbit-token."), nil
-			}
-		}
-	}
-
-	return r.URL.Query().Get("token"), nil
+	return "", ErrMissingCredentials
 }
 
 func (b *Broker) checkOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 
 	if origin == "" {
+		// Native client (no Origin header sent by native mobile or Go CLI apps)
 		return true
 	}
 
+	// Browser request with Origin header: must match configured allowlist exactly (scheme, hostname, and port)
 	u, err := url.Parse(origin)
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return false
@@ -194,6 +218,79 @@ func (b *Broker) AuthorizeDeviceWithExactExpiry(machineID, deviceID, sessionID, 
 			b.authorizedClientTokens[key] = clientToken
 			b.authorizedExpiries[key] = expiresAt.UTC()
 			b.sessionExpiries[sessionID] = expiresAt.UTC()
+			b.saveAuthorizedSessionsLocked()
+		}
+	}
+}
+
+type StoredBrokerSession struct {
+	MachineID   string    `json:"machine_id"`
+	DeviceID    string    `json:"device_id"`
+	SessionID   string    `json:"session_id"`
+	ClientToken string    `json:"client_token"`
+	HostToken   string    `json:"host_token"`
+	ExpiresAt   time.Time `json:"expires_at"`
+}
+
+func getBrokerSessionStorePath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = "."
+	}
+	dir := filepath.Join(home, ".devorbit")
+	_ = os.MkdirAll(dir, 0700)
+	return filepath.Join(dir, "broker_sessions.json")
+}
+
+func (b *Broker) saveAuthorizedSessionsLocked() {
+	storePath := getBrokerSessionStorePath()
+	var list []StoredBrokerSession
+	for key, clientToken := range b.authorizedClientTokens {
+		parts := strings.SplitN(key, ":", 3)
+		if len(parts) == 3 {
+			mID, dID, sID := parts[0], parts[1], parts[2]
+			exp := b.authorizedExpiries[key]
+			if time.Now().UTC().Before(exp) {
+				hostToken := b.authorizedHost[mID]
+				list = append(list, StoredBrokerSession{
+					MachineID:   mID,
+					DeviceID:    dID,
+					SessionID:   sID,
+					ClientToken: clientToken,
+					HostToken:   hostToken,
+					ExpiresAt:   exp,
+				})
+			}
+		}
+	}
+	data, err := json.MarshalIndent(list, "", "  ")
+	if err == nil {
+		_ = os.WriteFile(storePath, data, 0600)
+	}
+}
+
+func (b *Broker) LoadPersistedSessions() {
+	storePath := getBrokerSessionStorePath()
+	data, err := os.ReadFile(storePath)
+	if err != nil {
+		return
+	}
+	var list []StoredBrokerSession
+	if err := json.Unmarshal(data, &list); err != nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, s := range list {
+		if time.Now().UTC().Before(s.ExpiresAt) {
+			key := s.MachineID + ":" + s.DeviceID + ":" + s.SessionID
+			b.authorizedClientTokens[key] = s.ClientToken
+			b.authorizedDev[s.MachineID+":"+s.DeviceID] = true
+			if s.HostToken != "" {
+				b.authorizedHost[s.MachineID] = s.HostToken
+			}
+			b.authorizedExpiries[key] = s.ExpiresAt
+			b.sessionExpiries[s.SessionID] = s.ExpiresAt
 		}
 	}
 }
@@ -217,18 +314,72 @@ func (b *Broker) RevokeDevice(machineID, deviceID string) {
 
 	for _, sess := range b.sessions {
 		if sess.MachineID == machineID && sess.DeviceID == deviceID {
+			if sess.ClientConn != nil {
+				revokedFrame := &FrameEnvelope{
+					ProtocolVersion: "1.2",
+					SessionID:       sess.ID,
+					Type:            "revoked",
+					Status:          "revoked",
+					Timestamp:       time.Now().UnixMicro(),
+				}
+				sess.mu.Lock()
+				_ = sess.ClientConn.WriteJSON(revokedFrame)
+				sess.mu.Unlock()
+			}
 			b.closeSessionLocked(sess.ID)
 		}
 	}
 }
 
-func (b *Broker) RegisterHostConnection(machineID, sessionID, token string, conn *websocket.Conn) (*Session, error) {
+// RevokeSession revokes exactly one authorized session. It deletes the session's client
+// authorization token and expiry (so a revoked session cannot re-authorize a new tunnel),
+// closes any live host/client tunnels for it, and notifies a connected client with a revoked
+// frame. Sibling sessions belonging to the same device keep their authorization and connections.
+func (b *Broker) RevokeSession(machineID, sessionID string) {
+	if machineID == "" || sessionID == "" {
+		return
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	for key := range b.authorizedClientTokens {
+		parts := strings.SplitN(key, ":", 3)
+		if len(parts) != 3 || parts[0] != machineID || parts[2] != sessionID {
+			continue
+		}
+		delete(b.authorizedClientTokens, key)
+		delete(b.authorizedExpiries, key)
+	}
+	delete(b.sessionExpiries, sessionID)
+
+	sess, ok := b.sessions[sessionID]
+	if !ok || sess.MachineID != machineID {
+		return
+	}
+
+	if sess.ClientConn != nil {
+		revokedFrame := &FrameEnvelope{
+			ProtocolVersion: "1.2",
+			SessionID:       sess.ID,
+			Type:            "revoked",
+			Status:          "revoked",
+			Timestamp:       time.Now().UnixMicro(),
+		}
+		sess.mu.Lock()
+		_ = sess.ClientConn.WriteJSON(revokedFrame)
+		sess.mu.Unlock()
+	}
+	b.closeSessionLocked(sessionID)
+}
+
+func (b *Broker) RegisterHostConnection(machineID, sessionID, token string, conn *websocket.Conn) (*Session, bool, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	expectedToken, registered := b.authorizedHost[machineID]
 	if !registered || expectedToken == "" || token != expectedToken {
-		return nil, ErrUnauthorizedSession
+		return nil, false, ErrUnauthorizedSession
 	}
 
 	expiry, hasExp := b.sessionExpiries[sessionID]
@@ -237,7 +388,7 @@ func (b *Broker) RegisterHostConnection(machineID, sessionID, token string, conn
 	}
 
 	if time.Now().UTC().After(expiry) {
-		return nil, ErrSessionExpired
+		return nil, false, ErrSessionExpired
 	}
 
 	sess, ok := b.sessions[sessionID]
@@ -252,7 +403,7 @@ func (b *Broker) RegisterHostConnection(machineID, sessionID, token string, conn
 	} else {
 		if time.Now().UTC().After(sess.ExpiresAt) {
 			b.closeSessionLocked(sessionID)
-			return nil, ErrSessionExpired
+			return nil, false, ErrSessionExpired
 		}
 	}
 
@@ -266,52 +417,107 @@ func (b *Broker) RegisterHostConnection(machineID, sessionID, token string, conn
 	}
 	b.hostSessions[machineID][sessionID] = sess
 
-	return sess, nil
+	isReady := false
+	if sess.ClientConn != nil {
+		isReady = true
+		readyFrame := &FrameEnvelope{
+			ProtocolVersion: "1.2",
+			SessionID:       sessionID,
+			Type:            "session_ready",
+			Status:          "ready",
+			Timestamp:       time.Now().UnixMicro(),
+		}
+		sess.mu.Lock()
+		_ = sess.ClientConn.WriteJSON(readyFrame)
+		sess.mu.Unlock()
+	}
+
+	return sess, isReady, nil
 }
 
-func (b *Broker) RegisterClientConnection(machineID, deviceID, sessionID, token string, conn *websocket.Conn) (*Session, error) {
+func (b *Broker) RegisterClientConnection(machineID, deviceID, sessionID, token string, conn *websocket.Conn) (*Session, bool, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	if !b.authorizedDev[machineID+":"+deviceID] {
-		return nil, ErrUnauthorizedSession
+		return nil, false, ErrUnauthorizedSession
 	}
 
 	key := machineID + ":" + deviceID + ":" + sessionID
 	expectedToken, tokenRegistered := b.authorizedClientTokens[key]
 	if !tokenRegistered || expectedToken == "" || token != expectedToken {
-		return nil, ErrUnauthorizedSession
+		return nil, false, ErrUnauthorizedSession
 	}
 
 	exp, hasExp := b.authorizedExpiries[key]
 	if hasExp && time.Now().UTC().After(exp) {
-		return nil, ErrSessionExpired
+		return nil, false, ErrSessionExpired
 	}
 
 	sess, ok := b.sessions[sessionID]
 	if !ok {
-		return nil, ErrSessionNotFound
-	}
-
-	if time.Now().UTC().After(sess.ExpiresAt) {
-		b.closeSessionLocked(sessionID)
-		return nil, ErrSessionExpired
+		// Client is allowed to connect first if authorized; session remains pending host
+		sess = &Session{
+			ID:        sessionID,
+			MachineID: machineID,
+			DeviceID:  deviceID,
+			Token:     token,
+			ExpiresAt: exp,
+		}
+		b.sessions[sessionID] = sess
+	} else {
+		if time.Now().UTC().After(sess.ExpiresAt) {
+			b.closeSessionLocked(sessionID)
+			return nil, false, ErrSessionExpired
+		}
+		sess.DeviceID = deviceID
 	}
 
 	if sess.ClientConn != nil && sess.ClientConn != conn {
 		_ = sess.ClientConn.Close()
 	}
-
-	sess.DeviceID = deviceID
 	sess.ClientConn = conn
 
-	return sess, nil
+	isReady := false
+	sess.mu.Lock()
+	if sess.HostConn != nil {
+		isReady = true
+		readyFrame := &FrameEnvelope{
+			ProtocolVersion: "1.2",
+			SessionID:       sessionID,
+			Type:            "session_ready",
+			Status:          "ready",
+			Timestamp:       time.Now().UnixMicro(),
+		}
+		_ = conn.WriteJSON(readyFrame)
+	} else {
+		pendingFrame := &FrameEnvelope{
+			ProtocolVersion: "1.2",
+			SessionID:       sessionID,
+			Type:            "session_pending",
+			Status:          "waiting_for_host",
+			Timestamp:       time.Now().UnixMicro(),
+		}
+		_ = conn.WriteJSON(pendingFrame)
+	}
+	sess.mu.Unlock()
+
+	return sess, isReady, nil
 }
 
 func (b *Broker) HandleHostWebSocket(w http.ResponseWriter, r *http.Request) {
 	machineID := r.URL.Query().Get("machine_id")
 	sessionID := r.URL.Query().Get("session_id")
-	token, _ := extractToken(r)
+	token, err := extractToken(r)
+
+	if err != nil {
+		if errors.Is(err, ErrQueryCredentialsRejected) {
+			http.Error(w, ErrQueryCredentialsRejected.Error(), http.StatusBadRequest)
+			return
+		}
+		http.Error(w, "missing or invalid host credentials", http.StatusUnauthorized)
+		return
+	}
 
 	if machineID == "" || sessionID == "" || token == "" {
 		http.Error(w, "missing required machine_id, session_id, or token", http.StatusUnauthorized)
@@ -326,6 +532,7 @@ func (b *Broker) HandleHostWebSocket(w http.ResponseWriter, r *http.Request) {
 	b.mu.RLock()
 	expectedToken, registered := b.authorizedHost[machineID]
 	exp, hasExp := b.sessionExpiries[sessionID]
+	existingSess, sessExists := b.sessions[sessionID]
 	b.mu.RUnlock()
 
 	if !registered || expectedToken == "" || token != expectedToken {
@@ -333,7 +540,7 @@ func (b *Broker) HandleHostWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if hasExp && time.Now().UTC().After(exp) {
+	if (hasExp && time.Now().UTC().After(exp)) || (sessExists && time.Now().UTC().After(existingSess.ExpiresAt)) {
 		http.Error(w, "session expired", http.StatusUnauthorized)
 		return
 	}
@@ -351,15 +558,35 @@ func (b *Broker) HandleHostWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	conn.SetReadLimit(MaxFrameSizeBytes)
 
-	sess, err := b.RegisterHostConnection(machineID, sessionID, token, conn)
+	sess, isReady, err := b.RegisterHostConnection(machineID, sessionID, token, conn)
 	if err != nil {
 		conn.WriteJSON(map[string]string{"error": err.Error()})
 		conn.Close()
 		return
 	}
-	log.Printf("Broker: Authenticated Host WSS connected for machine=%s session=%s", machineID, sessionID)
+	log.Printf("Broker: Authenticated Host WSS connected for machine=%s session=%s (ready=%v)", machineID, sessionID, isReady)
 
-	defer b.CloseSession(sess.ID)
+	defer func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		if s, exists := b.sessions[sess.ID]; exists && s.HostConn == conn {
+			s.HostConn = nil
+			if s.ClientConn != nil {
+				disconnectFrame := &FrameEnvelope{
+					ProtocolVersion: "1.2",
+					SessionID:       sess.ID,
+					Type:            "host_disconnected",
+					Status:          "waiting_for_host",
+					Timestamp:       time.Now().UnixMicro(),
+				}
+				s.mu.Lock()
+				_ = s.ClientConn.WriteJSON(disconnectFrame)
+				s.mu.Unlock()
+			} else {
+				b.closeSessionLocked(sess.ID)
+			}
+		}
+	}()
 
 	for {
 		var frame FrameEnvelope
@@ -374,7 +601,16 @@ func (b *Broker) HandleClientWebSocket(w http.ResponseWriter, r *http.Request) {
 	machineID := r.URL.Query().Get("machine_id")
 	deviceID := r.URL.Query().Get("device_id")
 	sessionID := r.URL.Query().Get("session_id")
-	token, _ := extractToken(r)
+	token, err := extractToken(r)
+
+	if err != nil {
+		if errors.Is(err, ErrQueryCredentialsRejected) {
+			http.Error(w, ErrQueryCredentialsRejected.Error(), http.StatusBadRequest)
+			return
+		}
+		http.Error(w, "missing or invalid client credentials", http.StatusUnauthorized)
+		return
+	}
 
 	if machineID == "" || deviceID == "" || sessionID == "" || token == "" {
 		http.Error(w, "missing required parameters: machine_id, device_id, session_id, or token", http.StatusBadRequest)
@@ -391,6 +627,7 @@ func (b *Broker) HandleClientWebSocket(w http.ResponseWriter, r *http.Request) {
 	isAuthorized := b.authorizedDev[machineID+":"+deviceID]
 	expectedToken, tokenRegistered := b.authorizedClientTokens[key]
 	exp, hasExp := b.authorizedExpiries[key]
+	existingSess, sessExists := b.sessions[sessionID]
 	b.mu.RUnlock()
 
 	if !isAuthorized || !tokenRegistered || expectedToken == "" || token != expectedToken {
@@ -398,8 +635,8 @@ func (b *Broker) HandleClientWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if hasExp && time.Now().UTC().After(exp) {
-		http.Error(w, "session expired", http.StatusForbidden)
+	if (hasExp && time.Now().UTC().After(exp)) || (sessExists && time.Now().UTC().After(existingSess.ExpiresAt)) {
+		http.Error(w, "session expired", http.StatusUnauthorized)
 		return
 	}
 
@@ -416,15 +653,24 @@ func (b *Broker) HandleClientWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	conn.SetReadLimit(MaxFrameSizeBytes)
 
-	sess, err := b.RegisterClientConnection(machineID, deviceID, sessionID, token, conn)
+	sess, isReady, err := b.RegisterClientConnection(machineID, deviceID, sessionID, token, conn)
 	if err != nil {
 		conn.WriteJSON(map[string]string{"error": err.Error()})
 		conn.Close()
 		return
 	}
-	log.Printf("Broker: Authenticated Client WSS connected for machine=%s device=%s session=%s", machineID, deviceID, sessionID)
+	log.Printf("Broker: Authenticated Client WSS connected for machine=%s device=%s session=%s (ready=%v)", machineID, deviceID, sessionID, isReady)
 
-	defer b.CloseSession(sess.ID)
+	defer func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		if s, exists := b.sessions[sess.ID]; exists && s.ClientConn == conn {
+			s.ClientConn = nil
+			if s.HostConn == nil {
+				b.closeSessionLocked(sess.ID)
+			}
+		}
+	}()
 
 	for {
 		var frame FrameEnvelope
@@ -502,7 +748,19 @@ func (b *Broker) closeSessionLocked(sessionID string) {
 	}
 
 	delete(b.sessions, sessionID)
-	delete(b.sessionExpiries, sessionID)
+}
+
+// AuthorizeAdmin exposes the service-to-service admin credential check for operational endpoints
+// (for example /metrics). It never reveals whether a secret is configured.
+func (b *Broker) AuthorizeAdmin(r *http.Request) bool {
+	return b.verifyAdminAuth(r)
+}
+
+// IsProduction reports whether the broker was started in production mode.
+func (b *Broker) IsProduction() bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return strings.EqualFold(b.environment, "production")
 }
 
 func (b *Broker) verifyAdminAuth(r *http.Request) bool {
@@ -680,7 +938,7 @@ func (b *Broker) HandleRevoke(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.SessionID != "" {
-		b.CloseSession(req.SessionID)
+		b.RevokeSession(req.MachineID, req.SessionID)
 	}
 
 	w.Header().Set("Content-Type", "application/json")

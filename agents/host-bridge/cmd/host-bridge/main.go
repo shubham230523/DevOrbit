@@ -26,6 +26,7 @@ import (
 	"devorbit.net/agents/host-bridge/internal/transport"
 	httptransport "devorbit.net/agents/host-bridge/internal/transport/http"
 	airouter "devorbit.net/agents/ai-router/pkg/router"
+	"devorbit.net/services/connection-broker/pkg/observability"
 )
 
 func main() {
@@ -37,6 +38,15 @@ func main() {
 		log.Fatalf("Host Bridge configuration error: %v", err)
 	}
 
+	// 0. Observability baseline: structured JSON logs (with redaction) and a metrics registry.
+	// These are optional plumbing: if a write fails, security operations still proceed.
+	logger := observability.NewLogger(os.Stderr, "host-bridge", "1.2.1", cfg.Environment, "info")
+	metrics := observability.NewMetrics()
+	startedAt := time.Now()
+	metrics.SetGaugeFunc("devorbit_uptime_seconds", func() float64 {
+		return time.Since(startedAt).Seconds()
+	})
+
 	// 1. Security Layer
 	jail := security.NewWorkspaceJail(cfg.AllowedRoots)
 	policy := security.NewDefaultCommandPolicy()
@@ -47,6 +57,7 @@ func main() {
 	// 2. Infrastructure Layer
 	storage := filesystem.NewStorageEngine(jail, cfg.MaxFileSizeMB*1024*1024)
 	procRunner := process.NewProcessRunner(policy, jail)
+	procRunner.SetObservability(logger, metrics)
 	gitClient := git.NewGitClient(jail)
 	adbClient := adb.NewADBClient("adb")
 
@@ -69,6 +80,7 @@ func main() {
 	serverEngine.SetBrokerEndpoints(cfg.BrokerHTTPURL, cfg.BrokerWSURL, cfg.HostSecret)
 	serverEngine.SetTrustedProxies(cfg.TrustedProxies)
 	serverEngine.SetIsProduction(cfg.Environment == "production")
+	serverEngine.SetObservability(logger, metrics)
 
 	brokerAdminSecret := cfg.BrokerSecret
 	if brokerAdminSecret == "" && cfg.Environment != "production" {
@@ -154,6 +166,22 @@ func main() {
 	brokerClient.Start(context.Background())
 	defer brokerClient.Stop()
 
+	metrics.SetGaugeFunc("devorbit_active_broker_sessions", func() float64 {
+		return float64(brokerClient.ActiveSessionCount())
+	})
+
+	// Security initialisation is complete (secret store resolved, persistence loaded, broker client
+	// started). Only now may the instance advertise readiness.
+	serverEngine.SetReady(true)
+	metrics.Inc("devorbit_startup_total")
+	logger.OperationalEvent(observability.LevelInfo, httptransport.EventStartup, map[string]any{
+		"host_id":       cfg.HostID,
+		"environment":   cfg.Environment,
+		"allowed_roots": len(cfg.AllowedRoots),
+		"tls_enabled":   cfg.TLSCertFile != "" && cfg.TLSKeyFile != "",
+		"trusted_proxies": len(cfg.TrustedProxies),
+	})
+
 	// Print initial pairing challenge on startup for mobile pairing
 	if ch, err := pairingEngine.CreateChallenge(30 * time.Minute); err == nil {
 		hasNativeTLS := cfg.TLSCertFile != "" && cfg.TLSKeyFile != ""
@@ -226,6 +254,10 @@ func main() {
 	<-stop
 
 	log.Println("Shutting down Host Bridge gracefully...")
+	logger.OperationalEvent(observability.LevelInfo, httptransport.EventShutdown, map[string]any{
+		"reason": "signal",
+	})
+	serverEngine.SetReady(false)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 

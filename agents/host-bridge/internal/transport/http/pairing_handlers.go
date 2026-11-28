@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"devorbit.net/agents/host-bridge/internal/security"
+	"devorbit.net/services/connection-broker/pkg/observability"
 )
 
 func (s *Server) SetPairingEngine(engine *security.PairingEngine) {
@@ -192,6 +193,11 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 	clientIP := ExtractIP(r.RemoteAddr)
 	if s.rateLimiter != nil {
 		if err := s.rateLimiter.Allow(clientIP); err != nil {
+			s.securityEvent(observability.LevelWarn, EventRateLimited, map[string]any{
+				"operation": "pairing_confirm",
+				"client_ip": clientIP,
+			})
+			s.incrementMetric("devorbit_pairing_rate_limited_total")
 			writeError(w, http.StatusTooManyRequests, err.Error())
 			return
 		}
@@ -238,6 +244,13 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 		if s.rateLimiter != nil {
 			s.rateLimiter.RecordFailure(clientIP)
 		}
+		// Security event: never include the proof, nonce or secrets; reason only.
+		s.securityEvent(observability.LevelWarn, EventPairingFailed, map[string]any{
+			"reason":    pairingFailureReason(err),
+			"client_ip": clientIP,
+			"device_id": req.DeviceID,
+		})
+		s.incrementMetric("devorbit_pairing_failures_total")
 		if errors.Is(err, security.ErrReplayDetected) {
 			writeError(w, http.StatusForbidden, err.Error())
 		} else if errors.Is(err, security.ErrPairingExpired) ||
@@ -254,6 +267,12 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 	if s.rateLimiter != nil {
 		s.rateLimiter.RecordSuccess(clientIP)
 	}
+
+	s.securityEvent(observability.LevelInfo, EventPairingSucceeded, map[string]any{
+		"client_ip": clientIP,
+		"device_id": req.DeviceID,
+	})
+	s.incrementMetric("devorbit_pairing_success_total")
 
 	// If this challenge+device was already confirmed and cached, return the exact same session
 	// (only after ConfirmPairing already verified expiry + constant-time proof).
