@@ -26,16 +26,20 @@ class FlutterE2ESession {
     required String sessionId,
     required String deviceId,
     required String masterSecret,
+    String? channel,
   }) async {
     final hkdf = Hkdf(
       hmac: Hmac.sha256(),
       outputLength: 32,
     );
 
+    final prefix = (channel != null && channel.isNotEmpty)
+        ? 'devorbit-$channel'
+        : 'devorbit';
     final secretBytes = utf8.encode(masterSecret);
     final salt = utf8.encode('devorbit-e2e-salt-$sessionId');
-    final infoClient = utf8.encode('devorbit-client-to-host-$sessionId-$deviceId');
-    final infoHost = utf8.encode('devorbit-host-to-client-$sessionId-$deviceId');
+    final infoClient = utf8.encode('$prefix-client-to-host-$sessionId-$deviceId');
+    final infoHost = utf8.encode('$prefix-host-to-client-$sessionId-$deviceId');
 
     final clientKeyBytes = await hkdf.deriveKey(
       secretKey: SecretKey(secretBytes),

@@ -3,19 +3,18 @@ package http
 import (
 	"net/http"
 	"strings"
+
+	"devorbit.net/agents/host-bridge/internal/security"
 )
 
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
+	// Public minimal health endpoint (returns full metadata only when authenticated)
 	mux.HandleFunc("/api/v1/health", s.HandleHealth)
 
-	mux.HandleFunc("/api/v1/pairing/challenge", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		s.HandleCreatePairingChallenge(w, r)
-	})
+	// Host-admin-only pairing challenge generation (returns ephemeral pairing_secret)
+	mux.HandleFunc("/api/v1/pairing/challenge", s.withHostAdmin(http.MethodPost, s.HandleCreatePairingChallenge))
 
+	// Public pairing confirmation endpoint protected by ephemeral HMAC proof-of-possession and IP rate limiter
 	mux.HandleFunc("/api/v1/pairing/confirm", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -24,143 +23,52 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 		s.HandleConfirmPairing(w, r)
 	})
 
-	mux.HandleFunc("/api/v1/workspaces", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/v1/workspaces/discover" {
-			if r.Method != http.MethodPost {
-				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-				return
-			}
-			s.HandleDiscoverWorkspaces(w, r)
-			return
-		}
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		s.HandleListWorkspaces(w, r)
-	})
+	// Host-admin-only session/device revocation endpoint
+	mux.HandleFunc("/api/v1/sessions/revoke", s.withHostAdmin(http.MethodPost, s.HandleRevokeSession))
 
-	mux.HandleFunc("/api/v1/files/list", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		s.HandleListDirectory(w, r)
-	})
+	// Authenticated E2E AES-256-GCM HTTP tunnel endpoint for direct LAN and HTTPS clients
+	mux.HandleFunc("/api/v1/e2e", s.HandleE2ERequest)
 
-	mux.HandleFunc("/api/v1/files/read", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		s.HandleReadFile(w, r)
-	})
+	// Protected workspace endpoints
+	mux.HandleFunc("/api/v1/workspaces", s.withAuth(http.MethodGet, security.PermissionWorkspaceList, s.HandleListWorkspaces))
+	mux.HandleFunc("/api/v1/workspaces/discover", s.withAuth(http.MethodPost, security.PermissionWorkspaceDiscover, s.HandleDiscoverWorkspaces))
 
-	mux.HandleFunc("/api/v1/files/write", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		s.HandleWriteFile(w, r)
-	})
+	// Protected filesystem endpoints
+	mux.HandleFunc("/api/v1/files/list", s.withAuth(http.MethodPost, security.PermissionFileRead, s.HandleListDirectory))
+	mux.HandleFunc("/api/v1/files/read", s.withAuth(http.MethodPost, security.PermissionFileRead, s.HandleReadFile))
+	mux.HandleFunc("/api/v1/files/write", s.withAuth(http.MethodPost, security.PermissionFileWrite, s.HandleWriteFile))
 
-	mux.HandleFunc("/api/v1/git/status", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		s.HandleGitStatus(w, r)
-	})
+	// Protected Git endpoints
+	mux.HandleFunc("/api/v1/git/status", s.withAuth(http.MethodPost, security.PermissionGitInspect, s.HandleGitStatus))
+	mux.HandleFunc("/api/v1/git/diff", s.withAuth(http.MethodPost, security.PermissionGitInspect, s.HandleGitDiff))
 
-	mux.HandleFunc("/api/v1/git/diff", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		s.HandleGitDiff(w, r)
-	})
-
-	mux.HandleFunc("/api/v1/processes/execute", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		s.HandleExecuteProcess(w, r)
-	})
-
+	// Protected process endpoints
+	mux.HandleFunc("/api/v1/processes/execute", s.withAuth(http.MethodPost, security.PermissionProcessExecute, s.HandleExecuteProcess))
 	mux.HandleFunc("/api/v1/processes/", func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/api/v1/processes/") {
-			s.HandleProcessById(w, r)
+		if !strings.HasPrefix(r.URL.Path, "/api/v1/processes/") {
+			http.NotFound(w, r)
 			return
 		}
-		http.NotFound(w, r)
+		s.HandleProcessById(w, r)
 	})
 
-	mux.HandleFunc("/api/v1/devices/adb", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		s.HandleListADBDevices(w, r)
-	})
+	// Protected ADB device endpoint
+	mux.HandleFunc("/api/v1/devices/adb", s.withAuth(http.MethodGet, security.PermissionDeviceInspect, s.HandleListADBDevices))
 
-	mux.HandleFunc("/api/v1/ai/prompt", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		s.HandleAIPrompt(w, r)
-	})
-
-	mux.HandleFunc("/api/v1/agent/tasks", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		s.HandleCreateAgentTask(w, r)
-	})
-
-	mux.HandleFunc("/api/v1/agent/tasks/approve", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		s.HandleApproveAgentTask(w, r)
-	})
-
-	mux.HandleFunc("/api/v1/agent/tasks/cancel", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		s.HandleCancelAgentTask(w, r)
-	})
-
+	// Protected AI & Agent endpoints
+	mux.HandleFunc("/api/v1/ai/prompt", s.withAuth(http.MethodPost, security.PermissionAIExecute, s.HandleAIPrompt))
+	mux.HandleFunc("/api/v1/agent/tasks", s.withAuth(http.MethodPost, security.PermissionAgentExecute, s.HandleCreateAgentTask))
+	mux.HandleFunc("/api/v1/agent/tasks/approve", s.withAuth(http.MethodPost, security.PermissionAgentApprove, s.HandleApproveAgentTask))
+	mux.HandleFunc("/api/v1/agent/tasks/cancel", s.withAuth(http.MethodPost, security.PermissionAgentExecute, s.HandleCancelAgentTask))
 	mux.HandleFunc("/api/v1/agent/tasks/", func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/api/v1/agent/tasks/") {
-			if r.Method != http.MethodGet {
-				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-				return
-			}
-			s.HandleGetAgentTask(w, r)
+		if !strings.HasPrefix(r.URL.Path, "/api/v1/agent/tasks/") {
+			http.NotFound(w, r)
 			return
 		}
-		http.NotFound(w, r)
+		s.withAuth(http.MethodGet, security.PermissionAgentRead, s.HandleGetAgentTask)(w, r)
 	})
 
-	mux.HandleFunc("/api/v1/github/repos", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		s.HandleListGitHubRepos(w, r)
-	})
-
-	mux.HandleFunc("/api/v1/github/clone", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		s.HandleCloneGitHubRepo(w, r)
-	})
+	// Protected GitHub endpoints
+	mux.HandleFunc("/api/v1/github/repos", s.withAuth(http.MethodGet, security.PermissionGitHubRead, s.HandleListGitHubRepos))
+	mux.HandleFunc("/api/v1/github/clone", s.withAuth(http.MethodPost, security.PermissionGitHubClone, s.HandleCloneGitHubRepo))
 }

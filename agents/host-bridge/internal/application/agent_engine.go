@@ -59,6 +59,8 @@ const (
 type AgentTask struct {
 	ID                string                        `json:"id"`
 	WorkspaceID       string                        `json:"workspace_id"`
+	OwnerSessionID    string                        `json:"-"`
+	OwnerDeviceID     string                        `json:"-"`
 	Prompt            string                        `json:"prompt"`
 	ModelID           string                        `json:"model_id"`
 	Status            string                        `json:"status"` // "running", "approval_required", "completed", "failed", "cancelled"
@@ -332,9 +334,11 @@ func (t *AgentTask) Snapshot() (*AgentTask, error) {
 	}
 
 	return &AgentTask{
-		ID:            t.ID,
-		WorkspaceID:   t.WorkspaceID,
-		Prompt:        t.Prompt,
+		ID:             t.ID,
+		WorkspaceID:    t.WorkspaceID,
+		OwnerSessionID: t.OwnerSessionID,
+		OwnerDeviceID:  t.OwnerDeviceID,
+		Prompt:         t.Prompt,
 		ModelID:       t.ModelID,
 		Status:        t.Status,
 		Messages:      messagesCopy,
@@ -501,6 +505,11 @@ func (e *GeminiAgentEngine) emitCancellationEvent(task *AgentTask, msg string) e
 }
 
 func (e *GeminiAgentEngine) CreateTask(workspaceID, prompt, modelID string) (*AgentTask, error) {
+	return e.CreateTaskForOwner(workspaceID, prompt, modelID, "", "")
+}
+
+// CreateTaskForOwner creates a task bound to the authenticated owner's session and device IDs.
+func (e *GeminiAgentEngine) CreateTaskForOwner(workspaceID, prompt, modelID, ownerSessionID, ownerDeviceID string) (*AgentTask, error) {
 	b := make([]byte, 12)
 	if _, err := rand.Read(b); err != nil {
 		return nil, fmt.Errorf("failed to generate task ID: %w", err)
@@ -513,9 +522,11 @@ func (e *GeminiAgentEngine) CreateTask(workspaceID, prompt, modelID string) (*Ag
 
 	now := time.Now().UTC()
 	task := &AgentTask{
-		ID:          taskID,
-		WorkspaceID: workspaceID,
-		Prompt:      prompt,
+		ID:             taskID,
+		WorkspaceID:    workspaceID,
+		OwnerSessionID: ownerSessionID,
+		OwnerDeviceID:  ownerDeviceID,
+		Prompt:         prompt,
 		ModelID:     modelID,
 		Status:      "running",
 		Messages: []router.Message{

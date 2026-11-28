@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../../../core/network/api_client.dart';
+import '../../../core/network/direct_e2e_http_client.dart';
 import '../../../core/security/secure_storage.dart';
 
 class GitWorkspaceScreen extends StatefulWidget {
@@ -47,8 +48,11 @@ class _GitWorkspaceScreenState extends State<GitWorkspaceScreen> with SingleTick
     }
 
     final client = HostBridgeApiClient(
-      baseUrl: session['brokerUrl'] ?? 'http://localhost:8082',
+      baseUrl: DirectE2EHttpTransport.resolveHostBridgeHttpUrl(session['brokerUrl']),
       sessionToken: session['token'],
+      sessionId: session['sessionId'],
+      deviceId: session['deviceId'],
+      masterSecret: session['masterSecret'],
     );
 
     final wsId = widget.workspaceId ?? (session['machineId'] ?? 'workspace');

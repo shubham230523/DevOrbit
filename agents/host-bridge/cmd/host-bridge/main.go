@@ -125,10 +125,21 @@ func main() {
 	}
 
 	// 5. Outbound Connection Broker Client
+	serverEngine.SessionStore().EnablePersistence("")
+	serverEngine.SessionStore().LoadPersistedSessions()
+
 	brokerClient := transport.NewBrokerClient(cfg.BrokerWSURL, cfg.HostID, "", cfg.HostSecret, serverEngine)
 	brokerClient.EnableSessionPersistence("")
 	serverEngine.SetSessionProvisioner(func(sessionID, deviceID, sessionSecret string, expiry time.Time) error {
 		return brokerClient.ProvisionSession(sessionID, deviceID, sessionSecret, expiry)
+	})
+	serverEngine.SetSessionRevoker(func(sessionID, deviceID string) {
+		if sessionID != "" {
+			brokerClient.RevokeSession(sessionID)
+		}
+		if deviceID != "" {
+			brokerClient.RevokeDevice(deviceID)
+		}
 	})
 
 	brokerClient.Start(context.Background())

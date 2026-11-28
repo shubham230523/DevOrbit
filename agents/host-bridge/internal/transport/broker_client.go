@@ -303,6 +303,10 @@ func (bc *BrokerClient) RevokeSession(sessionID string) {
 			break
 		}
 	}
+	bc.saveSessionsToDiskLocked()
+	if bc.Server != nil {
+		bc.Server.SessionStore().RevokeSession(sessionID)
+	}
 	log.Printf("BrokerClient: Session %s revoked and disconnected (remaining active: %d)", sessionID, len(bc.sessions))
 }
 
@@ -312,6 +316,9 @@ func (bc *BrokerClient) RevokeDevice(deviceID string) {
 
 	sessionIDs, ok := bc.deviceSessions[deviceID]
 	if !ok {
+		if bc.Server != nil {
+			bc.Server.SessionStore().RevokeDevice(deviceID)
+		}
 		return
 	}
 
@@ -337,6 +344,10 @@ func (bc *BrokerClient) RevokeDevice(deviceID string) {
 			bc.E2ESession = remDS.E2ESession
 			break
 		}
+	}
+	bc.saveSessionsToDiskLocked()
+	if bc.Server != nil {
+		bc.Server.SessionStore().RevokeDevice(deviceID)
 	}
 	log.Printf("BrokerClient: Device %s and all its sessions revoked (remaining active: %d)", deviceID, len(bc.sessions))
 }
@@ -432,18 +443,19 @@ func (bc *BrokerClient) runSessionLoop(ctx context.Context, ds *DeviceSession) {
 						return
 					}
 
-					if appReq.Method == "" || appReq.Path == "" {
+					if appReq.SessionID != "" && appReq.SessionID != ds.SessionID {
+						respTS := time.Now().UnixNano()
 						errResp := ApplicationResponseEnvelope{
 							ProtocolVersion: "1.2",
 							SessionID:       ds.SessionID,
 							RequestID:       appReq.RequestID,
-							StatusCode:      http.StatusBadRequest,
-							Body:            `{"error":"invalid request envelope: method and path are required"}`,
+							StatusCode:      http.StatusForbidden,
+							Body:            `{"error":"session_id mismatch in broker request envelope"}`,
 							SeqNum:          f.SeqNum,
-							Timestamp:       time.Now().UnixNano(),
+							Timestamp:       respTS,
 						}
 						respBytes, _ := json.Marshal(errResp)
-						encryptedRespPayload, _ := ds.E2ESession.Encrypt(security.DirHostToClient, respBytes, f.SeqNum, time.Now().UnixNano())
+						encryptedRespPayload, _ := ds.E2ESession.Encrypt(security.DirHostToClient, respBytes, f.SeqNum, respTS)
 						ds.mu.Lock()
 						if ds.conn != nil {
 							_ = ds.conn.WriteJSON(FrameEnvelope{
@@ -452,7 +464,35 @@ func (bc *BrokerClient) runSessionLoop(ctx context.Context, ds *DeviceSession) {
 								Type:            "data",
 								EncryptedData:   encryptedRespPayload,
 								SeqNum:          f.SeqNum,
-								Timestamp:       time.Now().UnixNano(),
+								Timestamp:       respTS,
+							})
+						}
+						ds.mu.Unlock()
+						return
+					}
+
+					if appReq.Method == "" || appReq.Path == "" {
+						respTS := time.Now().UnixNano()
+						errResp := ApplicationResponseEnvelope{
+							ProtocolVersion: "1.2",
+							SessionID:       ds.SessionID,
+							RequestID:       appReq.RequestID,
+							StatusCode:      http.StatusBadRequest,
+							Body:            `{"error":"invalid request envelope: method and path are required"}`,
+							SeqNum:          f.SeqNum,
+							Timestamp:       respTS,
+						}
+						respBytes, _ := json.Marshal(errResp)
+						encryptedRespPayload, _ := ds.E2ESession.Encrypt(security.DirHostToClient, respBytes, f.SeqNum, respTS)
+						ds.mu.Lock()
+						if ds.conn != nil {
+							_ = ds.conn.WriteJSON(FrameEnvelope{
+								ProtocolVersion: "1.2",
+								SessionID:       ds.SessionID,
+								Type:            "data",
+								EncryptedData:   encryptedRespPayload,
+								SeqNum:          f.SeqNum,
+								Timestamp:       respTS,
 							})
 						}
 						ds.mu.Unlock()
@@ -465,13 +505,10 @@ func (bc *BrokerClient) runSessionLoop(ctx context.Context, ds *DeviceSession) {
 						return
 					}
 
-					for k, v := range appReq.Headers {
-						req.Header.Set(k, v)
-					}
-
 					rec := NewResponseWriterBuffer()
-					bc.Server.Mux().ServeHTTP(rec, req)
+					bc.Server.ServeBrokerRequest(rec, req, ds.SessionID, ds.DeviceID, appReq.Headers)
 
+					respTS := time.Now().UnixNano()
 					appResp := ApplicationResponseEnvelope{
 						ProtocolVersion: "1.2",
 						SessionID:       ds.SessionID,
@@ -479,7 +516,7 @@ func (bc *BrokerClient) runSessionLoop(ctx context.Context, ds *DeviceSession) {
 						StatusCode:      rec.Code,
 						Body:            rec.Body.String(),
 						SeqNum:          f.SeqNum,
-						Timestamp:       time.Now().UnixNano(),
+						Timestamp:       respTS,
 					}
 
 					respBytes, err := json.Marshal(appResp)
@@ -487,7 +524,7 @@ func (bc *BrokerClient) runSessionLoop(ctx context.Context, ds *DeviceSession) {
 						return
 					}
 
-					encryptedRespPayload, err := ds.E2ESession.Encrypt(security.DirHostToClient, respBytes, f.SeqNum, time.Now().UnixNano())
+					encryptedRespPayload, err := ds.E2ESession.Encrypt(security.DirHostToClient, respBytes, f.SeqNum, respTS)
 					if err == nil {
 						ds.mu.Lock()
 						if ds.conn != nil {
@@ -497,7 +534,7 @@ func (bc *BrokerClient) runSessionLoop(ctx context.Context, ds *DeviceSession) {
 								Type:            "data",
 								EncryptedData:   encryptedRespPayload,
 								SeqNum:          f.SeqNum,
-								Timestamp:       time.Now().UnixNano(),
+								Timestamp:       respTS,
 							})
 						}
 						ds.mu.Unlock()

@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../../../core/network/api_client.dart';
+import '../../../core/network/direct_e2e_http_client.dart';
 import '../../../core/security/secure_storage.dart';
 
 class ProjectExplorerScreen extends StatefulWidget {
@@ -66,6 +67,19 @@ class _ProjectExplorerScreenState extends State<ProjectExplorerScreen> {
 
     final session = await SecureStorageService.instance.getPairedSession();
     final token = session?['token'];
+    final sessionId = session?['sessionId'];
+    final deviceId = session?['deviceId'];
+    final masterSecret = session?['masterSecret'];
+
+    if (token == null || sessionId == null || deviceId == null || masterSecret == null) {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+          _errorMessage = 'Pairing required: pair host machine to browse workspaces.';
+        });
+      }
+      return;
+    }
 
     final candidateUrls = <String>[
       'http://localhost:8082',
@@ -73,18 +87,21 @@ class _ProjectExplorerScreenState extends State<ProjectExplorerScreen> {
       'http://10.0.2.2:8082',
     ];
 
-    if (session != null && session['brokerUrl'] != null && session['brokerUrl']!.isNotEmpty) {
-      final bUrl = session['brokerUrl']!
-          .replaceAll('ws://', 'http://')
-          .replaceAll('wss://', 'https://')
-          .replaceAll(':8081', ':8082');
+    if (session?['brokerUrl'] != null && session!['brokerUrl']!.isNotEmpty) {
+      final bUrl = DirectE2EHttpTransport.resolveHostBridgeHttpUrl(session['brokerUrl']);
       if (!candidateUrls.contains(bUrl)) {
         candidateUrls.insert(0, bUrl);
       }
     }
 
     for (final url in candidateUrls) {
-      final client = HostBridgeApiClient(baseUrl: url, sessionToken: token);
+      final client = HostBridgeApiClient(
+        baseUrl: url,
+        sessionToken: token,
+        sessionId: sessionId,
+        deviceId: deviceId,
+        masterSecret: masterSecret,
+      );
       final wsRes = await client.listWorkspaces();
       if (wsRes['success'] == true && mounted) {
         final list = wsRes['workspaces'] as List<dynamic>;

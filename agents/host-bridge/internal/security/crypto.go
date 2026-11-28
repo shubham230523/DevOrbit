@@ -3,6 +3,7 @@ package security
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
@@ -27,6 +28,9 @@ type Direction string
 const (
 	DirClientToHost Direction = "client_to_host"
 	DirHostToClient Direction = "host_to_client"
+
+	ChannelBrokerWS   = ""
+	ChannelDirectHTTP = "http"
 )
 
 type E2ESession struct {
@@ -42,10 +46,20 @@ type E2ESession struct {
 }
 
 func DeriveDirectionalKeys(masterSecret string, sessionID, deviceID string) ([]byte, []byte, error) {
+	return DeriveChannelDirectionalKeys(ChannelBrokerWS, masterSecret, sessionID, deviceID)
+}
+
+// DeriveChannelDirectionalKeys derives independent AES-256 keys per transport channel
+// using HKDF-SHA256 domain separation so frames from one channel cannot be replayed on another.
+func DeriveChannelDirectionalKeys(channel, masterSecret, sessionID, deviceID string) ([]byte, []byte, error) {
 	secretBytes := []byte(masterSecret)
 	salt := []byte(fmt.Sprintf("devorbit-e2e-salt-%s", sessionID))
-	infoClient := []byte(fmt.Sprintf("devorbit-client-to-host-%s-%s", sessionID, deviceID))
-	infoHost := []byte(fmt.Sprintf("devorbit-host-to-client-%s-%s", sessionID, deviceID))
+	prefix := "devorbit"
+	if channel != "" {
+		prefix = "devorbit-" + channel
+	}
+	infoClient := []byte(fmt.Sprintf("%s-client-to-host-%s-%s", prefix, sessionID, deviceID))
+	infoHost := []byte(fmt.Sprintf("%s-host-to-client-%s-%s", prefix, sessionID, deviceID))
 
 	hkdfClient := hkdf.New(sha256.New, secretBytes, salt, infoClient)
 	clientKey := make([]byte, 32) // AES-256
@@ -62,8 +76,35 @@ func DeriveDirectionalKeys(masterSecret string, sessionID, deviceID string) ([]b
 	return clientKey, hostKey, nil
 }
 
+// DeriveHTTPRequestAuthKey derives a 32-byte HMAC key from the session master secret
+// bound to sessionID and deviceID for authenticating direct HTTPS requests.
+func DeriveHTTPRequestAuthKey(masterSecret, sessionID, deviceID string) ([]byte, error) {
+	salt := []byte(fmt.Sprintf("devorbit-e2e-salt-%s", sessionID))
+	info := []byte(fmt.Sprintf("devorbit-http-auth-%s-%s", sessionID, deviceID))
+	r := hkdf.New(sha256.New, []byte(masterSecret), salt, info)
+	key := make([]byte, 32)
+	if _, err := io.ReadFull(r, key); err != nil {
+		return nil, err
+	}
+	return key, nil
+}
+
+// ComputeHTTPRequestMAC computes the canonical HMAC-SHA256 signature for a direct HTTPS request.
+func ComputeHTTPRequestMAC(authKey []byte, method, requestURI, sessionID, deviceID, timestamp, nonce, bodySHA256Hex string) string {
+	canonical := fmt.Sprintf("%s\n%s\n%s\n%s\n%s\n%s\n%s",
+		method, requestURI, sessionID, deviceID, timestamp, nonce, bodySHA256Hex)
+	mac := hmac.New(sha256.New, authKey)
+	mac.Write([]byte(canonical))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
 func NewE2ESession(sessionID, deviceID, masterSecret string, ttl time.Duration) (*E2ESession, error) {
-	cKey, hKey, err := DeriveDirectionalKeys(masterSecret, sessionID, deviceID)
+	return NewChannelE2ESession(ChannelBrokerWS, sessionID, deviceID, masterSecret, ttl)
+}
+
+// NewChannelE2ESession constructs an E2ESession with channel-specific HKDF key separation.
+func NewChannelE2ESession(channel, sessionID, deviceID, masterSecret string, ttl time.Duration) (*E2ESession, error) {
+	cKey, hKey, err := DeriveChannelDirectionalKeys(channel, masterSecret, sessionID, deviceID)
 	if err != nil {
 		return nil, err
 	}

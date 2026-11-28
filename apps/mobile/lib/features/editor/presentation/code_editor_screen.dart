@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../../../core/network/api_client.dart';
+import '../../../core/network/direct_e2e_http_client.dart';
 import '../../../core/security/secure_storage.dart';
 import 'conflict_resolution_modal.dart';
 
@@ -80,8 +81,11 @@ class _CodeEditorScreenState extends State<CodeEditorScreen> {
     }
 
     final client = HostBridgeApiClient(
-      baseUrl: session['brokerUrl'] ?? 'http://localhost:8082',
+      baseUrl: DirectE2EHttpTransport.resolveHostBridgeHttpUrl(session['brokerUrl']),
       sessionToken: session['token'],
+      sessionId: session['sessionId'],
+      deviceId: session['deviceId'],
+      masterSecret: session['masterSecret'],
     );
 
     final wsId = widget.workspaceId ?? (session['machineId'] ?? 'workspace');
@@ -122,8 +126,11 @@ class _CodeEditorScreenState extends State<CodeEditorScreen> {
     }
 
     final client = HostBridgeApiClient(
-      baseUrl: session['brokerUrl'] ?? 'http://localhost:8082',
+      baseUrl: DirectE2EHttpTransport.resolveHostBridgeHttpUrl(session['brokerUrl']),
       sessionToken: session['token'],
+      sessionId: session['sessionId'],
+      deviceId: session['deviceId'],
+      masterSecret: session['masterSecret'],
     );
 
     final wsId = widget.workspaceId ?? (session['machineId'] ?? 'workspace');
@@ -190,8 +197,11 @@ class _CodeEditorScreenState extends State<CodeEditorScreen> {
     if (session == null || session['brokerUrl'] == null) return;
 
     final client = HostBridgeApiClient(
-      baseUrl: session['brokerUrl'] ?? 'http://localhost:8082',
+      baseUrl: DirectE2EHttpTransport.resolveHostBridgeHttpUrl(session['brokerUrl']),
       sessionToken: session['token'],
+      sessionId: session['sessionId'],
+      deviceId: session['deviceId'],
+      masterSecret: session['masterSecret'],
     );
 
     final wsId = widget.workspaceId ?? (session['machineId'] ?? 'workspace');

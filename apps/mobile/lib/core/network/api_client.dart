@@ -1,25 +1,68 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
+import 'direct_e2e_http_client.dart';
 
 class HostBridgeApiClient {
   final String baseUrl;
   final String? sessionToken;
+  final String? sessionId;
+  final String? deviceId;
+  final String? masterSecret;
+  final http.Client _httpClient;
+  final DirectE2EHttpTransport _e2eTransport;
 
-  HostBridgeApiClient({required this.baseUrl, this.sessionToken});
+  HostBridgeApiClient({
+    required this.baseUrl,
+    this.sessionToken,
+    this.sessionId,
+    this.deviceId,
+    this.masterSecret,
+    http.Client? httpClient,
+  })  : _httpClient = httpClient ?? http.Client(),
+        _e2eTransport = DirectE2EHttpTransport(
+          baseUrl: baseUrl,
+          sessionToken: sessionToken,
+          sessionId: sessionId,
+          deviceId: deviceId,
+          masterSecret: masterSecret,
+          httpClient: httpClient,
+        );
 
-  Map<String, String> get _headers => {
-        'Content-Type': 'application/json',
-        if (sessionToken != null) 'Authorization': 'Bearer $sessionToken',
-      };
+  Future<http.Response> _sendProtected({
+    required String method,
+    required String path,
+    Map<String, String>? headers,
+    String? body,
+    Duration timeout = const Duration(seconds: 10),
+  }) async {
+    if (!_e2eTransport.hasE2ECredentials) {
+      throw StateError('Authenticated E2E session credentials required for direct Host Bridge API access');
+    }
+    return _e2eTransport.send(
+      method: method,
+      path: path,
+      headers: headers,
+      body: body,
+      timeout: timeout,
+    );
+  }
 
   Future<Map<String, dynamic>?> getHealth() async {
     try {
       final stopwatch = Stopwatch()..start();
-      final res = await http.get(
-        Uri.parse('$baseUrl/api/v1/health'),
-        headers: _headers,
-      ).timeout(const Duration(seconds: 2));
+      final http.Response res;
+      if (_e2eTransport.hasE2ECredentials) {
+        res = await _e2eTransport.send(
+          method: 'GET',
+          path: '/api/v1/health',
+          timeout: const Duration(seconds: 2),
+        );
+      } else {
+        res = await _httpClient
+            .get(Uri.parse('$baseUrl/api/v1/health'))
+            .timeout(const Duration(seconds: 2));
+      }
       stopwatch.stop();
 
       if (res.statusCode == 200) {
@@ -33,10 +76,11 @@ class HostBridgeApiClient {
 
   Future<Map<String, dynamic>> listWorkspaces() async {
     try {
-      final res = await http.get(
-        Uri.parse('$baseUrl/api/v1/workspaces'),
-        headers: _headers,
-      ).timeout(const Duration(milliseconds: 2500));
+      final res = await _sendProtected(
+        method: 'GET',
+        path: '/api/v1/workspaces',
+        timeout: const Duration(milliseconds: 2500),
+      );
 
       if (res.statusCode == 200) {
         final list = jsonDecode(res.body) as List<dynamic>;
@@ -51,14 +95,15 @@ class HostBridgeApiClient {
 
   Future<Map<String, dynamic>?> listDirectory(String workspaceId, String relativePath) async {
     try {
-      final res = await http.post(
-        Uri.parse('$baseUrl/api/v1/files/list'),
-        headers: _headers,
+      final res = await _sendProtected(
+        method: 'POST',
+        path: '/api/v1/files/list',
         body: jsonEncode({
           'workspace_id': workspaceId,
           'relative_path': relativePath,
         }),
-      ).timeout(const Duration(milliseconds: 2500));
+        timeout: const Duration(milliseconds: 2500),
+      );
       if (res.statusCode == 200) {
         return jsonDecode(res.body) as Map<String, dynamic>;
       }
@@ -68,14 +113,15 @@ class HostBridgeApiClient {
 
   Future<Map<String, dynamic>?> readFile(String workspaceId, String relativePath) async {
     try {
-      final res = await http.post(
-        Uri.parse('$baseUrl/api/v1/files/read'),
-        headers: _headers,
+      final res = await _sendProtected(
+        method: 'POST',
+        path: '/api/v1/files/read',
         body: jsonEncode({
           'workspace_id': workspaceId,
           'relative_path': relativePath,
         }),
-      ).timeout(const Duration(seconds: 8));
+        timeout: const Duration(seconds: 8),
+      );
       if (res.statusCode == 200) {
         return jsonDecode(res.body) as Map<String, dynamic>;
       }
@@ -91,9 +137,9 @@ class HostBridgeApiClient {
     String? requestId,
   }) async {
     try {
-      final res = await http.post(
-        Uri.parse('$baseUrl/api/v1/files/write'),
-        headers: _headers,
+      final res = await _sendProtected(
+        method: 'POST',
+        path: '/api/v1/files/write',
         body: jsonEncode({
           'workspace_id': workspaceId,
           'relative_path': relativePath,
@@ -101,7 +147,8 @@ class HostBridgeApiClient {
           'base_sha256': baseSHA256,
           if (requestId != null) 'request_id': requestId,
         }),
-      ).timeout(const Duration(seconds: 8));
+        timeout: const Duration(seconds: 8),
+      );
 
       final body = jsonDecode(res.body) as Map<String, dynamic>;
       if (res.statusCode == 200) {
@@ -118,11 +165,12 @@ class HostBridgeApiClient {
 
   Future<Map<String, dynamic>?> getGitStatus(String workspaceId) async {
     try {
-      final res = await http.post(
-        Uri.parse('$baseUrl/api/v1/git/status'),
-        headers: _headers,
+      final res = await _sendProtected(
+        method: 'POST',
+        path: '/api/v1/git/status',
         body: jsonEncode({'workspace_id': workspaceId}),
-      ).timeout(const Duration(seconds: 5));
+        timeout: const Duration(seconds: 5),
+      );
       if (res.statusCode == 200) {
         return jsonDecode(res.body) as Map<String, dynamic>;
       }
@@ -132,11 +180,12 @@ class HostBridgeApiClient {
 
   Future<Map<String, dynamic>?> getGitDiff(String workspaceId) async {
     try {
-      final res = await http.post(
-        Uri.parse('$baseUrl/api/v1/git/diff'),
-        headers: _headers,
+      final res = await _sendProtected(
+        method: 'POST',
+        path: '/api/v1/git/diff',
         body: jsonEncode({'workspace_id': workspaceId}),
-      ).timeout(const Duration(seconds: 5));
+        timeout: const Duration(seconds: 5),
+      );
       if (res.statusCode == 200) {
         return jsonDecode(res.body) as Map<String, dynamic>;
       }
@@ -151,16 +200,17 @@ class HostBridgeApiClient {
     String? requestId,
   }) async {
     try {
-      final res = await http.post(
-        Uri.parse('$baseUrl/api/v1/processes/execute'),
-        headers: _headers,
+      final res = await _sendProtected(
+        method: 'POST',
+        path: '/api/v1/processes/execute',
         body: jsonEncode({
           'workspace_id': workspaceId,
           'command': command,
           'args': args,
           if (requestId != null) 'request_id': requestId,
         }),
-      ).timeout(const Duration(seconds: 10));
+        timeout: const Duration(seconds: 10),
+      );
       if (res.statusCode == 200) {
         return jsonDecode(res.body) as Map<String, dynamic>;
       }
@@ -170,10 +220,11 @@ class HostBridgeApiClient {
 
   Future<List<dynamic>> listADBDevices() async {
     try {
-      final res = await http.get(
-        Uri.parse('$baseUrl/api/v1/devices/adb'),
-        headers: _headers,
-      ).timeout(const Duration(seconds: 5));
+      final res = await _sendProtected(
+        method: 'GET',
+        path: '/api/v1/devices/adb',
+        timeout: const Duration(seconds: 5),
+      );
       if (res.statusCode == 200) {
         return jsonDecode(res.body) as List<dynamic>;
       }
@@ -183,15 +234,16 @@ class HostBridgeApiClient {
 
   Future<Map<String, dynamic>> listGitHubRepos({String? githubToken}) async {
     try {
-      final headers = {
-        ..._headers,
+      final headers = <String, String>{
         if (githubToken != null && githubToken.trim().isNotEmpty)
           'X-GitHub-Token': githubToken.trim(),
       };
-      final res = await http.get(
-        Uri.parse('$baseUrl/api/v1/github/repos'),
+      final res = await _sendProtected(
+        method: 'GET',
+        path: '/api/v1/github/repos',
         headers: headers,
-      ).timeout(const Duration(seconds: 15));
+        timeout: const Duration(seconds: 15),
+      );
 
       final body = jsonDecode(res.body) as Map<String, dynamic>;
       if (res.statusCode == 200) {
@@ -216,19 +268,20 @@ class HostBridgeApiClient {
     String? githubToken,
   }) async {
     try {
-      final headers = {
-        ..._headers,
+      final headers = <String, String>{
         if (githubToken != null && githubToken.trim().isNotEmpty)
           'X-GitHub-Token': githubToken.trim(),
       };
-      final res = await http.post(
-        Uri.parse('$baseUrl/api/v1/github/clone'),
+      final res = await _sendProtected(
+        method: 'POST',
+        path: '/api/v1/github/clone',
         headers: headers,
         body: jsonEncode({
           'clone_url': cloneUrl,
           'name': name,
         }),
-      ).timeout(const Duration(seconds: 60));
+        timeout: const Duration(seconds: 60),
+      );
 
       final body = jsonDecode(res.body) as Map<String, dynamic>;
       if (res.statusCode == 200) {

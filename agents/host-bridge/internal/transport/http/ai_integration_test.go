@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"devorbit.net/agents/ai-router/pkg/router"
 	"devorbit.net/agents/host-bridge/internal/application"
@@ -41,16 +42,85 @@ func setupTestServerWithAIRouter(t *testing.T) (*httptransport.Server, *router.A
 	return server, aiRouter, mockProvider
 }
 
-// TestHostBridge_AIMockedPromptAndFunctionCallingWorkflow verifies the full 7-step mocked workflow:
-// 1. Host Bridge receives a user prompt.
-// 2. AI Router sends it to the Gemini provider.
-// 3. Provider returns a function-call request.
-// 4. Host Bridge receives the structured request without executing it.
-// 5. A simulated function result is submitted.
-// 6. Gemini provider receives the result.
-// 7. A final assistant response is returned.
+func postEncryptedE2E(t *testing.T, serverURL string, e2e *security.E2ESession, token string, seq int64, method, path string, body []byte) (int, []byte) {
+	t.Helper()
+	ts := time.Now().UTC().UnixMicro()
+	appReq := map[string]any{
+		"v":          "1.2",
+		"session_id": e2e.SessionID,
+		"request_id": "ai_test_req",
+		"method":     method,
+		"path":       path,
+		"body":       string(body),
+		"seq_num":    seq,
+		"timestamp":  ts,
+	}
+	appBytes, _ := json.Marshal(appReq)
+	cipherHex, err := e2e.Encrypt(security.DirClientToHost, appBytes, seq, ts)
+	if err != nil {
+		t.Fatalf("Encrypt failed: %v", err)
+	}
+	frameBytes, _ := json.Marshal(map[string]any{
+		"v":                 "1.2",
+		"session_id":        e2e.SessionID,
+		"type":              "data",
+		"encrypted_payload": cipherHex,
+		"seq_num":           seq,
+		"timestamp":         ts,
+	})
+	req, _ := http.NewRequest(http.MethodPost, serverURL+"/api/v1/e2e", bytes.NewReader(frameBytes))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set(httptransport.HeaderSessionID, e2e.SessionID)
+	req.Header.Set(httptransport.HeaderDeviceID, e2e.DeviceID)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("E2E HTTP request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected outer E2E HTTP 200, got %d", resp.StatusCode)
+	}
+
+	var respFrame struct {
+		EncryptedPayload string `json:"encrypted_payload"`
+		SeqNum           int64  `json:"seq_num"`
+		Timestamp        int64  `json:"timestamp"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&respFrame); err != nil {
+		t.Fatalf("Decode outer E2E frame failed: %v", err)
+	}
+	plainResp, err := e2e.Decrypt(security.DirHostToClient, respFrame.EncryptedPayload, respFrame.SeqNum, respFrame.Timestamp)
+	if err != nil {
+		t.Fatalf("Decrypt outer E2E response failed: %v", err)
+	}
+	var appResp struct {
+		StatusCode int    `json:"status_code"`
+		Body       string `json:"body"`
+	}
+	if err := json.Unmarshal(plainResp, &appResp); err != nil {
+		t.Fatalf("Unmarshal inner app response failed: %v", err)
+	}
+	return appResp.StatusCode, []byte(appResp.Body)
+}
+
+// TestHostBridge_AIMockedPromptAndFunctionCallingWorkflow verifies the full 7-step mocked workflow
+// executed over the authenticated E2E HTTP transport boundary.
 func TestHostBridge_AIMockedPromptAndFunctionCallingWorkflow(t *testing.T) {
 	server, _, mockProvider := setupTestServerWithAIRouter(t)
+
+	sessID := "sess-ai-01"
+	devID := "dev-ai-01"
+	token := "token-ai-32bytes-secret-value-01!"
+	secret := "secret-ai-32bytes-master-value-01!"
+	if _, err := server.SessionStore().RegisterSession(sessID, devID, token, secret, time.Now().UTC().Add(time.Hour), security.NewFullSessionPermissions()); err != nil {
+		t.Fatalf("RegisterSession failed: %v", err)
+	}
+	clientE2E, err := security.NewChannelE2ESession(security.ChannelDirectHTTP, sessID, devID, secret, time.Hour)
+	if err != nil {
+		t.Fatalf("NewChannelE2ESession failed: %v", err)
+	}
 
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
@@ -70,7 +140,7 @@ func TestHostBridge_AIMockedPromptAndFunctionCallingWorkflow(t *testing.T) {
 		},
 	})
 
-	// 1. Host Bridge receives a user prompt via HTTP
+	// 1. Host Bridge receives a user prompt via authenticated E2E HTTP
 	promptReq1 := router.GenerateRequest{
 		Model: "gemini-2.5-flash",
 		Messages: []router.Message{
@@ -79,19 +149,24 @@ func TestHostBridge_AIMockedPromptAndFunctionCallingWorkflow(t *testing.T) {
 	}
 	bodyBytes1, _ := json.Marshal(promptReq1)
 
-	resp1, err := http.Post(ts.URL+"/api/v1/ai/prompt", "application/json", bytes.NewReader(bodyBytes1))
+	// Unauthenticated direct POST must be rejected with 401
+	unauthResp, err := http.Post(ts.URL+"/api/v1/ai/prompt", "application/json", bytes.NewReader(bodyBytes1))
 	if err != nil {
-		t.Fatalf("Failed to post prompt: %v", err)
+		t.Fatalf("Failed unauth post: %v", err)
 	}
-	defer resp1.Body.Close()
+	unauthResp.Body.Close()
+	if unauthResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("Expected HTTP 401 for unauthenticated AI prompt, got: %d", unauthResp.StatusCode)
+	}
 
-	if resp1.StatusCode != http.StatusOK {
-		t.Fatalf("Expected HTTP 200, got: %d", resp1.StatusCode)
+	status1, respBody1 := postEncryptedE2E(t, ts.URL, clientE2E, token, 1, http.MethodPost, "/api/v1/ai/prompt", bodyBytes1)
+	if status1 != http.StatusOK {
+		t.Fatalf("Expected HTTP 200, got: %d (%s)", status1, string(respBody1))
 	}
 
 	// 4. Host Bridge receives the structured request without executing it
 	var genResp1 router.GenerateResponse
-	if err := json.NewDecoder(resp1.Body).Decode(&genResp1); err != nil {
+	if err := json.Unmarshal(respBody1, &genResp1); err != nil {
 		t.Fatalf("Failed to decode response 1: %v", err)
 	}
 
@@ -142,19 +217,14 @@ func TestHostBridge_AIMockedPromptAndFunctionCallingWorkflow(t *testing.T) {
 	}
 	bodyBytes2, _ := json.Marshal(promptReq2)
 
-	resp2, err := http.Post(ts.URL+"/api/v1/ai/prompt", "application/json", bytes.NewReader(bodyBytes2))
-	if err != nil {
-		t.Fatalf("Failed to post continuation: %v", err)
-	}
-	defer resp2.Body.Close()
-
-	if resp2.StatusCode != http.StatusOK {
-		t.Fatalf("Expected HTTP 200 on continuation, got: %d", resp2.StatusCode)
+	status2, respBody2 := postEncryptedE2E(t, ts.URL, clientE2E, token, 2, http.MethodPost, "/api/v1/ai/prompt", bodyBytes2)
+	if status2 != http.StatusOK {
+		t.Fatalf("Expected HTTP 200 on continuation, got: %d (%s)", status2, string(respBody2))
 	}
 
 	// 7. A final assistant response is returned
 	var genResp2 router.GenerateResponse
-	if err := json.NewDecoder(resp2.Body).Decode(&genResp2); err != nil {
+	if err := json.Unmarshal(respBody2, &genResp2); err != nil {
 		t.Fatalf("Failed to decode response 2: %v", err)
 	}
 
@@ -177,18 +247,25 @@ func TestHostBridge_AIEndpointErrorHandling(t *testing.T) {
 		application.NewDeviceService(adb.NewADBClient("adb")),
 	)
 
+	sessID := "sess-ai-err-01"
+	devID := "dev-ai-err-01"
+	token := "token-ai-err-32bytes-secret-val!"
+	secret := "secret-ai-err-32bytes-master-val!"
+	if _, err := server.SessionStore().RegisterSession(sessID, devID, token, secret, time.Now().UTC().Add(time.Hour), security.NewFullSessionPermissions()); err != nil {
+		t.Fatalf("RegisterSession failed: %v", err)
+	}
+	clientE2E, err := security.NewChannelE2ESession(security.ChannelDirectHTTP, sessID, devID, secret, time.Hour)
+	if err != nil {
+		t.Fatalf("NewChannelE2ESession failed: %v", err)
+	}
+
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
-	resp, err := http.Post(ts.URL+"/api/v1/ai/prompt", "application/json", bytes.NewReader([]byte(`{"messages":[{"role":"user","content":"hi"}]}`)))
-	if err != nil {
-		t.Fatalf("Post failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Errorf("Expected HTTP 503 when AI router not configured, got: %d", resp.StatusCode)
+	status, _ := postEncryptedE2E(t, ts.URL, clientE2E, token, 1, http.MethodPost, "/api/v1/ai/prompt", []byte(`{"messages":[{"role":"user","content":"hi"}]}`))
+	if status != http.StatusServiceUnavailable {
+		t.Errorf("Expected HTTP 503 when AI router not configured, got: %d", status)
 	}
 }

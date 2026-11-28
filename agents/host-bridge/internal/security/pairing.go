@@ -129,18 +129,12 @@ func (p *PairingEngine) ConfirmPairing(chID, deviceID, deviceName, pubKey, proof
 		return "", errors.New("pairing challenge not found")
 	}
 
-	if ch.Consumed {
-		// If the SAME device retries (e.g. response lost due to network timeout),
-		// replay the cached session token instead of returning an error.
-		// This makes pairing idempotent for the confirming device.
-		if ch.CachedDeviceID == deviceID && ch.CachedSessionToken != "" {
-			return ch.CachedSessionToken, nil
-		}
-		return "", ErrPairingUsed
-	}
-
 	if time.Now().After(ch.ExpiresAt) {
 		return "", ErrPairingExpired
+	}
+
+	if ch.Consumed && (ch.CachedDeviceID != deviceID || ch.CachedSessionToken == "") {
+		return "", ErrPairingUsed
 	}
 
 	if ch.Secret == "" {
@@ -148,7 +142,8 @@ func (p *PairingEngine) ConfirmPairing(chID, deviceID, deviceName, pubKey, proof
 	}
 
 	// Verify cryptographic proof of possession EXCLUSIVELY with the challenge's ephemeral secret
-	// Authenticated data binds: protocol version, challenge ID, pairing payload, host ID, device ID, expiry
+	// Authenticated data binds: protocol version, challenge ID, pairing payload, host ID, device ID, expiry.
+	// Proof is always verified even on same-device idempotent retries.
 	expectedAuthData := ConstructProofAuthenticatedData(ch.Version, ch.ID, ch.Payload, ch.HostID, deviceID, ch.ExpiresAtStr)
 	mac := hmac.New(sha256.New, []byte(ch.Secret))
 	mac.Write([]byte(expectedAuthData))
@@ -157,6 +152,10 @@ func (p *PairingEngine) ConfirmPairing(chID, deviceID, deviceName, pubKey, proof
 	// Constant-time comparison
 	if subtle.ConstantTimeCompare([]byte(proofSig), []byte(expectedSig)) != 1 {
 		return "", ErrInvalidProof
+	}
+
+	if ch.Consumed {
+		return ch.CachedSessionToken, nil
 	}
 
 	// Mark consumed atomically under lock

@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"devorbit.net/agents/host-bridge/internal/security"
 )
 
 type githubAPIRepo struct {
@@ -69,6 +71,13 @@ func isValidRepoName(name string) bool {
 }
 
 func (s *Server) HandleListGitHubRepos(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.authorizeRequest(w, r, security.PermissionGitHubRead); !ok {
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	token := s.resolveGitHubToken(r)
 	if token == "" {
 		writeError(w, http.StatusUnauthorized, "GitHub token required: set DEVORBIT_GITHUB_TOKEN on host or configure GitHub PAT in mobile Settings")
@@ -157,6 +166,13 @@ func (s *Server) HandleListGitHubRepos(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) HandleCloneGitHubRepo(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.authorizeRequest(w, r, security.PermissionGitHubClone); !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	var req struct {
 		CloneURL string `json:"clone_url"`
 		Name     string `json:"name"`
@@ -199,8 +215,10 @@ func (s *Server) HandleCloneGitHubRepo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	args := []string{}
-	if token := s.resolveGitHubToken(r); token != "" {
-		basic := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
+	token := s.resolveGitHubToken(r)
+	var basic string
+	if token != "" {
+		basic = base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
 		args = append(args, "-c", "http.extraHeader=Authorization: Basic "+basic)
 	}
 	args = append(args, "clone", parsedURL.String(), targetPath)
@@ -208,7 +226,14 @@ func (s *Server) HandleCloneGitHubRepo(w http.ResponseWriter, r *http.Request) {
 	cmd := exec.CommandContext(r.Context(), "git", args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Sprintf("git clone failed: %v (%s)", err, strings.TrimSpace(string(output))))
+		outStr := strings.TrimSpace(string(output))
+		if token != "" {
+			outStr = strings.ReplaceAll(outStr, token, "[REDACTED]")
+		}
+		if basic != "" {
+			outStr = strings.ReplaceAll(outStr, basic, "[REDACTED]")
+		}
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("git clone failed: %v (%s)", err, outStr))
 		return
 	}
 

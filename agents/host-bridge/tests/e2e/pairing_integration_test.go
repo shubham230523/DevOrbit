@@ -111,8 +111,10 @@ func TestDevOrbit_FullProductionPairingSessionLifecycle(t *testing.T) {
 	})
 	defer brokerClient.Stop()
 
-	// 4. Create Pairing Challenge via POST
-	resp, err := http.Post(fmt.Sprintf("%s/api/v1/pairing/challenge", hostHTTPServer.URL), "application/json", nil)
+	// 4. Create Pairing Challenge via POST (host admin authenticated)
+	chReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/v1/pairing/challenge", hostHTTPServer.URL), nil)
+	chReq.Header.Set("Authorization", "Bearer "+cfg.HostSecret)
+	resp, err := http.DefaultClient.Do(chReq)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		t.Fatalf("Failed to fetch pairing challenge: %v (code=%d)", err, resp.StatusCode)
 	}

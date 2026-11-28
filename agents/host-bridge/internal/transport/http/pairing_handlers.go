@@ -25,6 +25,13 @@ func (s *Server) SetRateLimiter(limiter *security.RateLimiter) {
 }
 
 func (s *Server) HandleCreatePairingChallenge(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeHostAdmin(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	if s.pairingEngine == nil {
 		writeError(w, http.StatusInternalServerError, "pairing engine not initialized")
 		return
@@ -144,6 +151,9 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.ChallengeID == "" || req.DeviceID == "" || req.ProofSignature == "" {
+		if s.rateLimiter != nil {
+			s.rateLimiter.RecordFailure(clientIP)
+		}
 		writeError(w, http.StatusBadRequest, "challenge_id, device_id, and proof_signature are required")
 		return
 	}
@@ -172,9 +182,32 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 		s.rateLimiter.RecordSuccess(clientIP)
 	}
 
+	// If this challenge+device was already confirmed and cached, return the exact same session
+	// (only after ConfirmPairing already verified expiry + constant-time proof).
+	s.pairingCacheMu.Lock()
+	if s.pairingCache != nil {
+		if cached, ok := s.pairingCache[req.ChallengeID+":"+req.DeviceID]; ok && cached.sessionToken == token {
+			s.pairingCacheMu.Unlock()
+			brokerWSURL := s.resolveAdvertisedBrokerWSURL(r)
+			writeJSON(w, http.StatusOK, map[string]any{
+				"status":         "success",
+				"session_token":  cached.sessionToken,
+				"session_id":     cached.sessionID,
+				"session_secret": cached.sessionSecret,
+				"machine_id":     s.pairingEngine.HostID(),
+				"device_id":      req.DeviceID,
+				"broker_url":     brokerWSURL,
+				"expires_at":     cached.expiry.Format(time.RFC3339),
+			})
+			return
+		}
+	}
+	s.pairingCacheMu.Unlock()
+
 	// Generate a unique session ID and session-specific E2E master secret
 	sessBytes := make([]byte, 16)
 	if _, err := rand.Read(sessBytes); err != nil {
+		s.pairingEngine.UnconsumeChallenge(req.ChallengeID)
 		writeError(w, http.StatusInternalServerError, "failed to generate random session ID")
 		return
 	}
@@ -182,6 +215,7 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 
 	secretBytes := make([]byte, 32)
 	if _, err := rand.Read(secretBytes); err != nil {
+		s.pairingEngine.UnconsumeChallenge(req.ChallengeID)
 		writeError(w, http.StatusInternalServerError, "failed to generate random session secret")
 		return
 	}
@@ -190,6 +224,14 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 	// Authoritative UTC expiration timestamp calculated ONCE
 	ttl := 24 * time.Hour
 	expiry := time.Now().UTC().Add(ttl)
+
+	// Register session in Host Bridge SessionStore first (enforces direct HTTP & Broker authN/authZ)
+	store := s.ensureSessionStore()
+	if _, err := store.RegisterSession(sessionID, req.DeviceID, token, sessionSecret, expiry, security.NewFullSessionPermissions()); err != nil {
+		s.pairingEngine.UnconsumeChallenge(req.ChallengeID)
+		writeError(w, http.StatusInternalServerError, "failed to register host session: "+err.Error())
+		return
+	}
 
 	// 1. Authorize session with Connection Broker using exact authoritative expiry timestamp
 	if s.brokerAuthorizer != nil {
@@ -203,23 +245,37 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 			expiry,
 		)
 		if err != nil {
+			store.RemoveSession(sessionID)
 			s.pairingEngine.UnconsumeChallenge(req.ChallengeID)
 			writeError(w, http.StatusBadGateway, "failed to register session authorization with connection broker: "+err.Error())
 			return
 		}
 	}
 
-	// 2. Provision session on Host Bridge using exact authoritative expiry timestamp
+	// 2. Provision session on Host Bridge BrokerClient using exact authoritative expiry timestamp
 	if s.sessionProvisioner != nil {
 		if err := s.sessionProvisioner(sessionID, req.DeviceID, sessionSecret, expiry); err != nil {
 			if s.brokerAuthorizer != nil {
 				_ = s.brokerAuthorizer.RevokeDevice(r.Context(), s.pairingEngine.HostID(), req.DeviceID)
 			}
+			store.RemoveSession(sessionID)
 			s.pairingEngine.UnconsumeChallenge(req.ChallengeID)
 			writeError(w, http.StatusInternalServerError, "failed to provision session on host bridge: "+err.Error())
 			return
 		}
 	}
+
+	s.pairingCacheMu.Lock()
+	if s.pairingCache == nil {
+		s.pairingCache = make(map[string]cachedPairingSession)
+	}
+	s.pairingCache[req.ChallengeID+":"+req.DeviceID] = cachedPairingSession{
+		sessionToken:  token,
+		sessionID:     sessionID,
+		sessionSecret: sessionSecret,
+		expiry:        expiry,
+	}
+	s.pairingCacheMu.Unlock()
 
 	brokerWSURL := s.resolveAdvertisedBrokerWSURL(r)
 

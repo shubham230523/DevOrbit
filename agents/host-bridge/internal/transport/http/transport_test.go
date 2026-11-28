@@ -42,6 +42,7 @@ func TestTransport_HTTPAPIEndpointsAndPairing(t *testing.T) {
 
 	server := NewServer(wsSvc, fsSvc, psSvc, gsSvc, dsSvc)
 	server.SetPairingEngine(pairingEngine)
+	server.SetHostToken("secret-32-bytes-key")
 
 	provisionedSession := ""
 	provisionedDevice := ""
@@ -65,8 +66,16 @@ func TestTransport_HTTPAPIEndpointsAndPairing(t *testing.T) {
 		t.Fatalf("Health check failed: %v", err)
 	}
 
-	// 2. Test Pairing Challenge Endpoint
-	resCh, err := http.Post(ts.URL+"/api/v1/pairing/challenge", "application/json", nil)
+	// 2. Test Pairing Challenge Endpoint (must reject unauthenticated, accept host-admin)
+	resChUnauth, err := http.Post(ts.URL+"/api/v1/pairing/challenge", "application/json", nil)
+	if err != nil || resChUnauth.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("Expected unauthenticated pairing challenge request to return 401, got: %v", resChUnauth)
+	}
+	resChUnauth.Body.Close()
+
+	reqCh, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/pairing/challenge", nil)
+	reqCh.Header.Set("Authorization", "Bearer secret-32-bytes-key")
+	resCh, err := http.DefaultClient.Do(reqCh)
 	if err != nil || resCh.StatusCode != http.StatusOK {
 		t.Fatalf("Pairing challenge API failed: %v", err)
 	}
@@ -156,6 +165,7 @@ func TestTransport_AdvertisedURLTrustAndProxyValidation(t *testing.T) {
 
 	server := NewServer(wsSvc, fsSvc, psSvc, gsSvc, dsSvc)
 	server.SetPairingEngine(pairingEngine)
+	server.SetHostToken("secret-32-bytes-key")
 
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
@@ -165,6 +175,7 @@ func TestTransport_AdvertisedURLTrustAndProxyValidation(t *testing.T) {
 	server.SetAdvertisedURL("")
 	rec := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, "/api/v1/pairing/challenge", nil)
+	req.Header.Set("Authorization", "Bearer secret-32-bytes-key")
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusInternalServerError {
 		t.Errorf("Expected HTTP 500 for missing production advertised URL, got %d", rec.Code)
@@ -209,6 +220,7 @@ func TestTransport_AdvertisedURLTrustAndProxyValidation(t *testing.T) {
 	server.SetAdvertisedURL("")
 	server.SetTrustedProxies([]string{"10.0.0.1"})
 	reqUntrusted, _ := http.NewRequest(http.MethodPost, "/api/v1/pairing/challenge", nil)
+	reqUntrusted.Header.Set("Authorization", "Bearer secret-32-bytes-key")
 	reqUntrusted.RemoteAddr = "192.168.1.50:54321" // Not trusted proxy
 	reqUntrusted.Header.Set("X-Forwarded-Proto", "https")
 	reqUntrusted.Header.Set("X-Forwarded-Host", "attacker-injected.com")
@@ -226,6 +238,7 @@ func TestTransport_AdvertisedURLTrustAndProxyValidation(t *testing.T) {
 
 	// 6. Trusted Reverse Proxy -> Uses forwarded proto and host
 	reqTrusted, _ := http.NewRequest(http.MethodPost, "/api/v1/pairing/challenge", nil)
+	reqTrusted.Header.Set("Authorization", "Bearer secret-32-bytes-key")
 	reqTrusted.RemoteAddr = "10.0.0.1:443" // Trusted proxy
 	reqTrusted.Header.Set("X-Forwarded-Proto", "https")
 	reqTrusted.Header.Set("X-Forwarded-Host", "proxy.trusted.com")
@@ -242,6 +255,7 @@ func TestTransport_AdvertisedURLTrustAndProxyValidation(t *testing.T) {
 
 	// 7. Host Header Injection with invalid characters -> Sanitized to safe default
 	reqHostInjection, _ := http.NewRequest(http.MethodPost, "/api/v1/pairing/challenge", nil)
+	reqHostInjection.Header.Set("Authorization", "Bearer secret-32-bytes-key")
 	reqHostInjection.RemoteAddr = "192.168.1.50:54321"
 	reqHostInjection.Host = "evil.com/path@victim"
 	rec = httptest.NewRecorder()

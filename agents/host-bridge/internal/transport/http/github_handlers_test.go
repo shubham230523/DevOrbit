@@ -2,28 +2,74 @@ package http
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
+	"time"
 
 	"devorbit.net/agents/host-bridge/internal/application"
 	"devorbit.net/agents/host-bridge/internal/security"
 )
 
+func registerTestSession(t *testing.T, srv *Server) (sessID, devID, token, secret string, authKey []byte) {
+	t.Helper()
+	sessID = "sess-gh-test-01"
+	devID = "dev-gh-test-01"
+	token = "token-gh-test-32bytes-secret-value!"
+	secret = "secret-gh-test-32bytes-master-key!"
+	if _, err := srv.SessionStore().RegisterSession(sessID, devID, token, secret, time.Now().UTC().Add(time.Hour), security.NewFullSessionPermissions()); err != nil {
+		t.Fatalf("failed to register test session: %v", err)
+	}
+	var err error
+	authKey, err = security.DeriveHTTPRequestAuthKey(secret, sessID, devID)
+	if err != nil {
+		t.Fatalf("failed to derive auth key: %v", err)
+	}
+	return sessID, devID, token, secret, authKey
+}
+
+func attachSignedTLSHeaders(req *http.Request, body []byte, sessID, devID, token, nonce string, authKey []byte) {
+	ts := strconv.FormatInt(time.Now().UTC().UnixMicro(), 10)
+	sum := sha256.Sum256(body)
+	sig := security.ComputeHTTPRequestMAC(authKey, req.Method, req.URL.RequestURI(), sessID, devID, ts, nonce, hex.EncodeToString(sum[:]))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set(HeaderSessionID, sessID)
+	req.Header.Set(HeaderDeviceID, devID)
+	req.Header.Set(HeaderTimestamp, ts)
+	req.Header.Set(HeaderNonce, nonce)
+	req.Header.Set(HeaderSignature, sig)
+	req.TLS = &tls.ConnectionState{}
+}
+
 func TestHandleListGitHubRepos_RequiresToken(t *testing.T) {
 	t.Setenv("DEVORBIT_GITHUB_TOKEN", "")
 	jail := security.NewWorkspaceJail([]string{t.TempDir()})
 	srv := NewServer(application.NewWorkspaceService(jail), nil, nil, nil, nil)
+	sessID, devID, token, _, authKey := registerTestSession(t, srv)
 
+	// Unauthenticated request must fail with 401
+	unauthReq := httptest.NewRequest(http.MethodGet, "/api/v1/github/repos", nil)
+	unauthRec := httptest.NewRecorder()
+	srv.Mux().ServeHTTP(unauthRec, unauthReq)
+	if unauthRec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 when unauthenticated, got %d", unauthRec.Code)
+	}
+
+	// Authenticated request without GitHub PAT must fail with 401 for missing GitHub token
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/github/repos", nil)
+	attachSignedTLSHeaders(req, nil, sessID, devID, token, "nonce-gh-001", authKey)
 	rec := httptest.NewRecorder()
 	srv.Mux().ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 when token missing, got %d: %s", rec.Code, rec.Body.String())
+		t.Fatalf("expected 401 when GitHub token missing, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -71,9 +117,11 @@ func TestHandleListGitHubRepos_ReturnsPublicAndPrivateAndDetectsCloned(t *testin
 	srv := NewServer(application.NewWorkspaceService(jail), nil, nil, nil, nil)
 	srv.githubAPIBaseURL = mockGH.URL
 	srv.githubCloneBaseDir = cloneBase
+	sessID, devID, token, _, authKey := registerTestSession(t, srv)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/github/repos", nil)
 	req.Header.Set("X-GitHub-Token", "test-pat-123")
+	attachSignedTLSHeaders(req, nil, sessID, devID, token, "nonce-gh-002", authKey)
 	rec := httptest.NewRecorder()
 	srv.Mux().ServeHTTP(rec, req)
 
@@ -104,10 +152,12 @@ func TestHandleCloneGitHubRepo_ValidationAndAlreadyCloned(t *testing.T) {
 	wsSvc := application.NewWorkspaceService(jail)
 	srv := NewServer(wsSvc, nil, nil, nil, nil)
 	srv.githubCloneBaseDir = cloneBase
+	sessID, devID, token, _, authKey := registerTestSession(t, srv)
 
 	// 1. Reject path traversal repo name
-	reqBadName := httptest.NewRequest(http.MethodPost, "/api/v1/github/clone",
-		bytes.NewBufferString(`{"name":"../evil","clone_url":"https://github.com/a/b.git"}`))
+	bodyBadName := []byte(`{"name":"../evil","clone_url":"https://github.com/a/b.git"}`)
+	reqBadName := httptest.NewRequest(http.MethodPost, "/api/v1/github/clone", bytes.NewReader(bodyBadName))
+	attachSignedTLSHeaders(reqBadName, bodyBadName, sessID, devID, token, "nonce-gh-003", authKey)
 	recBadName := httptest.NewRecorder()
 	srv.Mux().ServeHTTP(recBadName, reqBadName)
 	if recBadName.Code != http.StatusBadRequest {
@@ -115,8 +165,9 @@ func TestHandleCloneGitHubRepo_ValidationAndAlreadyCloned(t *testing.T) {
 	}
 
 	// 2. Reject non-https URL
-	reqBadURL := httptest.NewRequest(http.MethodPost, "/api/v1/github/clone",
-		bytes.NewBufferString(`{"name":"MyRepo","clone_url":"http://github.com/a/b.git"}`))
+	bodyBadURL := []byte(`{"name":"MyRepo","clone_url":"http://github.com/a/b.git"}`)
+	reqBadURL := httptest.NewRequest(http.MethodPost, "/api/v1/github/clone", bytes.NewReader(bodyBadURL))
+	attachSignedTLSHeaders(reqBadURL, bodyBadURL, sessID, devID, token, "nonce-gh-004", authKey)
 	recBadURL := httptest.NewRecorder()
 	srv.Mux().ServeHTTP(recBadURL, reqBadURL)
 	if recBadURL.Code != http.StatusBadRequest {
@@ -128,8 +179,9 @@ func TestHandleCloneGitHubRepo_ValidationAndAlreadyCloned(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(existingRepo, ".git"), 0755); err != nil {
 		t.Fatal(err)
 	}
-	reqExisting := httptest.NewRequest(http.MethodPost, "/api/v1/github/clone",
-		bytes.NewBufferString(`{"name":"ExistingRepo","clone_url":"https://github.com/shubham230523/ExistingRepo.git"}`))
+	bodyExisting := []byte(`{"name":"ExistingRepo","clone_url":"https://github.com/shubham230523/ExistingRepo.git"}`)
+	reqExisting := httptest.NewRequest(http.MethodPost, "/api/v1/github/clone", bytes.NewReader(bodyExisting))
+	attachSignedTLSHeaders(reqExisting, bodyExisting, sessID, devID, token, "nonce-gh-005", authKey)
 	recExisting := httptest.NewRecorder()
 	srv.Mux().ServeHTTP(recExisting, reqExisting)
 	if recExisting.Code != http.StatusOK {

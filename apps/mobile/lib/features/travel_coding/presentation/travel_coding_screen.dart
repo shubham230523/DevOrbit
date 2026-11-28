@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import '../../../core/network/api_client.dart';
 import '../../../core/network/agent_api_client.dart';
+import '../../../core/network/direct_e2e_http_client.dart';
 import '../../../core/security/secure_storage.dart';
 import 'widgets/approval_dialog.dart';
 
@@ -78,6 +79,19 @@ class _TravelCodingScreenState extends State<TravelCodingScreen> {
 
     final session = await _secureStorage.getPairedSession();
     final token = session?['token'] ?? widget.sessionToken;
+    final sessionId = session?['sessionId'];
+    final deviceId = session?['deviceId'];
+    final masterSecret = session?['masterSecret'];
+
+    if (token == null || sessionId == null || deviceId == null || masterSecret == null) {
+      if (mounted) {
+        setState(() {
+          _isLoadingWorkspaces = false;
+          _workspaceError = 'Pairing required to connect to host';
+        });
+      }
+      return;
+    }
 
     final candidateUrls = <String>[
       'http://localhost:8082',
@@ -85,23 +99,32 @@ class _TravelCodingScreenState extends State<TravelCodingScreen> {
       'http://10.0.2.2:8082',
     ];
 
-    if (session != null && session['brokerUrl'] != null && session['brokerUrl']!.isNotEmpty) {
-      final bUrl = session['brokerUrl']!
-          .replaceAll('ws://', 'http://')
-          .replaceAll('wss://', 'https://')
-          .replaceAll(':8081', ':8082');
+    if (session?['brokerUrl'] != null && session!['brokerUrl']!.isNotEmpty) {
+      final bUrl = DirectE2EHttpTransport.resolveHostBridgeHttpUrl(session['brokerUrl']);
       if (!candidateUrls.contains(bUrl)) {
         candidateUrls.insert(0, bUrl);
       }
     }
 
     for (final url in candidateUrls) {
-      final client = HostBridgeApiClient(baseUrl: url, sessionToken: token);
+      final client = HostBridgeApiClient(
+        baseUrl: url,
+        sessionToken: token,
+        sessionId: sessionId,
+        deviceId: deviceId,
+        masterSecret: masterSecret,
+      );
       final wsRes = await client.listWorkspaces();
       if (wsRes['success'] == true && mounted) {
         final list = wsRes['workspaces'] as List<dynamic>;
         setState(() {
-          _agentClient = AgentApiClient(baseUrl: url, sessionToken: token);
+          _agentClient = AgentApiClient(
+            baseUrl: url,
+            sessionToken: token,
+            sessionId: sessionId,
+            deviceId: deviceId,
+            masterSecret: masterSecret,
+          );
           _workspaces = list;
           _isLoadingWorkspaces = false;
           _workspaceError = null;
