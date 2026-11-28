@@ -2,10 +2,12 @@ package http
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -103,7 +105,9 @@ func TestTransport_HTTPAPIEndpointsAndPairing(t *testing.T) {
 	}
 
 	// 3. Test Confirm Pairing Endpoint
-	proofSig, err := pairingEngine.GenerateProofForChallenge(ch.ChallengeID, "phone-test-01")
+	ts1 := strconv.FormatInt(time.Now().UTC().UnixMicro(), 10)
+	nonce1 := "nonce-transport-test-0001"
+	proofSig, err := pairingEngine.GenerateProofForChallenge(ch.ChallengeID, "phone-test-01", ts1, nonce1)
 	if err != nil {
 		t.Fatalf("Failed to generate proof: %v", err)
 	}
@@ -112,6 +116,8 @@ func TestTransport_HTTPAPIEndpointsAndPairing(t *testing.T) {
 		"device_id":         "phone-test-01",
 		"device_name":       "Test Device",
 		"device_public_key": "pubkey-12345",
+		"timestamp":         ts1,
+		"nonce":             nonce1,
 		"proof_signature":   proofSig,
 	}
 	confirmBody, _ := json.Marshal(confirmReq)
@@ -141,14 +147,33 @@ func TestTransport_HTTPAPIEndpointsAndPairing(t *testing.T) {
 			confResp.SessionID, confResp.SessionSecret, provisionedSession, provisionedDevice, provisionedSecret)
 	}
 
-	// 5. Test Replaying Consumed Challenge by SAME device returns 200 (cached response).
-	// This is the idempotent retry behaviour: if the mobile lost the response due to
-	// a network timeout, it can safely retry the same confirm request and get back
-	// the same session credentials.
-	resReplay, err := http.Post(ts.URL+"/api/v1/pairing/confirm", "application/json", bytes.NewBuffer(confirmBody))
-	if err != nil || resReplay.StatusCode != http.StatusOK {
-		t.Fatalf("Expected same-device replay to return 200 OK (cached response), got: %v", resReplay)
+	// 5. Replaying the exact captured confirm request must be REJECTED with 403 Forbidden (anti-replay)
+	resCapturedReplay, err := http.Post(ts.URL+"/api/v1/pairing/confirm", "application/json", bytes.NewBuffer(confirmBody))
+	if err != nil || resCapturedReplay.StatusCode != http.StatusForbidden {
+		t.Fatalf("Expected replayed captured confirm request to return 403, got: %v", resCapturedReplay)
 	}
+	resCapturedReplay.Body.Close()
+
+	// 6. Legitimate retry by SAME device with fresh timestamp + unseen nonce + valid proof returns 200 (cached response).
+	ts2 := strconv.FormatInt(time.Now().UTC().UnixMicro(), 10)
+	nonce2 := "nonce-transport-test-0002"
+	proofSig2, err := pairingEngine.GenerateProofForChallenge(ch.ChallengeID, "phone-test-01", ts2, nonce2)
+	if err != nil {
+		t.Fatalf("Failed to generate retry proof: %v", err)
+	}
+	retryBody, _ := json.Marshal(map[string]string{
+		"challenge_id":    ch.ChallengeID,
+		"device_id":       "phone-test-01",
+		"device_name":     "Test Device",
+		"timestamp":       ts2,
+		"nonce":           nonce2,
+		"proof_signature": proofSig2,
+	})
+	resReplay, err := http.Post(ts.URL+"/api/v1/pairing/confirm", "application/json", bytes.NewBuffer(retryBody))
+	if err != nil || resReplay.StatusCode != http.StatusOK {
+		t.Fatalf("Expected same-device fresh-nonce retry to return 200 OK (cached response), got: %v", resReplay)
+	}
+	resReplay.Body.Close()
 }
 
 func TestTransport_AdvertisedURLTrustAndProxyValidation(t *testing.T) {
@@ -170,12 +195,24 @@ func TestTransport_AdvertisedURLTrustAndProxyValidation(t *testing.T) {
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 
+	// 0. Plaintext HTTP in production -> Rejected with HTTP 403
+	server.SetIsProduction(true)
+	server.SetAdvertisedURL("https://prod.devorbit.net")
+	recPlainProd := httptest.NewRecorder()
+	reqPlainProd, _ := http.NewRequest(http.MethodPost, "/api/v1/pairing/challenge", nil)
+	reqPlainProd.Header.Set("Authorization", "Bearer secret-32-bytes-key")
+	mux.ServeHTTP(recPlainProd, reqPlainProd)
+	if recPlainProd.Code != http.StatusForbidden {
+		t.Errorf("Expected HTTP 403 for non-confidential request in production, got %d", recPlainProd.Code)
+	}
+
 	// 1. Missing Production Advertised URL -> Fails with HTTP 500
 	server.SetIsProduction(true)
 	server.SetAdvertisedURL("")
 	rec := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, "/api/v1/pairing/challenge", nil)
 	req.Header.Set("Authorization", "Bearer secret-32-bytes-key")
+	req.TLS = &tls.ConnectionState{}
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusInternalServerError {
 		t.Errorf("Expected HTTP 500 for missing production advertised URL, got %d", rec.Code)

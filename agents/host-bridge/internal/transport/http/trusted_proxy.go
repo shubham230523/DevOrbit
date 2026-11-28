@@ -15,6 +15,12 @@ func ExtractIP(remoteAddr string) string {
 	return ipStr
 }
 
+// IsLoopbackRemoteAddr checks whether remoteAddr originates from a loopback interface.
+func IsLoopbackRemoteAddr(remoteAddr string) bool {
+	ip := net.ParseIP(ExtractIP(remoteAddr))
+	return ip != nil && ip.IsLoopback()
+}
+
 // IsTrustedProxy checks whether the requester IP (from remoteAddr) matches any entry in trustedProxies (exact IP or CIDR).
 // Loopback entries (127.0.0.1, ::1) in trustedProxies apply ONLY if the requester IP is actually loopback!
 func IsTrustedProxy(remoteAddr string, trustedProxies []string) bool {

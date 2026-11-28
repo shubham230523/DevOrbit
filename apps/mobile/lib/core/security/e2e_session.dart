@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
+import 'package:crypto/crypto.dart' as crypto;
 import 'package:cryptography/cryptography.dart';
 
 enum Direction {
@@ -59,6 +60,44 @@ class FlutterE2ESession {
       clientToHostKey: clientKeyBytes,
       hostToClientKey: hostKeyBytes,
     );
+  }
+
+  /// Derives the 32-byte HMAC-SHA256 HTTP request authentication key from the
+  /// session master secret bound to sessionId and deviceId (matches Go DeriveHTTPRequestAuthKey).
+  static Future<List<int>> deriveHttpAuthKey({
+    required String sessionId,
+    required String deviceId,
+    required String masterSecret,
+  }) async {
+    final hkdf = Hkdf(
+      hmac: Hmac.sha256(),
+      outputLength: 32,
+    );
+    final derived = await hkdf.deriveKey(
+      secretKey: SecretKey(utf8.encode(masterSecret)),
+      nonce: utf8.encode('devorbit-e2e-salt-$sessionId'),
+      info: utf8.encode('devorbit-http-auth-$sessionId-$deviceId'),
+    );
+    return derived.extractBytes();
+  }
+
+  /// Computes canonical HMAC-SHA256 signature for HTTP requests without transmitting
+  /// raw bearer tokens (matches Go ComputeHTTPRequestMAC).
+  static String computeHttpRequestMac({
+    required List<int> authKey,
+    required String method,
+    required String requestUri,
+    required String sessionId,
+    required String deviceId,
+    required String timestamp,
+    required String nonce,
+    required String bodySha256Hex,
+  }) {
+    final canonical =
+        '$method\n$requestUri\n$sessionId\n$deviceId\n$timestamp\n$nonce\n$bodySha256Hex';
+    return crypto.Hmac(crypto.sha256, authKey)
+        .convert(utf8.encode(canonical))
+        .toString();
   }
 
   List<int> constructAAD(int seqNum, int timestampMicroseconds) {

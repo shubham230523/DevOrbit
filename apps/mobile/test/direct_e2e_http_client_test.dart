@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'package:crypto/crypto.dart' as crypto;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -40,13 +41,35 @@ void main() {
       masterSecret: secret,
       channel: 'http',
     );
+    final serverAuthKey = await FlutterE2ESession.deriveHttpAuthKey(
+      sessionId: sessId,
+      deviceId: devId,
+      masterSecret: secret,
+    );
 
     final mockHttp = MockClient((http.Request req) async {
       expect(req.method, 'POST');
       expect(req.url.path, '/api/v1/e2e');
-      expect(req.headers['Authorization'], 'Bearer $token');
+      expect(req.headers.containsKey('Authorization'), isFalse);
       expect(req.headers['X-DevOrbit-Session-ID'], sessId);
       expect(req.headers['X-DevOrbit-Device-ID'], devId);
+      final reqTs = req.headers['X-DevOrbit-Timestamp'] ?? '';
+      final reqNonce = req.headers['X-DevOrbit-Nonce'] ?? '';
+      final reqSig = req.headers['X-DevOrbit-Signature'] ?? '';
+      expect(reqTs, isNotEmpty);
+      expect(reqNonce.length, greaterThanOrEqualTo(16));
+      final bodyHash = crypto.sha256.convert(utf8.encode(req.body)).toString();
+      final expectedSig = FlutterE2ESession.computeHttpRequestMac(
+        authKey: serverAuthKey,
+        method: req.method,
+        requestUri: req.url.path,
+        sessionId: sessId,
+        deviceId: devId,
+        timestamp: reqTs,
+        nonce: reqNonce,
+        bodySha256Hex: bodyHash,
+      );
+      expect(reqSig, equals(expectedSig));
 
       final outer = jsonDecode(req.body) as Map<String, dynamic>;
       expect(outer['session_id'], sessId);

@@ -1,11 +1,15 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
+import 'package:crypto/crypto.dart' as crypto;
 import 'package:http/http.dart' as http;
 import '../security/e2e_session.dart';
 
 /// Shared E2E HTTP transport for direct Host Bridge LAN/HTTPS communication.
 /// Encrypts every request and response with HKDF-derived AES-256-GCM keys
-/// on the `http` channel and enforces monotonic per-session sequence numbers.
+/// on the `http` channel, authenticates outer requests with HKDF-derived
+/// HMAC-SHA256 signatures (never sending raw bearer tokens), and enforces
+/// monotonic per-session sequence numbers.
 class DirectE2EHttpTransport {
   static final Map<String, int> _sessionSequences = {};
   static final Map<String, Future<void>> _sessionQueues = {};
@@ -18,6 +22,7 @@ class DirectE2EHttpTransport {
   final http.Client _httpClient;
 
   FlutterE2ESession? _e2eSession;
+  List<int>? _httpAuthKey;
 
   DirectE2EHttpTransport({
     required this.baseUrl,
@@ -29,8 +34,6 @@ class DirectE2EHttpTransport {
   }) : _httpClient = httpClient ?? http.Client();
 
   bool get hasE2ECredentials =>
-      sessionToken != null &&
-      sessionToken!.isNotEmpty &&
       sessionId != null &&
       sessionId!.isNotEmpty &&
       deviceId != null &&
@@ -46,6 +49,21 @@ class DirectE2EHttpTransport {
       channel: 'http',
     );
     return _e2eSession!;
+  }
+
+  Future<List<int>> _getHttpAuthKey() async {
+    _httpAuthKey ??= await FlutterE2ESession.deriveHttpAuthKey(
+      sessionId: sessionId!,
+      deviceId: deviceId!,
+      masterSecret: masterSecret!,
+    );
+    return _httpAuthKey!;
+  }
+
+  static String _generateHexNonce([int numBytes = 16]) {
+    final random = Random.secure();
+    final bytes = List<int>.generate(numBytes, (_) => random.nextInt(256));
+    return bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
   }
 
   static int _nextSequence(String sessId) {
@@ -116,15 +134,36 @@ class DirectE2EHttpTransport {
       final cleanBase = baseUrl.endsWith('/')
           ? baseUrl.substring(0, baseUrl.length - 1)
           : baseUrl;
+      final endpointUri = Uri.parse('$cleanBase/api/v1/e2e');
+      final requestUri = endpointUri.hasQuery
+          ? '${endpointUri.path}?${endpointUri.query}'
+          : endpointUri.path;
+
+      final authKey = await _getHttpAuthKey();
+      final authTs = DateTime.now().toUtc().microsecondsSinceEpoch.toString();
+      final authNonce = _generateHexNonce();
+      final bodyHashHex = crypto.sha256.convert(utf8.encode(outerFrame)).toString();
+      final signature = FlutterE2ESession.computeHttpRequestMac(
+        authKey: authKey,
+        method: 'POST',
+        requestUri: requestUri,
+        sessionId: sessId,
+        deviceId: deviceId!,
+        timestamp: authTs,
+        nonce: authNonce,
+        bodySha256Hex: bodyHashHex,
+      );
 
       final res = await _httpClient
           .post(
-            Uri.parse('$cleanBase/api/v1/e2e'),
+            endpointUri,
             headers: {
               'Content-Type': 'application/json',
-              'Authorization': 'Bearer $sessionToken',
               'X-DevOrbit-Session-ID': sessId,
               'X-DevOrbit-Device-ID': deviceId!,
+              'X-DevOrbit-Timestamp': authTs,
+              'X-DevOrbit-Nonce': authNonce,
+              'X-DevOrbit-Signature': signature,
             },
             body: outerFrame,
           )

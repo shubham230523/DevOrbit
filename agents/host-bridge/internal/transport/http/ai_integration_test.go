@@ -2,9 +2,12 @@ package http_test
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -42,7 +45,7 @@ func setupTestServerWithAIRouter(t *testing.T) (*httptransport.Server, *router.A
 	return server, aiRouter, mockProvider
 }
 
-func postEncryptedE2E(t *testing.T, serverURL string, e2e *security.E2ESession, token string, seq int64, method, path string, body []byte) (int, []byte) {
+func postEncryptedE2E(t *testing.T, serverURL string, e2e *security.E2ESession, authKey []byte, seq int64, method, path string, body []byte) (int, []byte) {
 	t.Helper()
 	ts := time.Now().UTC().UnixMicro()
 	appReq := map[string]any{
@@ -69,10 +72,16 @@ func postEncryptedE2E(t *testing.T, serverURL string, e2e *security.E2ESession, 
 		"timestamp":         ts,
 	})
 	req, _ := http.NewRequest(http.MethodPost, serverURL+"/api/v1/e2e", bytes.NewReader(frameBytes))
+	tsHeader := strconv.FormatInt(time.Now().UTC().UnixMicro(), 10)
+	nonce := "nonce-ai-e2e-" + strconv.FormatInt(seq, 10)
+	bodySum := sha256.Sum256(frameBytes)
+	sig := security.ComputeHTTPRequestMAC(authKey, req.Method, req.URL.RequestURI(), e2e.SessionID, e2e.DeviceID, tsHeader, nonce, hex.EncodeToString(bodySum[:]))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set(httptransport.HeaderSessionID, e2e.SessionID)
 	req.Header.Set(httptransport.HeaderDeviceID, e2e.DeviceID)
+	req.Header.Set(httptransport.HeaderTimestamp, tsHeader)
+	req.Header.Set(httptransport.HeaderNonce, nonce)
+	req.Header.Set(httptransport.HeaderSignature, sig)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -121,6 +130,10 @@ func TestHostBridge_AIMockedPromptAndFunctionCallingWorkflow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewChannelE2ESession failed: %v", err)
 	}
+	authKey, err := security.DeriveHTTPRequestAuthKey(secret, sessID, devID)
+	if err != nil {
+		t.Fatalf("DeriveHTTPRequestAuthKey failed: %v", err)
+	}
 
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
@@ -159,7 +172,7 @@ func TestHostBridge_AIMockedPromptAndFunctionCallingWorkflow(t *testing.T) {
 		t.Fatalf("Expected HTTP 401 for unauthenticated AI prompt, got: %d", unauthResp.StatusCode)
 	}
 
-	status1, respBody1 := postEncryptedE2E(t, ts.URL, clientE2E, token, 1, http.MethodPost, "/api/v1/ai/prompt", bodyBytes1)
+	status1, respBody1 := postEncryptedE2E(t, ts.URL, clientE2E, authKey, 1, http.MethodPost, "/api/v1/ai/prompt", bodyBytes1)
 	if status1 != http.StatusOK {
 		t.Fatalf("Expected HTTP 200, got: %d (%s)", status1, string(respBody1))
 	}
@@ -217,7 +230,7 @@ func TestHostBridge_AIMockedPromptAndFunctionCallingWorkflow(t *testing.T) {
 	}
 	bodyBytes2, _ := json.Marshal(promptReq2)
 
-	status2, respBody2 := postEncryptedE2E(t, ts.URL, clientE2E, token, 2, http.MethodPost, "/api/v1/ai/prompt", bodyBytes2)
+	status2, respBody2 := postEncryptedE2E(t, ts.URL, clientE2E, authKey, 2, http.MethodPost, "/api/v1/ai/prompt", bodyBytes2)
 	if status2 != http.StatusOK {
 		t.Fatalf("Expected HTTP 200 on continuation, got: %d (%s)", status2, string(respBody2))
 	}
@@ -258,13 +271,17 @@ func TestHostBridge_AIEndpointErrorHandling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewChannelE2ESession failed: %v", err)
 	}
+	authKey, err := security.DeriveHTTPRequestAuthKey(secret, sessID, devID)
+	if err != nil {
+		t.Fatalf("DeriveHTTPRequestAuthKey failed: %v", err)
+	}
 
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
-	status, _ := postEncryptedE2E(t, ts.URL, clientE2E, token, 1, http.MethodPost, "/api/v1/ai/prompt", []byte(`{"messages":[{"role":"user","content":"hi"}]}`))
+	status, _ := postEncryptedE2E(t, ts.URL, clientE2E, authKey, 1, http.MethodPost, "/api/v1/ai/prompt", []byte(`{"messages":[{"role":"user","content":"hi"}]}`))
 	if status != http.StatusServiceUnavailable {
 		t.Errorf("Expected HTTP 503 when AI router not configured, got: %d", status)
 	}

@@ -255,18 +255,22 @@ class SecureStorageService {
     }
   }
 
-  /// Computes HMAC-SHA256 proof of possession binding challenge, host identity,
-  /// device identity, protocol version, and expiry with the ephemeral challenge secret.
+  /// Computes v1.1 HMAC-SHA256 proof of possession binding challenge, host identity,
+  /// device identity, protocol version, expiry, and per-attempt timestamp + nonce
+  /// with the ephemeral challenge secret.
   String generateBoundDeviceProof({
-    required String version,
+    String version = '1.1',
     required String challengeId,
     required String payload,
     required String hostId,
     required String deviceId,
     required String expiresAtStr,
+    required String timestamp,
+    required String nonce,
     required String secretKey,
   }) {
-    final authData = '$version:$challengeId:$payload:$hostId:$deviceId:$expiresAtStr';
+    final authData =
+        '$version:$challengeId:$payload:$hostId:$deviceId:$expiresAtStr:$timestamp:$nonce';
     final key = utf8.encode(secretKey);
     final bytes = utf8.encode(authData);
     final hmacSha256 = Hmac(sha256, key);

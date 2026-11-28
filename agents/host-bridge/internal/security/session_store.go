@@ -125,11 +125,13 @@ type PersistedSessionEntry struct {
 // SessionStore manages active, expired, and revoked sessions across direct HTTP
 // and Broker WebSocket transports.
 type SessionStore struct {
-	mu             sync.RWMutex
-	sessions       map[string]*SessionRecord
-	deviceSessions map[string]map[string]bool
-	revokedDevices map[string]bool
-	storePath      string
+	mu               sync.RWMutex
+	sessions         map[string]*SessionRecord
+	deviceSessions   map[string]map[string]bool
+	revokedDevices   map[string]bool
+	storePath        string
+	onSessionUsed    func(sessionID string)
+	onSessionRevoked func(sessionID, deviceID string)
 }
 
 func NewSessionStore() *SessionStore {
@@ -320,6 +322,46 @@ func (s *SessionStore) AuthenticateBearer(token, claimedSessionID, claimedDevice
 	return matched, nil
 }
 
+// VerifySessionToken verifies a candidate raw session token against the stored SHA-256 hash
+// in constant time without persisting or exposing raw bearer tokens.
+func (s *SessionStore) VerifySessionToken(rec *SessionRecord, rawToken string) error {
+	if rec == nil || rawToken == "" {
+		return ErrSessionNotFound
+	}
+	tokenHash := HashSessionToken(rawToken)
+	if subtle.ConstantTimeCompare([]byte(rec.TokenHash), []byte(tokenHash)) != 1 {
+		return ErrSessionNotFound
+	}
+	if rec.Revoked {
+		return ErrSessionRevoked
+	}
+	if rec.IsExpired() {
+		return ErrSessionExpired
+	}
+	return nil
+}
+
+// SetLifecycleHooks registers optional callbacks invoked when a session becomes active or is revoked.
+func (s *SessionStore) SetLifecycleHooks(onUsed func(sessionID string), onRevoked func(sessionID, deviceID string)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onSessionUsed = onUsed
+	s.onSessionRevoked = onRevoked
+}
+
+// MarkSessionUsed notifies registered lifecycle hooks that the client has actively authenticated with sessionID.
+func (s *SessionStore) MarkSessionUsed(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	s.mu.RLock()
+	cb := s.onSessionUsed
+	s.mu.RUnlock()
+	if cb != nil {
+		cb(sessionID)
+	}
+}
+
 // GetActiveSession returns an active, non-expired, non-revoked session bound to sessionID and deviceID.
 func (s *SessionStore) GetActiveSession(sessionID, deviceID string) (*SessionRecord, error) {
 	if sessionID == "" || deviceID == "" {
@@ -348,16 +390,22 @@ func (s *SessionStore) GetActiveSession(sessionID, deviceID string) (*SessionRec
 // RevokeSession permanently revokes a session, destroys its keys, and updates persistence.
 func (s *SessionStore) RevokeSession(sessionID string) bool {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	rec, ok := s.sessions[sessionID]
 	if !ok {
+		s.mu.Unlock()
 		return false
 	}
 	rec.Revoked = true
 	rec.RevokedAt = time.Now().UTC()
 	rec.destroyKeysLocked()
 	s.saveLocked()
+	cb := s.onSessionRevoked
+	devID := rec.DeviceID
+	s.mu.Unlock()
+
+	if cb != nil {
+		cb(sessionID, devID)
+	}
 	return true
 }
 
@@ -367,12 +415,12 @@ func (s *SessionStore) RevokeDevice(deviceID string) int {
 		return 0
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	s.revokedDevices[deviceID] = true
 	count := 0
+	var revokedIDs []string
 	if sessIDs, ok := s.deviceSessions[deviceID]; ok {
 		for sessID := range sessIDs {
+			revokedIDs = append(revokedIDs, sessID)
 			if rec, exists := s.sessions[sessID]; exists {
 				if !rec.Revoked {
 					count++
@@ -384,6 +432,14 @@ func (s *SessionStore) RevokeDevice(deviceID string) int {
 		}
 	}
 	s.saveLocked()
+	cb := s.onSessionRevoked
+	s.mu.Unlock()
+
+	if cb != nil {
+		for _, sid := range revokedIDs {
+			cb(sid, deviceID)
+		}
+	}
 	return count
 }
 

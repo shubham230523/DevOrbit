@@ -120,7 +120,70 @@ func (s *Server) HandleCreatePairingChallenge(w http.ResponseWriter, r *http.Req
 	})
 }
 
+// BuildStartupPairingQRPayload constructs the startup pairing QR payload displayed in the Host Bridge CLI.
+// In production mode it requires native TLS or configured trusted reverse proxies and always emits the
+// configured HTTPS DEVORBIT_ADVERTISED_URL rather than an unencrypted LAN URL.
+func (s *Server) BuildStartupPairingQRPayload(ch *security.PairingChallenge, localIP string, port int, hasNativeTLS bool) (map[string]any, error) {
+	if ch == nil {
+		return nil, errors.New("pairing challenge cannot be nil")
+	}
+
+	var confirmBaseURL string
+	if s.advertisedURL != "" {
+		confirmBaseURL = s.advertisedURL
+	} else {
+		confirmBaseURL = os.Getenv("DEVORBIT_ADVERTISED_URL")
+	}
+
+	if s.isProduction {
+		if !hasNativeTLS && len(s.trustedProxies) == 0 {
+			return nil, errors.New("production mode requires native TLS or trusted reverse proxy")
+		}
+		if confirmBaseURL == "" {
+			return nil, errors.New("advertised URL must be configured in production mode")
+		}
+		u, err := url.Parse(confirmBaseURL)
+		if err != nil || u.Host == "" || strings.ToLower(u.Scheme) != "https" || u.User != nil {
+			return nil, errors.New("invalid advertised URL in production: must be a valid https URL without credentials")
+		}
+	} else if confirmBaseURL == "" {
+		scheme := "http"
+		if hasNativeTLS {
+			scheme = "https"
+		}
+		if localIP == "" {
+			localIP = "127.0.0.1"
+		}
+		confirmBaseURL = fmt.Sprintf("%s://%s:%d", scheme, localIP, port)
+	}
+
+	u, err := url.Parse(confirmBaseURL)
+	if err != nil || u.Host == "" || u.User != nil || (strings.ToLower(u.Scheme) != "http" && strings.ToLower(u.Scheme) != "https") {
+		return nil, errors.New("invalid advertised base URL: must be valid http or https URL without credentials")
+	}
+
+	confirmBaseURL = strings.TrimRight(confirmBaseURL, "/")
+	confirmURL := fmt.Sprintf("%s/api/v1/pairing/confirm", confirmBaseURL)
+	brokerWSURL := s.resolveAdvertisedBrokerWSURL(nil)
+
+	return map[string]any{
+		"v":               ch.Version,
+		"challenge_id":    ch.ID,
+		"host_id":         ch.HostID,
+		"host_name":       ch.HostName,
+		"pairing_payload": ch.Payload,
+		"pairing_secret":  ch.Secret,
+		"confirm_url":     confirmURL,
+		"broker_url":      brokerWSURL,
+		"expires_at":      ch.ExpiresAtStr,
+	}, nil
+}
+
 func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
+	if s.isProduction && !s.isTransportConfidential(r) {
+		writeError(w, http.StatusForbidden, "pairing confirmation requires HTTPS or trusted reverse proxy in production")
+		return
+	}
 	if s.pairingEngine == nil {
 		writeError(w, http.StatusInternalServerError, "pairing engine not initialized")
 		return
@@ -135,10 +198,14 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		ChallengeID     string `json:"challenge_id"`
-		DeviceID        string `json:"device_id"`
-		DeviceName      string `json:"device_name"`
+		ChallengeID string `json:"challenge_id"`
+		DeviceID    string `json:"device_id"`
+		DeviceName  string `json:"device_name"`
+		// DevicePublicKey is accepted for wire compatibility only and is not used cryptographically
+		// by Host Bridge; response confidentiality is enforced by HTTPS/TLS transport.
 		DevicePublicKey string `json:"device_public_key"`
+		Timestamp       string `json:"timestamp"`
+		Nonce           string `json:"nonce"`
 		ProofSignature  string `json:"proof_signature"`
 	}
 
@@ -150,19 +217,20 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.ChallengeID == "" || req.DeviceID == "" || req.ProofSignature == "" {
+	if req.ChallengeID == "" || req.DeviceID == "" || req.Timestamp == "" || req.Nonce == "" || req.ProofSignature == "" {
 		if s.rateLimiter != nil {
 			s.rateLimiter.RecordFailure(clientIP)
 		}
-		writeError(w, http.StatusBadRequest, "challenge_id, device_id, and proof_signature are required")
+		writeError(w, http.StatusBadRequest, "challenge_id, device_id, timestamp, nonce, and proof_signature are required")
 		return
 	}
 
-	token, err := s.pairingEngine.ConfirmPairing(
+	token, _, _, err := s.pairingEngine.ConfirmPairing(
 		req.ChallengeID,
 		req.DeviceID,
 		req.DeviceName,
-		req.DevicePublicKey,
+		req.Timestamp,
+		req.Nonce,
 		req.ProofSignature,
 	)
 
@@ -170,7 +238,12 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 		if s.rateLimiter != nil {
 			s.rateLimiter.RecordFailure(clientIP)
 		}
-		if errors.Is(err, security.ErrPairingExpired) || errors.Is(err, security.ErrPairingUsed) || errors.Is(err, security.ErrInvalidProof) {
+		if errors.Is(err, security.ErrReplayDetected) {
+			writeError(w, http.StatusForbidden, err.Error())
+		} else if errors.Is(err, security.ErrPairingExpired) ||
+			errors.Is(err, security.ErrPairingUsed) ||
+			errors.Is(err, security.ErrInvalidProof) ||
+			errors.Is(err, security.ErrInvalidTimestamp) {
 			writeError(w, http.StatusBadRequest, err.Error())
 		} else {
 			writeError(w, http.StatusInternalServerError, err.Error())
@@ -264,6 +337,8 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+
+	s.pairingEngine.BindChallengeSession(req.ChallengeID, sessionID)
 
 	s.pairingCacheMu.Lock()
 	if s.pairingCache == nil {

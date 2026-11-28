@@ -134,6 +134,26 @@ func (e *secTestEnv) registerSession(sessID, devID, token, secret string, ttl ti
 	}
 }
 
+func signOuterE2EHeaders(req *http.Request, body []byte, creds *secSessionCreds, ts string, nonce string) {
+	sum := sha256.Sum256(body)
+	sig := security.ComputeHTTPRequestMAC(
+		creds.authKey,
+		req.Method,
+		req.URL.RequestURI(),
+		creds.sessionID,
+		creds.deviceID,
+		ts,
+		nonce,
+		hex.EncodeToString(sum[:]),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(httptransport.HeaderSessionID, creds.sessionID)
+	req.Header.Set(httptransport.HeaderDeviceID, creds.deviceID)
+	req.Header.Set(httptransport.HeaderTimestamp, ts)
+	req.Header.Set(httptransport.HeaderNonce, nonce)
+	req.Header.Set(httptransport.HeaderSignature, sig)
+}
+
 func signTLSHeaders(req *http.Request, body []byte, creds *secSessionCreds, ts string, nonce string) {
 	sum := sha256.Sum256(body)
 	sig := security.ComputeHTTPRequestMAC(
@@ -205,10 +225,9 @@ func doSecE2ERequest(t *testing.T, baseURL string, creds *secSessionCreds, seq i
 	})
 
 	req, _ := http.NewRequest(http.MethodPost, baseURL+"/api/v1/e2e", bytes.NewReader(frameBytes))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+creds.token)
-	req.Header.Set(httptransport.HeaderSessionID, creds.sessionID)
-	req.Header.Set(httptransport.HeaderDeviceID, creds.deviceID)
+	outerTS := strconv.FormatInt(time.Now().UTC().UnixMicro(), 10)
+	outerNonce := fmt.Sprintf("e2e-%s-%d-%d", creds.sessionID, seq, time.Now().UTC().UnixNano())
+	signOuterE2EHeaders(req, frameBytes, creds, outerTS, outerNonce)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -548,9 +567,8 @@ func TestAuthBoundary_HostAdminAndE2ETunnelChecks(t *testing.T) {
 		"timestamp":         ts,
 	})
 	reqEsc, _ := http.NewRequest(http.MethodPost, env.httpServer.URL+"/api/v1/e2e", bytes.NewReader(frameBytes))
-	reqEsc.Header.Set("Authorization", "Bearer "+creds.token)
-	reqEsc.Header.Set(httptransport.HeaderSessionID, creds.sessionID)
-	reqEsc.Header.Set(httptransport.HeaderDeviceID, creds.deviceID)
+	escTS := strconv.FormatInt(time.Now().UTC().UnixMicro(), 10)
+	signOuterE2EHeaders(reqEsc, frameBytes, creds, escTS, "nonce-esc-0001")
 	escResp, err := http.DefaultClient.Do(reqEsc)
 	if err != nil {
 		t.Fatalf("E2E escalation request failed: %v", err)
@@ -567,18 +585,41 @@ func TestAuthBoundary_HostAdminAndE2ETunnelChecks(t *testing.T) {
 		t.Fatalf("expected tunneled Authorization header to be stripped and return 401, got: %s", string(plainEsc))
 	}
 
-	// Replayed E2E seq_num 2 must be rejected with 403
+	// Replayed outer E2E request must be rejected with 403
 	reqReplay, _ := http.NewRequest(http.MethodPost, env.httpServer.URL+"/api/v1/e2e", bytes.NewReader(frameBytes))
-	reqReplay.Header.Set("Authorization", "Bearer "+creds.token)
-	reqReplay.Header.Set(httptransport.HeaderSessionID, creds.sessionID)
-	reqReplay.Header.Set(httptransport.HeaderDeviceID, creds.deviceID)
+	signOuterE2EHeaders(reqReplay, frameBytes, creds, escTS, "nonce-esc-0001")
 	repResp, err := http.DefaultClient.Do(reqReplay)
 	if err != nil {
 		t.Fatalf("E2E replay request failed: %v", err)
 	}
 	repResp.Body.Close()
 	if repResp.StatusCode != http.StatusForbidden {
-		t.Fatalf("replayed E2E frame expected 403, got %d", repResp.StatusCode)
+		t.Fatalf("replayed outer E2E request expected 403, got %d", repResp.StatusCode)
+	}
+
+	// Replayed inner E2E seq_num 2 with a fresh outer nonce must ALSO be rejected with 403
+	reqInnerReplay, _ := http.NewRequest(http.MethodPost, env.httpServer.URL+"/api/v1/e2e", bytes.NewReader(frameBytes))
+	signOuterE2EHeaders(reqInnerReplay, frameBytes, creds, strconv.FormatInt(time.Now().UTC().UnixMicro(), 10), "nonce-esc-replay-inner")
+	repInnerResp, err := http.DefaultClient.Do(reqInnerReplay)
+	if err != nil {
+		t.Fatalf("E2E inner replay request failed: %v", err)
+	}
+	repInnerResp.Body.Close()
+	if repInnerResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("replayed inner E2E frame seq_num expected 403, got %d", repInnerResp.StatusCode)
+	}
+
+	// Sending raw Authorization: Bearer on /api/v1/e2e must be rejected with 401
+	reqRawBearer, _ := http.NewRequest(http.MethodPost, env.httpServer.URL+"/api/v1/e2e", bytes.NewReader(frameBytes))
+	signOuterE2EHeaders(reqRawBearer, frameBytes, creds, strconv.FormatInt(time.Now().UTC().UnixMicro(), 10), "nonce-raw-bearer-0001")
+	reqRawBearer.Header.Set("Authorization", "Bearer "+creds.token)
+	rawBearerResp, err := http.DefaultClient.Do(reqRawBearer)
+	if err != nil {
+		t.Fatalf("E2E raw bearer test request failed: %v", err)
+	}
+	rawBearerResp.Body.Close()
+	if rawBearerResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("raw bearer header on /api/v1/e2e expected 401, got %d", rawBearerResp.StatusCode)
 	}
 
 	// Cross-channel BrokerWS key cannot decrypt on DirectHTTP /api/v1/e2e
@@ -592,9 +633,7 @@ func TestAuthBoundary_HostAdminAndE2ETunnelChecks(t *testing.T) {
 		"v": "1.2", "session_id": creds.sessionID, "type": "data", "encrypted_payload": wsCipher, "seq_num": int64(3), "timestamp": tsWS,
 	})
 	reqCross, _ := http.NewRequest(http.MethodPost, env.httpServer.URL+"/api/v1/e2e", bytes.NewReader(wsFrame))
-	reqCross.Header.Set("Authorization", "Bearer "+creds.token)
-	reqCross.Header.Set(httptransport.HeaderSessionID, creds.sessionID)
-	reqCross.Header.Set(httptransport.HeaderDeviceID, creds.deviceID)
+	signOuterE2EHeaders(reqCross, wsFrame, creds, strconv.FormatInt(time.Now().UTC().UnixMicro(), 10), "nonce-cross-0001")
 	crossResp, err := http.DefaultClient.Do(reqCross)
 	if err != nil {
 		t.Fatalf("E2E cross-channel request failed: %v", err)

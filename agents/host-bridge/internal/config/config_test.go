@@ -134,3 +134,94 @@ func TestConfig_GeminiConfiguration(t *testing.T) {
 		t.Errorf("Expected GeminiModel to be gemini-2.5-pro, got %s", cfg.GeminiModel)
 	}
 }
+
+func setBaseProdEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("DEVORBIT_ENV", "production")
+	t.Setenv("DEVORBIT_HOST_SECRET", "valid-production-secret-key-32-bytes")
+	t.Setenv("DEVORBIT_BROKER_HTTP_URL", "https://broker.example.com")
+	t.Setenv("DEVORBIT_BROKER_WS_URL", "wss://broker.example.com")
+	t.Setenv("DEVORBIT_BROKER_SECRET", "valid-broker-secret-32-bytes-ok!")
+	t.Setenv("DEVORBIT_ADVERTISED_URL", "https://host.example.com")
+	t.Setenv("DEVORBIT_TLS_CERT_FILE", "")
+	t.Setenv("DEVORBIT_TLS_KEY_FILE", "")
+	t.Setenv("DEVORBIT_TRUSTED_PROXIES", "")
+	t.Setenv("DEVORBIT_BIND_ADDR", "")
+}
+
+func TestConfig_ProductionListenerAndTLSValidation(t *testing.T) {
+	t.Run("rejects production without native TLS or trusted proxies", func(t *testing.T) {
+		setBaseProdEnv(t)
+		if _, err := LoadConfig(); err == nil {
+			t.Fatalf("expected error when neither TLS nor trusted proxies are configured in production")
+		}
+	})
+
+	t.Run("rejects partial TLS cert without key", func(t *testing.T) {
+		setBaseProdEnv(t)
+		t.Setenv("DEVORBIT_TLS_CERT_FILE", "/etc/ssl/cert.pem")
+		if _, err := LoadConfig(); err == nil {
+			t.Fatalf("expected error when DEVORBIT_TLS_CERT_FILE is set without DEVORBIT_TLS_KEY_FILE")
+		}
+	})
+
+	t.Run("rejects non-loopback bind addr without native TLS in production", func(t *testing.T) {
+		setBaseProdEnv(t)
+		t.Setenv("DEVORBIT_TRUSTED_PROXIES", "127.0.0.1")
+		t.Setenv("DEVORBIT_BIND_ADDR", "0.0.0.0")
+		if _, err := LoadConfig(); err == nil {
+			t.Fatalf("expected error when DEVORBIT_BIND_ADDR is non-loopback without native TLS in production")
+		}
+	})
+
+	t.Run("defaults BindAddr to loopback when using trusted proxy without native TLS", func(t *testing.T) {
+		setBaseProdEnv(t)
+		t.Setenv("DEVORBIT_TRUSTED_PROXIES", "127.0.0.1")
+		cfg, err := LoadConfig()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.BindAddr != "127.0.0.1" {
+			t.Fatalf("expected BindAddr=127.0.0.1 behind trusted proxy, got %q", cfg.BindAddr)
+		}
+	})
+
+	t.Run("allows explicit IPv6 loopback behind trusted proxy", func(t *testing.T) {
+		setBaseProdEnv(t)
+		t.Setenv("DEVORBIT_TRUSTED_PROXIES", "::1")
+		t.Setenv("DEVORBIT_BIND_ADDR", "::1")
+		cfg, err := LoadConfig()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.BindAddr != "::1" {
+			t.Fatalf("expected BindAddr=::1, got %q", cfg.BindAddr)
+		}
+	})
+
+	t.Run("defaults BindAddr to 0.0.0.0 when native TLS cert and key are configured", func(t *testing.T) {
+		setBaseProdEnv(t)
+		t.Setenv("DEVORBIT_TLS_CERT_FILE", "/etc/ssl/host.crt")
+		t.Setenv("DEVORBIT_TLS_KEY_FILE", "/etc/ssl/host.key")
+		cfg, err := LoadConfig()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.BindAddr != "0.0.0.0" {
+			t.Fatalf("expected BindAddr=0.0.0.0 with native TLS, got %q", cfg.BindAddr)
+		}
+	})
+
+	t.Run("IsLoopbackAddr checks", func(t *testing.T) {
+		for _, addr := range []string{"127.0.0.1", "::1", "[::1]", "localhost", "127.0.1.1"} {
+			if !IsLoopbackAddr(addr) {
+				t.Errorf("expected IsLoopbackAddr(%q) == true", addr)
+			}
+		}
+		for _, addr := range []string{"", "0.0.0.0", "192.168.1.10", "::", "example.com"} {
+			if IsLoopbackAddr(addr) {
+				t.Errorf("expected IsLoopbackAddr(%q) == false", addr)
+			}
+		}
+	})
+}

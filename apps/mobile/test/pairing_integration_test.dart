@@ -187,7 +187,21 @@ void main() {
         final body = jsonDecode(request.body) as Map<String, dynamic>;
         expect(body['challenge_id'], equals('qr-test-01'));
         expect(body['device_id'], equals('dev-phone-01'));
+        expect(body['timestamp'], isNotEmpty);
+        expect((body['nonce'] as String).length, greaterThanOrEqualTo(16));
         expect(body['proof_signature'], isNotEmpty);
+        final expectedProof = storage.generateBoundDeviceProof(
+          version: '1.1',
+          challengeId: payload.challengeId,
+          payload: payload.pairingPayload,
+          hostId: payload.hostId,
+          deviceId: 'dev-phone-01',
+          expiresAtStr: payload.rawExpiresAt,
+          timestamp: body['timestamp'] as String,
+          nonce: body['nonce'] as String,
+          secretKey: payload.pairingSecret,
+        );
+        expect(body['proof_signature'], equals(expectedProof));
 
         return http.Response(
           jsonEncode({

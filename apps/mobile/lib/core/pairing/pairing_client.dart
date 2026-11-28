@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 import 'package:http/http.dart' as http;
 import '../security/secure_storage.dart';
 import 'qr_pairing_payload.dart';
@@ -50,13 +51,21 @@ class PairingClient {
       throw PairingException('Pairing challenge has expired. Generate a new QR code on the host.');
     }
 
+    final timestamp = DateTime.now().toUtc().microsecondsSinceEpoch.toString();
+    final rng = Random.secure();
+    final nonce = List<int>.generate(16, (_) => rng.nextInt(256))
+        .map((b) => b.toRadixString(16).padLeft(2, '0'))
+        .join();
+
     final proofSig = secureStorage.generateBoundDeviceProof(
-      version: payload.version,
+      version: '1.1',
       challengeId: payload.challengeId,
       payload: payload.pairingPayload,
       hostId: payload.hostId,
       deviceId: deviceId,
       expiresAtStr: payload.rawExpiresAt,
+      timestamp: timestamp,
+      nonce: nonce,
       secretKey: payload.pairingSecret,
     );
 
@@ -90,6 +99,8 @@ class PairingClient {
       'device_id': deviceId,
       'device_name': deviceName,
       'device_public_key': devicePublicKey ?? '',
+      'timestamp': timestamp,
+      'nonce': nonce,
       'proof_signature': proofSig,
     });
 

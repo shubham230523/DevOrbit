@@ -119,6 +119,9 @@ func main() {
 	serverEngine.RegisterRoutes(mux)
 
 	addr := fmt.Sprintf(":%d", cfg.Port)
+	if cfg.BindAddr != "" {
+		addr = net.JoinHostPort(cfg.BindAddr, fmt.Sprintf("%d", cfg.Port))
+	}
 	srv := &http.Server{
 		Addr:    addr,
 		Handler: mux,
@@ -147,25 +150,13 @@ func main() {
 
 	// Print initial pairing challenge on startup for mobile pairing
 	if ch, err := pairingEngine.CreateChallenge(30 * time.Minute); err == nil {
-		hostIP := getLocalIP()
-		confirmURL := fmt.Sprintf("http://%s:%d/api/v1/pairing/confirm", hostIP, cfg.Port)
-		if cfg.AdvertisedURL != "" {
-			confirmURL = fmt.Sprintf("%s/api/v1/pairing/confirm", strings.TrimRight(cfg.AdvertisedURL, "/"))
+		hasNativeTLS := cfg.TLSCertFile != "" && cfg.TLSKeyFile != ""
+		qrMap, err := serverEngine.BuildStartupPairingQRPayload(ch, getLocalIP(), cfg.Port, hasNativeTLS)
+		if err != nil {
+			log.Fatalf("Host Bridge startup QR error: %v", err)
 		}
-
-		qrMap := map[string]interface{}{
-			"v":               "1.0",
-			"challenge_id":    ch.ID,
-			"host_id":         cfg.HostID,
-			"host_name":       cfg.HostName,
-			"pairing_payload": ch.Payload,
-			"pairing_secret":  ch.Secret,
-			"confirm_url":     confirmURL,
-			"broker_url":      cfg.BrokerWSURL,
-			// Use ch.ExpiresAtStr exactly — same string the host uses for HMAC verification.
-			// Never re-format ExpiresAt here: any timezone difference produces a different
-			// string and breaks the cryptographic proof on the mobile side.
-			"expires_at": ch.ExpiresAtStr,
+		if cfg.Environment != "production" && !hasNativeTLS {
+			log.Println("DEVELOPMENT MODE ONLY WARNING: Host Bridge HTTP listener is running WITHOUT TLS for local LAN development pairing. Set DEVORBIT_ENV=production with TLS or trusted HTTPS reverse proxy for production.")
 		}
 		compactJSON, _ := json.Marshal(qrMap)
 		qrBytes, _ := json.MarshalIndent(qrMap, "", "  ")
@@ -210,7 +201,14 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("DevOrbit Host Bridge v1.2.1 listening on %s (HostID: %s, Allowed Roots: %d)", addr, cfg.HostID, len(cfg.AllowedRoots))
+		if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
+			log.Printf("DevOrbit Host Bridge v1.2.1 listening with TLS on %s (HostID: %s, Env: %s, Allowed Roots: %d)", addr, cfg.HostID, cfg.Environment, len(cfg.AllowedRoots))
+			if err := srv.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("Host Bridge TLS server failed: %v", err)
+			}
+			return
+		}
+		log.Printf("DevOrbit Host Bridge v1.2.1 listening on %s (HostID: %s, Env: %s, Allowed Roots: %d)", addr, cfg.HostID, cfg.Environment, len(cfg.AllowedRoots))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Host Bridge server failed: %v", err)
 		}

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -33,6 +34,9 @@ type Config struct {
 	BrokerSecret    string // Service-to-service admin secret
 	AdvertisedURL   string
 	TrustedProxies  []string
+	BindAddr        string
+	TLSCertFile     string
+	TLSKeyFile      string
 	Environment     string
 	GeminiAPIKey    string // Host-only: DEVORBIT_GEMINI_API_KEY
 	GeminiModel     string // Host-only: DEVORBIT_GEMINI_MODEL
@@ -208,7 +212,7 @@ func LoadConfig() (*Config, error) {
 		}
 	}
 
-	// 4. Trusted Reverse Proxies
+	// 4. Trusted Reverse Proxies, Bind Address & Native TLS
 	var trustedProxies []string
 	if rawProxies := os.Getenv("DEVORBIT_TRUSTED_PROXIES"); rawProxies != "" {
 		for _, p := range strings.Split(rawProxies, ",") {
@@ -216,6 +220,30 @@ func LoadConfig() (*Config, error) {
 			if trimmed != "" {
 				trustedProxies = append(trustedProxies, trimmed)
 			}
+		}
+	}
+
+	tlsCertFile := strings.TrimSpace(os.Getenv("DEVORBIT_TLS_CERT_FILE"))
+	tlsKeyFile := strings.TrimSpace(os.Getenv("DEVORBIT_TLS_KEY_FILE"))
+	if (tlsCertFile == "") != (tlsKeyFile == "") {
+		return nil, fmt.Errorf("%w: DEVORBIT_TLS_CERT_FILE and DEVORBIT_TLS_KEY_FILE must both be set together", ErrInvalidConfig)
+	}
+	hasNativeTLS := tlsCertFile != "" && tlsKeyFile != ""
+
+	bindAddr := strings.TrimSpace(os.Getenv("DEVORBIT_BIND_ADDR"))
+	if env == "production" {
+		if !hasNativeTLS && len(trustedProxies) == 0 {
+			return nil, fmt.Errorf("%w: production mode requires native TLS (DEVORBIT_TLS_CERT_FILE/DEVORBIT_TLS_KEY_FILE) or DEVORBIT_TRUSTED_PROXIES behind an HTTPS reverse proxy", ErrInvalidConfig)
+		}
+		if bindAddr == "" {
+			if hasNativeTLS {
+				bindAddr = "0.0.0.0"
+			} else {
+				// Bind plaintext upstream strictly to loopback behind the trusted reverse proxy.
+				bindAddr = "127.0.0.1"
+			}
+		} else if !hasNativeTLS && !IsLoopbackAddr(bindAddr) {
+			return nil, fmt.Errorf("%w: production mode forbids binding non-loopback address %q without native TLS", ErrInvalidConfig, bindAddr)
 		}
 	}
 
@@ -255,6 +283,9 @@ func LoadConfig() (*Config, error) {
 		BrokerSecret:    brokerSecret,
 		AdvertisedURL:   advertisedURL,
 		TrustedProxies:  trustedProxies,
+		BindAddr:        bindAddr,
+		TLSCertFile:     tlsCertFile,
+		TLSKeyFile:      tlsKeyFile,
 		Environment:     env,
 		GeminiAPIKey:    geminiKey,
 		GeminiModel:     geminiModel,
@@ -263,4 +294,17 @@ func LoadConfig() (*Config, error) {
 			"git", "git.exe", "gradlew", "gradlew.bat", "gradle", "gradle.bat", "adb", "adb.exe",
 		},
 	}, nil
+}
+
+// IsLoopbackAddr reports whether bindAddr refers to a loopback host or IP (e.g. 127.0.0.1, ::1, localhost).
+func IsLoopbackAddr(bindAddr string) bool {
+	trimmed := strings.TrimSpace(strings.Trim(bindAddr, "[]"))
+	if trimmed == "" {
+		return false
+	}
+	if strings.EqualFold(trimmed, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(trimmed)
+	return ip != nil && ip.IsLoopback()
 }

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -137,7 +138,9 @@ func TestDevOrbit_FullProductionPairingSessionLifecycle(t *testing.T) {
 
 	// 5. Confirm Pairing as Device 1
 	dev1ID := "dev-phone-01"
-	dev1ProofSig, err := pairingEngine.GenerateProofForChallenge(chResp.ChallengeID, dev1ID)
+	dev1TS := strconv.FormatInt(time.Now().UTC().UnixMicro(), 10)
+	dev1Nonce := "nonce-e2e-dev1-0001"
+	dev1ProofSig, err := pairingEngine.GenerateProofForChallenge(chResp.ChallengeID, dev1ID, dev1TS, dev1Nonce)
 	if err != nil {
 		t.Fatalf("Failed to generate proof for device 1: %v", err)
 	}
@@ -147,6 +150,8 @@ func TestDevOrbit_FullProductionPairingSessionLifecycle(t *testing.T) {
 		"device_id":         dev1ID,
 		"device_name":       "Pixel 8 Pro",
 		"device_public_key": "pubkey-android-01",
+		"timestamp":         dev1TS,
+		"nonce":             dev1Nonce,
 		"proof_signature":   dev1ProofSig,
 	}
 
@@ -247,12 +252,16 @@ func TestDevOrbit_FullProductionPairingSessionLifecycle(t *testing.T) {
 	// 8. Confirm Pairing for Device 2 (Simultaneous Multi-Device Isolation)
 	ch2, _ := pairingEngine.CreateChallenge(5 * time.Minute)
 	dev2ID := "dev-phone-02"
-	dev2ProofSig, _ := pairingEngine.GenerateProofForChallenge(ch2.ID, dev2ID)
+	dev2TS := strconv.FormatInt(time.Now().UTC().UnixMicro(), 10)
+	dev2Nonce := "nonce-e2e-dev2-0002"
+	dev2ProofSig, _ := pairingEngine.GenerateProofForChallenge(ch2.ID, dev2ID, dev2TS, dev2Nonce)
 	confirmBody2 := map[string]string{
 		"challenge_id":      ch2.ID,
 		"device_id":         dev2ID,
 		"device_name":       "Pixel 9 Pro",
 		"device_public_key": "pubkey-android-02",
+		"timestamp":         dev2TS,
+		"nonce":             dev2Nonce,
 		"proof_signature":   dev2ProofSig,
 	}
 

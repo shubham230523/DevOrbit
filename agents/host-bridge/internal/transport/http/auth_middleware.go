@@ -103,12 +103,22 @@ var (
 	errMissingBearer = errors.New("missing or malformed Bearer authorization header")
 )
 
-func extractBearerToken(r *http.Request) (string, error) {
+func hasForbiddenQueryCredentials(r *http.Request) bool {
+	if r == nil || r.URL == nil {
+		return false
+	}
 	q := r.URL.Query()
 	for _, forbiddenKey := range []string{"token", "credential", "secret", "session_token", "session_secret", "api_key"} {
 		if q.Has(forbiddenKey) {
-			return "", errQueryCreds
+			return true
 		}
+	}
+	return false
+}
+
+func extractBearerToken(r *http.Request) (string, error) {
+	if hasForbiddenQueryCredentials(r) {
+		return "", errQueryCreds
 	}
 
 	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
@@ -124,6 +134,65 @@ func extractBearerToken(r *http.Request) (string, error) {
 		return "", errMissingBearer
 	}
 	return token, nil
+}
+
+func readBoundedRequestBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	if r.Body == nil {
+		return nil, true
+	}
+	limited := io.LimitReader(r.Body, maxAuthBodyBytes+1)
+	bodyBytes, err := io.ReadAll(limited)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read request body")
+		return nil, false
+	}
+	if len(bodyBytes) > maxAuthBodyBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, "request body exceeds maximum allowed size")
+		return nil, false
+	}
+	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	return bodyBytes, true
+}
+
+func verifySignedHMACAndConsumeNonce(w http.ResponseWriter, r *http.Request, rec *security.SessionRecord, bodyBytes []byte) bool {
+	tsRaw := strings.TrimSpace(r.Header.Get(HeaderTimestamp))
+	nonce := strings.TrimSpace(r.Header.Get(HeaderNonce))
+	sig := strings.TrimSpace(r.Header.Get(HeaderSignature))
+	if tsRaw == "" || nonce == "" || sig == "" {
+		writeError(w, http.StatusUnauthorized, "missing required request signature, timestamp, or nonce headers")
+		return false
+	}
+
+	tsTime, tsValid := security.ParseTimestamp(tsRaw)
+	if !tsValid || !security.IsTimestampFresh(tsTime, time.Now().UTC()) {
+		writeError(w, http.StatusUnauthorized, security.ErrInvalidTimestamp.Error())
+		return false
+	}
+
+	bodyHash := sha256.Sum256(bodyBytes)
+	bodyHashHex := hex.EncodeToString(bodyHash[:])
+
+	expectedSig := security.ComputeHTTPRequestMAC(
+		rec.HTTPAuthKey,
+		r.Method,
+		r.URL.RequestURI(),
+		rec.SessionID,
+		rec.DeviceID,
+		tsRaw,
+		nonce,
+		bodyHashHex,
+	)
+
+	if subtle.ConstantTimeCompare([]byte(sig), []byte(expectedSig)) != 1 {
+		writeError(w, http.StatusUnauthorized, "invalid request signature")
+		return false
+	}
+
+	if err := rec.VerifyAndConsumeNonce(nonce, tsTime, time.Now().UTC()); err != nil {
+		writeError(w, http.StatusForbidden, err.Error())
+		return false
+	}
+	return true
 }
 
 func (s *Server) isTransportConfidential(r *http.Request) bool {
@@ -144,6 +213,7 @@ func (s *Server) ensureSessionStore() *security.SessionStore {
 	defer s.sessionStoreMu.Unlock()
 	if s.sessionStore == nil {
 		s.sessionStore = security.NewSessionStore()
+		s.wireSessionStoreHooks(s.sessionStore)
 	}
 	return s.sessionStore
 }
@@ -198,6 +268,7 @@ func (s *Server) authorizeRequest(w http.ResponseWriter, r *http.Request, requir
 			writeError(w, http.StatusForbidden, "insufficient session permissions for operation")
 			return nil, false
 		}
+		store.MarkSessionUsed(rec.SessionID)
 		ac.Session = rec
 		return ac, true
 	}
@@ -212,57 +283,11 @@ func (s *Server) authorizeRequest(w http.ResponseWriter, r *http.Request, requir
 		return nil, false
 	}
 
-	tsRaw := strings.TrimSpace(r.Header.Get(HeaderTimestamp))
-	nonce := strings.TrimSpace(r.Header.Get(HeaderNonce))
-	sig := strings.TrimSpace(r.Header.Get(HeaderSignature))
-	if tsRaw == "" || nonce == "" || sig == "" {
-		writeError(w, http.StatusUnauthorized, "missing required request signature, timestamp, or nonce headers")
+	bodyBytes, ok := readBoundedRequestBody(w, r)
+	if !ok {
 		return nil, false
 	}
-
-	tsTime, tsValid := security.ParseTimestamp(tsRaw)
-	if !tsValid || !security.IsTimestampFresh(tsTime, time.Now().UTC()) {
-		writeError(w, http.StatusUnauthorized, security.ErrInvalidTimestamp.Error())
-		return nil, false
-	}
-
-	var bodyBytes []byte
-	if r.Body != nil {
-		limited := io.LimitReader(r.Body, maxAuthBodyBytes+1)
-		var err error
-		bodyBytes, err = io.ReadAll(limited)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "failed to read request body")
-			return nil, false
-		}
-		if len(bodyBytes) > maxAuthBodyBytes {
-			writeError(w, http.StatusRequestEntityTooLarge, "request body exceeds maximum allowed size")
-			return nil, false
-		}
-		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-	}
-
-	bodyHash := sha256.Sum256(bodyBytes)
-	bodyHashHex := hex.EncodeToString(bodyHash[:])
-
-	expectedSig := security.ComputeHTTPRequestMAC(
-		rec.HTTPAuthKey,
-		r.Method,
-		r.URL.RequestURI(),
-		rec.SessionID,
-		rec.DeviceID,
-		tsRaw,
-		nonce,
-		bodyHashHex,
-	)
-
-	if subtle.ConstantTimeCompare([]byte(sig), []byte(expectedSig)) != 1 {
-		writeError(w, http.StatusUnauthorized, "invalid request signature")
-		return nil, false
-	}
-
-	if err := rec.VerifyAndConsumeNonce(nonce, tsTime, time.Now().UTC()); err != nil {
-		writeError(w, http.StatusForbidden, err.Error())
+	if !verifySignedHMACAndConsumeNonce(w, r, rec, bodyBytes) {
 		return nil, false
 	}
 
@@ -270,6 +295,8 @@ func (s *Server) authorizeRequest(w http.ResponseWriter, r *http.Request, requir
 		writeError(w, http.StatusForbidden, "insufficient session permissions for operation")
 		return nil, false
 	}
+
+	store.MarkSessionUsed(rec.SessionID)
 
 	return &AuthenticatedContext{
 		Session:               rec,
@@ -295,6 +322,10 @@ func (s *Server) tryAuthenticateOptional(r *http.Request) (*AuthenticatedContext
 }
 
 func (s *Server) authorizeHostAdmin(w http.ResponseWriter, r *http.Request) bool {
+	if s.isProduction && !s.isTransportConfidential(r) {
+		writeError(w, http.StatusForbidden, "host-admin operations require HTTPS or trusted reverse proxy in production")
+		return false
+	}
 	if s.hostToken == "" {
 		writeError(w, http.StatusUnauthorized, "host admin secret not configured")
 		return false
@@ -395,6 +426,51 @@ func applySafeTunneledHeaders(dst http.Header, src map[string]string) {
 	}
 }
 
+// authenticateDirectE2ESession authenticates an outer E2E HTTP tunnel request using HKDF-derived
+// HMAC-SHA256 request signatures bound to session_id and device_id, without transmitting raw bearer tokens.
+func (s *Server) authenticateDirectE2ESession(w http.ResponseWriter, r *http.Request) (*security.SessionRecord, []byte, bool) {
+	if hasForbiddenQueryCredentials(r) {
+		writeError(w, http.StatusBadRequest, errQueryCreds.Error())
+		return nil, nil, false
+	}
+	if strings.TrimSpace(r.Header.Get("Authorization")) != "" {
+		writeError(w, http.StatusUnauthorized, "raw bearer Authorization header is rejected on /api/v1/e2e; authenticate with HMAC proof headers")
+		return nil, nil, false
+	}
+
+	claimedSessionID := strings.TrimSpace(r.Header.Get(HeaderSessionID))
+	claimedDeviceID := strings.TrimSpace(r.Header.Get(HeaderDeviceID))
+	if claimedSessionID == "" || claimedDeviceID == "" {
+		writeError(w, http.StatusUnauthorized, "missing required session and device binding headers")
+		return nil, nil, false
+	}
+
+	store := s.ensureSessionStore()
+	rec, err := store.GetActiveSession(claimedSessionID, claimedDeviceID)
+	if err != nil {
+		switch {
+		case errors.Is(err, security.ErrSessionRevoked), errors.Is(err, security.ErrSessionBindingMismatch):
+			writeError(w, http.StatusForbidden, err.Error())
+		default:
+			writeError(w, http.StatusUnauthorized, err.Error())
+		}
+		return nil, nil, false
+	}
+	if len(rec.HTTPAuthKey) == 0 {
+		writeError(w, http.StatusUnauthorized, "HTTP auth key unavailable for session")
+		return nil, nil, false
+	}
+
+	bodyBytes, ok := readBoundedRequestBody(w, r)
+	if !ok {
+		return nil, nil, false
+	}
+	if !verifySignedHMACAndConsumeNonce(w, r, rec, bodyBytes) {
+		return nil, nil, false
+	}
+	return rec, bodyBytes, true
+}
+
 // HandleE2ERequest processes an authenticated AES-256-GCM encrypted HTTP envelope over LAN/HTTPS.
 func (s *Server) HandleE2ERequest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -402,7 +478,7 @@ func (s *Server) HandleE2ERequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rec, ok := s.authenticateDirectSessionHeaders(w, r)
+	rec, bodyBytes, ok := s.authenticateDirectE2ESession(w, r)
 	if !ok {
 		return
 	}
@@ -413,7 +489,7 @@ func (s *Server) HandleE2ERequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var frame e2eFrameEnvelope
-	if err := json.NewDecoder(io.LimitReader(r.Body, maxAuthBodyBytes)).Decode(&frame); err != nil {
+	if err := json.Unmarshal(bodyBytes, &frame); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid E2E frame envelope JSON")
 		return
 	}
@@ -442,6 +518,8 @@ func (s *Server) HandleE2ERequest(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+
+	s.ensureSessionStore().MarkSessionUsed(rec.SessionID)
 
 	var appReq e2eAppRequestEnvelope
 	if err := json.Unmarshal(plainReqBytes, &appReq); err != nil {

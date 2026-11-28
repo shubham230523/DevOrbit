@@ -78,7 +78,7 @@ func NewServer(
 	gs *application.GitService,
 	ds *application.DeviceService,
 ) *Server {
-	return &Server{
+	s := &Server{
 		workspaceSvc:  ws,
 		filesystemSvc: fs,
 		processSvc:    ps,
@@ -87,12 +87,45 @@ func NewServer(
 		sessionStore:  security.NewSessionStore(),
 		processOwners: make(map[string]resourceOwner),
 	}
+	s.wireSessionStoreHooks(s.sessionStore)
+	return s
+}
+
+func (s *Server) wireSessionStoreHooks(store *security.SessionStore) {
+	if store == nil {
+		return
+	}
+	store.SetLifecycleHooks(
+		func(sessionID string) {
+			s.invalidatePairingRetryForSession(sessionID)
+		},
+		func(sessionID, _ string) {
+			s.invalidatePairingRetryForSession(sessionID)
+		},
+	)
+}
+
+func (s *Server) invalidatePairingRetryForSession(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	if s.pairingEngine != nil {
+		s.pairingEngine.InvalidateSessionRetry(sessionID)
+	}
+	s.pairingCacheMu.Lock()
+	for k, v := range s.pairingCache {
+		if v.sessionID == sessionID {
+			delete(s.pairingCache, k)
+		}
+	}
+	s.pairingCacheMu.Unlock()
 }
 
 func (s *Server) SetSessionStore(store *security.SessionStore) {
 	s.sessionStoreMu.Lock()
 	defer s.sessionStoreMu.Unlock()
 	s.sessionStore = store
+	s.wireSessionStoreHooks(store)
 }
 
 func (s *Server) SessionStore() *security.SessionStore {

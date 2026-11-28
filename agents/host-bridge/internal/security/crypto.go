@@ -31,6 +31,7 @@ const (
 
 	ChannelBrokerWS   = ""
 	ChannelDirectHTTP = "http"
+	ChannelPairing    = "pairing"
 )
 
 type E2ESession struct {
