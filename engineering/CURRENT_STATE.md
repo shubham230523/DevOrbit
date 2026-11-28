@@ -2,42 +2,39 @@
 
 **Last Updated:** 2026-11-28  
 **Current Branch:** `security/atomic-agent-task-execution`  
-**Latest Verified Remote Commit (prior to MP0.1):** `7aed09683a829f83dd3a6f04cfbba0f6e376bc31`  
-**Target Remote Branch:** `quality/autonomous-15min-improvement` (`7aed09683a829f83dd3a6f04cfbba0f6e376bc31`)  
-**Master Plan 24 Implementation Commit:** `7ba545da10f4ec61bf180c70c60960a3af03e5d4`  
-**Master Plan 24 Starting Baseline:** `efee2c99e16427223c803b89460dbe61fd151064`
+**MP0.1 Baseline Prior to MP24 Closure:** `be4ec8aa93cdfb8463f393f9f5d1ee0d457ef60d`  
+**Historical Milestones:** MP23 (`efee2c99e16427223c803b89460dbe61fd151064`), MP24 initial (`7ba545da10f4ec61bf180c70c60960a3af03e5d4`), MP0 (`7aed09683a829f83dd3a6f04cfbba0f6e376bc31`)
 
 ## 1. Stage Status Matrix
 
-| Workstream | Status | Evidence |
+| Workstream | Status | Notes |
 |---|---|---|
-| Master Plan 23 (Host Bridge HTTP Auth & Trust Boundary) | `IMPLEMENTED`, `TESTED`, `COMMITTED`, `PUSHED`, `REMOTE-VERIFIED` | Commit `efee2c99e16427223c803b89460dbe61fd151064` |
-| Master Plan 24 (Pairing Bootstrap & Host-Admin Transport Confidentiality) | Automated implementation & tests `IMPLEMENTED`, `TESTED`, `COMMITTED`, `PUSHED`, `REMOTE-VERIFIED`; **pending** `REVIEWED` & `PRODUCTION-VALIDATED` | Commit `7ba545da10f4ec61bf180c70c60960a3af03e5d4`; all Go & Flutter automated suites passed |
-| Master Plan 0 (Persistent Engineering Memory & Continuity) | `COMPLETED` (`COMMITTED`, `PUSHED`, `REMOTE-VERIFIED`) | Commit `7aed09683a829f83dd3a6f04cfbba0f6e376bc31` |
+| Master Plan 23 (Host Bridge HTTP Auth & Trust Boundary) | `IMPLEMENTED`, `TESTED`, `COMMITTED`, `PUSHED`, `REMOTE-VERIFIED` | `efee2c99e16427223c803b89460dbe61fd151064` |
+| Master Plan 0 / 0.1 (Continuity Infrastructure) | `COMPLETED` (`COMMITTED`, `PUSHED`, `REMOTE-VERIFIED`) | `7aed09683a829f83dd3a6f04cfbba0f6e376bc31` / `be4ec8aa93cdfb8463f393f9f5d1ee0d457ef60d` |
+| Master Plan 24 (Code, Independent Review & Closure Fixes) | `IMPLEMENTED`, `TESTED`, `REVIEWED` | Pending commit/push of closure fixes (Phase 7); `PRODUCTION-VALIDATED` is `BLOCKED` |
+| Master Plan 24 Live TLS Reverse-Proxy & Physical Mobile Validation | `BLOCKED` | No Caddy/Nginx, no trusted cert, no physical Android/iOS device attached (`adb devices -l` empty) |
 
-## 2. Implemented & Verified Functionality
+## 2. Implemented & Independently Reviewed Security Controls
 
-- **Host Bridge HTTP Auth & Ownership (`efee2c99e16427223c803b89460dbe61fd151064`):**
-  - Protected routes enforce session authN, device/session binding, expiry, revocation, and least-privilege `ActionPermission` checks.
-  - Process and agent task ownership is bound to `(session_id, device_id)`.
-  - Broker-mediated (`ServeBrokerRequest`) and direct HTTP paths share the same `SessionStore` and ownership checks.
-- **Pairing Bootstrap, Host-Admin Confidentiality & Outer E2E HMAC Auth (`7ba545da10f4ec61bf180c70c60960a3af03e5d4`):**
-  - `config.LoadConfig` enforces native TLS (`DEVORBIT_TLS_CERT_FILE`/`DEVORBIT_TLS_KEY_FILE`) or `DEVORBIT_TRUSTED_PROXIES` with loopback-only `BindAddr` in production.
-  - `authorizeHostAdmin` and `HandleConfirmPairing` reject non-confidential transport (`403`) in production; untrusted `X-Forwarded-Proto: https` headers are ignored.
-  - `BuildStartupPairingQRPayload` enforces production TLS/proxy rules and emits HTTPS `DEVORBIT_ADVERTISED_URL`.
-  - Pairing confirmation uses `v1.1` per-attempt `(timestamp, nonce)` HMAC proof (`ConfirmPairing`), consumes nonces only after proof verification, and closes the retry cache upon session activation (`MarkSessionUsed`) or revocation.
-  - Direct E2E HTTP (`POST /api/v1/e2e` and Flutter `DirectE2EHttpTransport`) authenticates outer requests with HKDF-derived `HTTPAuthKey` HMAC-SHA256 headers and rejects raw `Authorization: Bearer` headers.
+- **Session Store & Broker Client OS-Backed Secret Persistence (`session_store.go`, `secret_store*.go`, `broker_client.go`, `handlers.go`):**
+  - Plaintext `session_secret` eliminated from `host_http_sessions.json` and `host_sessions.json` (version 2 schema with `secret_ref`).
+  - Uses Windows DPAPI (`CryptProtectData`/`CryptUnprotectData` bound with per-session `OptionalEntropy`) on Windows and `secret-tool` (D-Bus Secret Service) on Linux when unlocked/available.
+  - When OS secret store is unavailable (`ErrSecureStoreUnavailable`), fails closed to memory-only sessions (requires re-pairing on restart) while keeping atomic non-secret revocation tombstone persistence (`revoked_sessions`, `revoked_devices`). Never falls back to plaintext.
+  - Explicit empty permission maps (`{}`) serialize cleanly (`omitempty` removed) and restore with zero privileges; missing/nil `permissions` or legacy v1 plaintext arrays are rejected fail-closed (`ErrCorruptPersistedState`).
+  - Atomic writes (`CreateTemp` -> `Chmod(0600)` -> `Sync` -> `Close` -> `os.Rename`) and error propagation across `EnablePersistence`, `LoadPersistedSessions`, `RegisterSession`, `RevokeSession`, `RevokeDevice`, `RemoveSession`, and HTTP `HandleRevokeSession` (`500` on persistence failure while revoking in-memory immediately).
+- **Mobile Pairing HTTPS Downgrade Prevention (`pairing_client.dart`):**
+  - `localhost` / `10.0.2.2` fallback URIs are generated only when `confirmUri.scheme == 'http'`. HTTPS URLs never attempt insecure HTTP fallback on `SocketException`, TLS/certificate failure, or timeout.
+- **Trusted Proxy & Cross-Platform Host Bridge Build (`auth_middleware.go`, `console_windows.go`, `console_other.go`):**
+  - `isTransportConfidential` requires an unambiguous single `X-Forwarded-Proto: https` header from a configured trusted proxy.
+  - Separated Windows `kernel32.dll` UTF-8 console helper into `console_windows.go` so `cmd/host-bridge` builds cleanly for both `linux/amd64` and `windows/amd64`.
 
-## 3. Verified Build & Test Status (at `7ba545da10f4ec61bf180c70c60960a3af03e5d4`)
+## 3. Verified Build & Test Status (After Final Code Edits)
 
-- `agents/host-bridge`: `go vet ./...` and `go test -count=1 -timeout=120s ./...` — **PASS** (all packages).
-- `services/connection-broker`: `go vet ./...` and `go test -count=1 ./...` — **PASS**.
-- `services/control-plane`: `go vet ./...` and `go test -count=1 ./...` — **PASS**.
-- `agents/ai-router`: `go vet ./...` and `go test -count=1 ./...` — **PASS**.
-- `agents/acp-adapter`: `go vet ./...` and `go test -count=1 ./...` — **PASS**.
-- `apps/mobile`: `flutter analyze` (No issues found) and `flutter test` (32 tests passed) — **PASS**.
-
-## 4. Outstanding Risks & Unverified Items
-
-- Independent post-implementation security review of Master Plan 24 (`7ba545da10f4ec61bf180c70c60960a3af03e5d4`) and live TLS reverse-proxy + physical Android/iOS validation remain pending.
-- Unresolved session-store persistence / empty-permission restoration risks (`agents/host-bridge/internal/security/session_store.go`) and pairing fallback URL scheme behavior (`apps/mobile/lib/core/pairing/pairing_client.dart`) are tracked in `engineering/KNOWN_ISSUES.md`.
+- `agents/host-bridge`: `go vet ./...` and `go test -count=1 -timeout=120s ./...` — **PASS** (all 12 test packages).
+- `services/connection-broker`: `go vet ./...` and `go test -count=1 -timeout=120s ./...` — **PASS**.
+- `services/control-plane`: `go vet ./...` and `go test -count=1 -timeout=120s ./...` — **PASS**.
+- `agents/ai-router`: `go vet ./...` and `go test -count=1 -timeout=120s ./...` — **PASS**.
+- `agents/acp-adapter`: `go vet ./...` and `go test -count=1 -timeout=120s ./...` — **PASS**.
+- Cross-compile (`linux/amd64` and `windows/amd64` `go build ./...` in all 5 Go modules) — **PASS**.
+- `agents/host-bridge/internal/security` `go test -race`: **BLOCKED on Windows host** (`# runtime/cgo: cc1.exe: sorry, unimplemented: 64-bit mode not compiled in`).
+- `apps/mobile`: `flutter analyze` (`No issues found`) and `flutter test` (37 tests passed) — **PASS**.

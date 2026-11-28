@@ -363,3 +363,31 @@ func TestE2ESession_ConcurrentEncryptAndDestroy(t *testing.T) {
 		t.Errorf("Expected ErrExpiredSessionKey after concurrent destroy, got: %v", err)
 	}
 }
+
+func TestE2ESession_CrossLanguageHTTPAuthKeyAndMAC(t *testing.T) {
+	const masterSecret = "devorbit-shared-test-secret-32b!"
+	const sessionID = "sess-interop-v1"
+	const deviceID = "dev-interop-phone-01"
+	const method = "POST"
+	const requestURI = "/api/v1/e2e"
+	const timestamp = "1700000000123456"
+	const nonce = "nonce-interop-0001"
+	const bodySHA256Hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+	const expectedHTTPAuthKeyHex = "0a41360b559c8c0122c04cf156b43903209c1b0c1bd8ac9e61f7501e5b071a90"
+	const expectedRequestMACHex = "7a1627cea91b8abcb68da5ffef7ff1afa9017527a6da2f870abcb92c70459d37"
+
+	authKey, err := DeriveHTTPRequestAuthKey(masterSecret, sessionID, deviceID)
+	if err != nil {
+		t.Fatalf("DeriveHTTPRequestAuthKey failed: %v", err)
+	}
+	actualKeyHex := hex.EncodeToString(authKey)
+	actualMACHex := ComputeHTTPRequestMAC(authKey, method, requestURI, sessionID, deviceID, timestamp, nonce, bodySHA256Hex)
+
+	if actualKeyHex != expectedHTTPAuthKeyHex {
+		t.Fatalf("HTTPAuthKey mismatch: got %s, want %s", actualKeyHex, expectedHTTPAuthKeyHex)
+	}
+	if actualMACHex != expectedRequestMACHex {
+		t.Fatalf("HTTPRequestMAC mismatch: got %s, want %s", actualMACHex, expectedRequestMACHex)
+	}
+}

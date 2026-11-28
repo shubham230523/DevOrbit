@@ -36,3 +36,13 @@ Decisions recorded here must not be reversed without explicit justification, sec
 
 - **Decision:** Official agent integrations (e.g., ACP via `agents/acp-adapter`) remain the primary AI integration path, with direct provider APIs (`agents/ai-router`, e.g., Gemini API) as additional options.
 - **Reasoning:** Preserves provider authentication semantics, tool compatibility, and entitlement boundaries.
+
+## 8. OS-Backed Session Secret Storage & Fail-Closed Persistence (Master Plan 24 Closure)
+
+- **Decision:** Replace plaintext `session_secret` JSON persistence in both `SessionStore` and `BrokerClient` with an OS-backed `SecretStore` (Windows DPAPI `CryptProtectData`/`CryptUnprotectData` bound with per-session entropy; Linux Secret Service via `secret-tool` over D-Bus) using atomic file replacement (`CreateTemp` + `Sync` + `Rename`), durable `revoked_sessions`/`revoked_devices` tombstones, version-2 schema (`permissions` without `omitempty`), and fail-closed rejection of legacy plaintext arrays (`[...]` or missing `permissions`). When an OS secret store is unavailable (e.g., headless Linux), sessions operate in memory-only mode requiring re-pairing after restart, while revocation tombstones continue to persist atomically.
+- **Reasoning:** Eliminates plaintext session secrets on disk, prevents empty-permission escalation across restarts, prevents revoked session resurrection, and never falls back to insecure plaintext or adjacent key files.
+
+## 9. No Insecure Fallback for HTTPS Pairing (Master Plan 24 Closure)
+
+- **Decision:** `PairingClient.confirmPairing` restricts localhost/`10.0.2.2` fallback attempts exclusively to `http://` URLs in development mode; `https://` URLs never fall back to HTTP on `SocketException`, TLS errors, or timeouts.
+- **Reasoning:** Prevents HTTPS downgrade attacks or certificate-bypassed connections during transient network failures.

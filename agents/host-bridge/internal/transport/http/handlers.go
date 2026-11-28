@@ -237,10 +237,16 @@ func (s *Server) HandleRevokeSession(w http.ResponseWriter, r *http.Request) {
 
 	store := s.ensureSessionStore()
 	if req.SessionID != "" {
-		store.RevokeSession(req.SessionID)
+		if _, err := store.RevokeSession(req.SessionID); err != nil {
+			writeError(w, http.StatusInternalServerError, "session revoked in memory but failed persisting durable revocation: "+err.Error())
+			return
+		}
 	}
 	if req.DeviceID != "" {
-		store.RevokeDevice(req.DeviceID)
+		if _, err := store.RevokeDevice(req.DeviceID); err != nil {
+			writeError(w, http.StatusInternalServerError, "device revoked in memory but failed persisting durable revocation: "+err.Error())
+			return
+		}
 	}
 	if s.sessionRevoker != nil {
 		s.sessionRevoker(req.SessionID, req.DeviceID)

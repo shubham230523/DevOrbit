@@ -381,3 +381,58 @@ func TestPairingTransport_ConfirmRequiresConfidentialTransportAndEnforcesAntiRep
 		t.Fatalf("expected BuildStartupPairingQRPayload to fail in production without native TLS or trusted proxies")
 	}
 }
+
+type failingDeleteSecretStore struct{}
+
+func (f *failingDeleteSecretStore) Name() string    { return "failing-delete-store" }
+func (f *failingDeleteSecretStore) Available() bool { return true }
+func (f *failingDeleteSecretStore) Store(scope, id string, secret []byte) (string, error) {
+	return "ref:" + scope + ":" + id, nil
+}
+func (f *failingDeleteSecretStore) Load(scope, id, ref string) ([]byte, error) {
+	return nil, security.ErrSecretNotFound
+}
+func (f *failingDeleteSecretStore) Delete(scope, id, ref string) error {
+	return os.ErrPermission
+}
+
+func TestPairingTransport_MultiValuedForwardedProtoAndRevokePersistenceFailure(t *testing.T) {
+	srv, _, mux, tlsSrv, _, hostSecret := newProdPairingSecEnv(t)
+
+	// 1. Multi-valued X-Forwarded-Proto from trusted proxy must be rejected (403)
+	recMulti := httptest.NewRecorder()
+	reqMulti := httptest.NewRequest(http.MethodPost, "/api/v1/pairing/challenge", strings.NewReader(`{}`))
+	reqMulti.RemoteAddr = "10.10.0.50:443" // Trusted proxy IP
+	reqMulti.Header.Add("X-Forwarded-Proto", "http")
+	reqMulti.Header.Add("X-Forwarded-Proto", "https")
+	reqMulti.Header.Set("Authorization", "Bearer "+hostSecret)
+	mux.ServeHTTP(recMulti, reqMulti)
+	if recMulti.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for ambiguous multi-valued X-Forwarded-Proto header, got %d", recMulti.Code)
+	}
+
+	// 2. If SessionStore persistence fails during /api/v1/sessions/revoke, HTTP handler must NOT return 200 OK,
+	//    while still revoking the session in memory immediately.
+	store := srv.SessionStore()
+	store.SetSecretStore(&failingDeleteSecretStore{})
+	if err := store.EnablePersistence(t.TempDir() + "/sessions.json"); err != nil {
+		t.Fatalf("EnablePersistence failed: %v", err)
+	}
+	if _, err := store.RegisterSession("sess-rev-err", "dev-rev-err", "tok-rev-err-32bytes!", "sec-rev-err-32bytes-master-01!!", time.Now().UTC().Add(time.Hour), security.NewFullSessionPermissions()); err != nil {
+		t.Fatalf("RegisterSession failed: %v", err)
+	}
+
+	reqRev, _ := http.NewRequest(http.MethodPost, tlsSrv.URL+"/api/v1/sessions/revoke", strings.NewReader(`{"session_id":"sess-rev-err"}`))
+	reqRev.Header.Set("Authorization", "Bearer "+hostSecret)
+	respRev, err := tlsSrv.Client().Do(reqRev)
+	if err != nil {
+		t.Fatalf("Do revoke failed: %v", err)
+	}
+	respRev.Body.Close()
+	if respRev.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected HTTP 500 when revocation durability persistence fails, got %d", respRev.StatusCode)
+	}
+	if _, activeErr := store.GetActiveSession("sess-rev-err", "dev-rev-err"); activeErr != security.ErrSessionRevoked {
+		t.Fatalf("expected session to still be revoked immediately in memory despite persistence failure, got: %v", activeErr)
+	}
+}

@@ -1,6 +1,7 @@
 package security
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
@@ -23,12 +24,15 @@ var (
 	ErrReplayDetected         = errors.New("replayed or stale request rejected")
 	ErrInvalidTimestamp       = errors.New("invalid or out-of-window request timestamp")
 	ErrMissingBinding         = errors.New("session_id and device_id headers are required")
+	ErrPersistenceFailed      = errors.New("session persistence failed")
+	ErrCorruptPersistedState  = errors.New("corrupt or incompatible persisted session state")
 )
 
 const (
-	MaxClockSkewPast   = 5 * time.Minute
-	MaxClockSkewFuture = 1 * time.Minute
-	NonceRetentionTTL  = 10 * time.Minute
+	MaxClockSkewPast      = 5 * time.Minute
+	MaxClockSkewFuture    = 1 * time.Minute
+	NonceRetentionTTL     = 10 * time.Minute
+	persistedStoreVersion = 2
 )
 
 // SessionRecord holds the server-authoritative identity, credentials, permissions,
@@ -38,6 +42,7 @@ type SessionRecord struct {
 	DeviceID      string
 	TokenHash     string
 	MasterSecret  string
+	SecretRef     string
 	ExpiresAt     time.Time
 	Revoked       bool
 	RevokedAt     time.Time
@@ -76,6 +81,7 @@ func (r *SessionRecord) destroyKeysLocked() {
 		r.HTTPAuthKey[i] = 0
 	}
 	r.MasterSecret = ""
+	r.SecretRef = ""
 	r.mu.Lock()
 	r.seenNonces = make(map[string]time.Time)
 	r.mu.Unlock()
@@ -112,14 +118,22 @@ func (r *SessionRecord) VerifyAndConsumeNonce(nonce string, ts time.Time, now ti
 }
 
 // PersistedSessionEntry is the on-disk representation of an active session.
-// Raw bearer tokens are never persisted; only the SHA-256 hash is stored.
+// Plaintext bearer tokens and plaintext session_secret values are NEVER persisted.
+// Permissions intentionally omits `omitempty` so empty permission maps persist as `{}` rather than missing/nil.
 type PersistedSessionEntry struct {
-	SessionID    string                    `json:"session_id"`
-	DeviceID     string                    `json:"device_id"`
-	TokenHash    string                    `json:"token_hash"`
-	MasterSecret string                    `json:"session_secret"`
-	ExpiresAt    time.Time                 `json:"expires_at"`
-	Permissions  map[ActionPermission]bool `json:"permissions,omitempty"`
+	SessionID   string                    `json:"session_id"`
+	DeviceID    string                    `json:"device_id"`
+	TokenHash   string                    `json:"token_hash"`
+	SecretRef   string                    `json:"secret_ref,omitempty"`
+	Permissions map[ActionPermission]bool `json:"permissions"`
+	ExpiresAt   time.Time                 `json:"expires_at"`
+}
+
+type persistedSessionStoreFile struct {
+	Version         int                     `json:"version"`
+	Sessions        []PersistedSessionEntry `json:"sessions"`
+	RevokedSessions map[string]time.Time    `json:"revoked_sessions,omitempty"`
+	RevokedDevices  map[string]time.Time    `json:"revoked_devices,omitempty"`
 }
 
 // SessionStore manages active, expired, and revoked sessions across direct HTTP
@@ -128,17 +142,32 @@ type SessionStore struct {
 	mu               sync.RWMutex
 	sessions         map[string]*SessionRecord
 	deviceSessions   map[string]map[string]bool
-	revokedDevices   map[string]bool
+	revokedSessions  map[string]time.Time
+	revokedDevices   map[string]time.Time
 	storePath        string
+	secretStore      SecretStore
+	persistSecrets   bool
 	onSessionUsed    func(sessionID string)
 	onSessionRevoked func(sessionID, deviceID string)
 }
 
 func NewSessionStore() *SessionStore {
 	return &SessionStore{
-		sessions:       make(map[string]*SessionRecord),
-		deviceSessions: make(map[string]map[string]bool),
-		revokedDevices: make(map[string]bool),
+		sessions:        make(map[string]*SessionRecord),
+		deviceSessions:  make(map[string]map[string]bool),
+		revokedSessions: make(map[string]time.Time),
+		revokedDevices:  make(map[string]time.Time),
+		secretStore:     NewDefaultSecretStore(),
+	}
+}
+
+// SetSecretStore overrides the OS-backed secret store used for session persistence (primarily for testing).
+func (s *SessionStore) SetSecretStore(ss SecretStore) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.secretStore = ss
+	if s.storePath != "" {
+		s.persistSecrets = ss != nil && ss.Available()
 	}
 }
 
@@ -147,92 +176,268 @@ func HashSessionToken(token string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func (s *SessionStore) EnablePersistence(customPath string) {
+// WriteFileAtomic safely writes data to path using a same-directory temp file, fsync, 0600 permissions, and atomic rename.
+func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
+}
+
+// EnablePersistence configures durable atomic state storage at customPath (or ~/.devorbit/host_http_sessions.json).
+// If no OS-backed confidential secret store is available, it enables tombstone-only persistence and returns
+// ErrSecureStoreUnavailable so callers know recoverable session secrets will NOT be written to disk.
+func (s *SessionStore) EnablePersistence(customPath string) error {
+	path := customPath
+	if path == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			home = "."
+		}
+		path = filepath.Join(home, ".devorbit", "host_http_sessions.json")
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return fmt.Errorf("%w: %w", ErrPersistenceFailed, err)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if customPath != "" {
-		s.storePath = customPath
-		return
+	s.storePath = path
+	if s.secretStore == nil || !s.secretStore.Available() {
+		s.persistSecrets = false
+		return ErrSecureStoreUnavailable
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		home = "."
-	}
-	dir := filepath.Join(home, ".devorbit")
-	_ = os.MkdirAll(dir, 0700)
-	s.storePath = filepath.Join(dir, "host_http_sessions.json")
+	s.persistSecrets = true
+	return nil
 }
 
-func (s *SessionStore) saveLocked() {
+func (s *SessionStore) saveLocked() error {
 	if s.storePath == "" {
-		return
+		return nil
 	}
 	now := time.Now().UTC()
-	var entries []PersistedSessionEntry
-	for _, rec := range s.sessions {
-		if rec.Revoked || now.After(rec.ExpiresAt) || rec.MasterSecret == "" || rec.TokenHash == "" {
-			continue
+	entries := make([]PersistedSessionEntry, 0)
+	if s.persistSecrets {
+		for _, rec := range s.sessions {
+			if rec.Revoked || now.After(rec.ExpiresAt) || rec.SecretRef == "" || rec.TokenHash == "" {
+				continue
+			}
+			if _, revSess := s.revokedSessions[rec.SessionID]; revSess {
+				continue
+			}
+			if _, revDev := s.revokedDevices[rec.DeviceID]; revDev {
+				continue
+			}
+			granted := make(map[ActionPermission]bool)
+			if rec.Permissions != nil && rec.Permissions.Granted != nil {
+				for k, v := range rec.Permissions.Granted {
+					granted[k] = v
+				}
+			}
+			entries = append(entries, PersistedSessionEntry{
+				SessionID:   rec.SessionID,
+				DeviceID:    rec.DeviceID,
+				TokenHash:   rec.TokenHash,
+				SecretRef:   rec.SecretRef,
+				Permissions: granted,
+				ExpiresAt:   rec.ExpiresAt,
+			})
 		}
-		var perms map[ActionPermission]bool
-		if rec.Permissions != nil {
-			perms = rec.Permissions.Granted
-		}
-		entries = append(entries, PersistedSessionEntry{
-			SessionID:    rec.SessionID,
-			DeviceID:     rec.DeviceID,
-			TokenHash:    rec.TokenHash,
-			MasterSecret: rec.MasterSecret,
-			ExpiresAt:    rec.ExpiresAt,
-			Permissions:  perms,
-		})
 	}
-	data, err := json.MarshalIndent(entries, "", "  ")
-	if err == nil {
-		_ = os.WriteFile(s.storePath, data, 0600)
+
+	revSessCopy := make(map[string]time.Time, len(s.revokedSessions))
+	for k, v := range s.revokedSessions {
+		revSessCopy[k] = v
 	}
+	revDevCopy := make(map[string]time.Time, len(s.revokedDevices))
+	for k, v := range s.revokedDevices {
+		revDevCopy[k] = v
+	}
+
+	payload := persistedSessionStoreFile{
+		Version:         persistedStoreVersion,
+		Sessions:        entries,
+		RevokedSessions: revSessCopy,
+		RevokedDevices:  revDevCopy,
+	}
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return fmt.Errorf("%w: marshal error: %w", ErrPersistenceFailed, err)
+	}
+	if err := WriteFileAtomic(s.storePath, data, 0600); err != nil {
+		return fmt.Errorf("%w: %w", ErrPersistenceFailed, err)
+	}
+	return nil
 }
 
-func (s *SessionStore) LoadPersistedSessions() {
+// LoadPersistedSessions loads durable revocation tombstones and sealed sessions from disk.
+// Fail-closed guarantees:
+// - Legacy plaintext files (pre-v2 array format or containing plaintext session_secret) are rejected without restoring sessions.
+// - Entries with nil/missing permissions are rejected (never elevated to full permissions).
+// - Entries matching revoked_sessions or revoked_devices are rejected.
+// - Corrupt or truncated JSON returns ErrCorruptPersistedState without partial restoration.
+func (s *SessionStore) LoadPersistedSessions() error {
 	s.mu.RLock()
 	p := s.storePath
+	ss := s.secretStore
 	s.mu.RUnlock()
+
 	if p == "" {
-		return
+		return nil
 	}
 	data, err := os.ReadFile(p)
 	if err != nil {
-		return
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("%w: %w", ErrPersistenceFailed, err)
 	}
-	var entries []PersistedSessionEntry
-	if err := json.Unmarshal(data, &entries); err != nil {
-		return
+
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return fmt.Errorf("%w: empty session store file", ErrCorruptPersistedState)
 	}
+	if trimmed[0] == '[' {
+		return fmt.Errorf("%w: legacy plaintext session file rejected; re-pairing required", ErrCorruptPersistedState)
+	}
+
+	var stored persistedSessionStoreFile
+	if err := json.Unmarshal(trimmed, &stored); err != nil {
+		return fmt.Errorf("%w: %w", ErrCorruptPersistedState, err)
+	}
+	if stored.Version != persistedStoreVersion {
+		return fmt.Errorf("%w: unsupported persisted version %d", ErrCorruptPersistedState, stored.Version)
+	}
+
+	s.mu.Lock()
+	for k, ts := range stored.RevokedSessions {
+		s.revokedSessions[k] = ts
+	}
+	for k, ts := range stored.RevokedDevices {
+		s.revokedDevices[k] = ts
+	}
+	s.mu.Unlock()
+
 	now := time.Now().UTC()
-	for _, e := range entries {
-		if e.SessionID == "" || e.DeviceID == "" || e.TokenHash == "" || e.MasterSecret == "" {
+	var loadErrs []error
+	for _, e := range stored.Sessions {
+		if e.SessionID == "" || e.DeviceID == "" || e.TokenHash == "" || e.SecretRef == "" {
+			loadErrs = append(loadErrs, fmt.Errorf("%w: incomplete session entry %q", ErrCorruptPersistedState, e.SessionID))
 			continue
 		}
 		if now.After(e.ExpiresAt) {
 			continue
 		}
-		perms := NewFullSessionPermissions()
-		if len(e.Permissions) > 0 {
-			perms = &SessionPermissions{Granted: e.Permissions}
+
+		s.mu.RLock()
+		_, isRevSess := s.revokedSessions[e.SessionID]
+		_, isRevDev := s.revokedDevices[e.DeviceID]
+		s.mu.RUnlock()
+		if isRevSess || isRevDev {
+			continue
 		}
-		_, _ = s.registerSessionInternal(e.SessionID, e.DeviceID, e.TokenHash, e.MasterSecret, e.ExpiresAt, perms)
+
+		// Fail closed: missing/nil permissions must NEVER default to full permissions.
+		if e.Permissions == nil {
+			loadErrs = append(loadErrs, fmt.Errorf("%w: entry %q missing permissions map", ErrCorruptPersistedState, e.SessionID))
+			continue
+		}
+
+		if ss == nil || !ss.Available() {
+			loadErrs = append(loadErrs, fmt.Errorf("%w: cannot unseal persisted session %q", ErrSecureStoreUnavailable, e.SessionID))
+			continue
+		}
+		secretBytes, err := ss.Load("http_session", e.SessionID, e.SecretRef)
+		if err != nil || len(secretBytes) == 0 {
+			loadErrs = append(loadErrs, fmt.Errorf("%w: failed loading secret for %q: %v", ErrCorruptPersistedState, e.SessionID, err))
+			continue
+		}
+		masterSecret := string(secretBytes)
+		zeroBytesSlice(secretBytes)
+
+		grantedCopy := make(map[ActionPermission]bool, len(e.Permissions))
+		for k, v := range e.Permissions {
+			grantedCopy[k] = v
+		}
+		perms := &SessionPermissions{Granted: grantedCopy}
+
+		if _, err := s.registerSessionInternal(e.SessionID, e.DeviceID, e.TokenHash, masterSecret, e.SecretRef, e.ExpiresAt, perms, false); err != nil {
+			loadErrs = append(loadErrs, err)
+		}
+	}
+
+	return errors.Join(loadErrs...)
+}
+
+func zeroBytesSlice(b []byte) {
+	for i := range b {
+		b[i] = 0
 	}
 }
 
+func clonePermissionsOrDefault(perms *SessionPermissions) *SessionPermissions {
+	if perms == nil {
+		return NewFullSessionPermissions()
+	}
+	granted := make(map[ActionPermission]bool, len(perms.Granted))
+	for k, v := range perms.Granted {
+		granted[k] = v
+	}
+	return &SessionPermissions{Granted: granted}
+}
+
 // RegisterSession provisions a new authenticated session with full validation and E2E key derivation.
+// Passing nil perms intentionally defaults to NewFullSessionPermissions for new sessions; passing an
+// explicitly empty SessionPermissions preserves zero privileges across both memory and persistence restarts.
+// If persistence is enabled and fails, the session remains usable in memory while the persistence error is returned.
 func (s *SessionStore) RegisterSession(sessionID, deviceID, sessionToken, masterSecret string, expiresAt time.Time, perms *SessionPermissions) (*SessionRecord, error) {
 	if sessionID == "" || deviceID == "" || sessionToken == "" || masterSecret == "" {
 		return nil, errors.New("session_id, device_id, session_token, and master_secret are required")
 	}
 	tokenHash := HashSessionToken(sessionToken)
-	return s.registerSessionInternal(sessionID, deviceID, tokenHash, masterSecret, expiresAt, perms)
+	resolvedPerms := clonePermissionsOrDefault(perms)
+	return s.registerSessionInternal(sessionID, deviceID, tokenHash, masterSecret, "", expiresAt, resolvedPerms, true)
 }
 
-func (s *SessionStore) registerSessionInternal(sessionID, deviceID, tokenHash, masterSecret string, expiresAt time.Time, perms *SessionPermissions) (*SessionRecord, error) {
+func (s *SessionStore) registerSessionInternal(
+	sessionID, deviceID, tokenHash, masterSecret, existingSecretRef string,
+	expiresAt time.Time,
+	perms *SessionPermissions,
+	persistNow bool,
+) (*SessionRecord, error) {
 	expUTC := expiresAt.UTC()
 	ttl := time.Until(expUTC)
 	if ttl <= 0 {
@@ -240,6 +445,8 @@ func (s *SessionStore) registerSessionInternal(sessionID, deviceID, tokenHash, m
 	}
 	if perms == nil {
 		perms = NewFullSessionPermissions()
+	} else if perms.Granted == nil {
+		perms = NewScopedSessionPermissions()
 	}
 
 	httpE2E, err := NewChannelE2ESession(ChannelDirectHTTP, sessionID, deviceID, masterSecret, ttl)
@@ -261,7 +468,12 @@ func (s *SessionStore) registerSessionInternal(sessionID, deviceID, tokenHash, m
 		return existing, nil
 	}
 
-	// Re-pairing a previously revoked device issues a new active session and clears device revocation.
+	// Never allow re-registering an explicitly revoked sessionID.
+	if _, revokedSess := s.revokedSessions[sessionID]; revokedSess {
+		return nil, ErrSessionRevoked
+	}
+
+	// Re-pairing a previously revoked device issues a new sessionID and clears device revocation.
 	delete(s.revokedDevices, deviceID)
 
 	rec := &SessionRecord{
@@ -269,6 +481,7 @@ func (s *SessionStore) registerSessionInternal(sessionID, deviceID, tokenHash, m
 		DeviceID:      deviceID,
 		TokenHash:     tokenHash,
 		MasterSecret:  masterSecret,
+		SecretRef:     existingSecretRef,
 		ExpiresAt:     expUTC,
 		Permissions:   perms,
 		DirectHTTPE2E: httpE2E,
@@ -281,7 +494,34 @@ func (s *SessionStore) registerSessionInternal(sessionID, deviceID, tokenHash, m
 		s.deviceSessions[deviceID] = make(map[string]bool)
 	}
 	s.deviceSessions[deviceID][sessionID] = true
-	s.saveLocked()
+
+	if !persistNow || s.storePath == "" {
+		return rec, nil
+	}
+
+	var storedNewSecret bool
+	if s.persistSecrets {
+		if s.secretStore == nil || !s.secretStore.Available() {
+			// Secure store was previously available or injected as unavailable after EnablePersistence.
+			// Never fall back to plaintext; keep in-memory session active and expose error to caller.
+			_ = s.saveLocked()
+			return rec, fmt.Errorf("%w: %w", ErrPersistenceFailed, ErrSecureStoreUnavailable)
+		}
+		ref, err := s.secretStore.Store("http_session", sessionID, []byte(masterSecret))
+		if err != nil {
+			return rec, fmt.Errorf("%w: %w", ErrPersistenceFailed, err)
+		}
+		rec.SecretRef = ref
+		storedNewSecret = true
+	}
+
+	if err := s.saveLocked(); err != nil {
+		if storedNewSecret && s.secretStore != nil {
+			_ = s.secretStore.Delete("http_session", sessionID, rec.SecretRef)
+			rec.SecretRef = ""
+		}
+		return rec, err
+	}
 	return rec, nil
 }
 
@@ -308,12 +548,20 @@ func (s *SessionStore) AuthenticateBearer(token, claimedSessionID, claimedDevice
 		}
 	}
 	if matched == nil {
+		if _, revSess := s.revokedSessions[claimedSessionID]; revSess {
+			return nil, ErrSessionRevoked
+		}
+		if _, revDev := s.revokedDevices[claimedDeviceID]; revDev {
+			return nil, ErrSessionRevoked
+		}
 		return nil, ErrSessionNotFound
 	}
 	if matched.SessionID != claimedSessionID || matched.DeviceID != claimedDeviceID {
 		return nil, ErrSessionBindingMismatch
 	}
-	if matched.Revoked || s.revokedDevices[matched.DeviceID] {
+	_, revSess := s.revokedSessions[matched.SessionID]
+	_, revDev := s.revokedDevices[matched.DeviceID]
+	if matched.Revoked || revSess || revDev {
 		return nil, ErrSessionRevoked
 	}
 	if matched.IsExpired() {
@@ -371,6 +619,13 @@ func (s *SessionStore) GetActiveSession(sessionID, deviceID string) (*SessionRec
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	if _, revSess := s.revokedSessions[sessionID]; revSess {
+		return nil, ErrSessionRevoked
+	}
+	if _, revDev := s.revokedDevices[deviceID]; revDev {
+		return nil, ErrSessionRevoked
+	}
+
 	rec, ok := s.sessions[sessionID]
 	if !ok {
 		return nil, ErrSessionNotFound
@@ -378,7 +633,7 @@ func (s *SessionStore) GetActiveSession(sessionID, deviceID string) (*SessionRec
 	if rec.DeviceID != deviceID {
 		return nil, ErrSessionBindingMismatch
 	}
-	if rec.Revoked || s.revokedDevices[rec.DeviceID] {
+	if rec.Revoked {
 		return nil, ErrSessionRevoked
 	}
 	if rec.IsExpired() {
@@ -387,52 +642,100 @@ func (s *SessionStore) GetActiveSession(sessionID, deviceID string) (*SessionRec
 	return rec, nil
 }
 
-// RevokeSession permanently revokes a session, destroys its keys, and updates persistence.
-func (s *SessionStore) RevokeSession(sessionID string) bool {
+// RevokeSession permanently revokes a session, destroys its keys, deletes any stored secret,
+// and persists the revocation tombstone. In-memory revocation always takes effect even if persistence fails;
+// any persistence error is returned to the caller so callers never silently assume durable revocation.
+func (s *SessionStore) RevokeSession(sessionID string) (bool, error) {
+	if sessionID == "" {
+		return false, nil
+	}
+	now := time.Now().UTC()
+
 	s.mu.Lock()
 	rec, ok := s.sessions[sessionID]
 	if !ok {
 		s.mu.Unlock()
-		return false
+		return false, nil
 	}
-	rec.Revoked = true
-	rec.RevokedAt = time.Now().UTC()
-	rec.destroyKeysLocked()
-	s.saveLocked()
-	cb := s.onSessionRevoked
+	oldRef := rec.SecretRef
 	devID := rec.DeviceID
+	rec.Revoked = true
+	rec.RevokedAt = now
+	rec.destroyKeysLocked()
+	s.revokedSessions[sessionID] = now
+	cb := s.onSessionRevoked
+	ss := s.secretStore
+	persistSecrets := s.persistSecrets
+	hasStorePath := s.storePath != ""
+
+	var errs []error
+	if hasStorePath && persistSecrets && ss != nil && oldRef != "" {
+		if err := ss.Delete("http_session", sessionID, oldRef); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := s.saveLocked(); err != nil {
+		errs = append(errs, err)
+	}
 	s.mu.Unlock()
 
 	if cb != nil {
 		cb(sessionID, devID)
 	}
-	return true
+	if len(errs) > 0 {
+		return true, fmt.Errorf("%w: %w", ErrPersistenceFailed, errors.Join(errs...))
+	}
+	return true, nil
 }
 
-// RevokeDevice permanently revokes all sessions belonging to deviceID and updates persistence.
-func (s *SessionStore) RevokeDevice(deviceID string) int {
+// RevokeDevice permanently revokes all sessions belonging to deviceID, deletes stored secrets,
+// and persists the device/session revocation tombstones.
+func (s *SessionStore) RevokeDevice(deviceID string) (int, error) {
 	if deviceID == "" {
-		return 0
+		return 0, nil
 	}
+	now := time.Now().UTC()
+
 	s.mu.Lock()
-	s.revokedDevices[deviceID] = true
+	s.revokedDevices[deviceID] = now
 	count := 0
 	var revokedIDs []string
+	oldRefs := make(map[string]string)
+
 	if sessIDs, ok := s.deviceSessions[deviceID]; ok {
 		for sessID := range sessIDs {
 			revokedIDs = append(revokedIDs, sessID)
+			s.revokedSessions[sessID] = now
 			if rec, exists := s.sessions[sessID]; exists {
 				if !rec.Revoked {
 					count++
 				}
+				if rec.SecretRef != "" {
+					oldRefs[sessID] = rec.SecretRef
+				}
 				rec.Revoked = true
-				rec.RevokedAt = time.Now().UTC()
+				rec.RevokedAt = now
 				rec.destroyKeysLocked()
 			}
 		}
 	}
-	s.saveLocked()
+
 	cb := s.onSessionRevoked
+	ss := s.secretStore
+	persistSecrets := s.persistSecrets
+	hasStorePath := s.storePath != ""
+
+	var errs []error
+	if hasStorePath && persistSecrets && ss != nil {
+		for sessID, ref := range oldRefs {
+			if err := ss.Delete("http_session", sessID, ref); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	if err := s.saveLocked(); err != nil {
+		errs = append(errs, err)
+	}
 	s.mu.Unlock()
 
 	if cb != nil {
@@ -440,24 +743,43 @@ func (s *SessionStore) RevokeDevice(deviceID string) int {
 			cb(sid, deviceID)
 		}
 	}
-	return count
+	if len(errs) > 0 {
+		return count, fmt.Errorf("%w: %w", ErrPersistenceFailed, errors.Join(errs...))
+	}
+	return count, nil
 }
 
 // RemoveSession deletes a session (used for rollback when downstream provisioning fails).
-func (s *SessionStore) RemoveSession(sessionID string) {
+func (s *SessionStore) RemoveSession(sessionID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if rec, ok := s.sessions[sessionID]; ok {
-		rec.destroyKeysLocked()
-		if m, exists := s.deviceSessions[rec.DeviceID]; exists {
-			delete(m, sessionID)
-			if len(m) == 0 {
-				delete(s.deviceSessions, rec.DeviceID)
-			}
-		}
-		delete(s.sessions, sessionID)
-		s.saveLocked()
+	rec, ok := s.sessions[sessionID]
+	if !ok {
+		return nil
 	}
+	oldRef := rec.SecretRef
+	rec.destroyKeysLocked()
+	if m, exists := s.deviceSessions[rec.DeviceID]; exists {
+		delete(m, sessionID)
+		if len(m) == 0 {
+			delete(s.deviceSessions, rec.DeviceID)
+		}
+	}
+	delete(s.sessions, sessionID)
+
+	var errs []error
+	if s.storePath != "" && s.persistSecrets && s.secretStore != nil && oldRef != "" {
+		if err := s.secretStore.Delete("http_session", sessionID, oldRef); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := s.saveLocked(); err != nil {
+		errs = append(errs, err)
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("%w: %w", ErrPersistenceFailed, errors.Join(errs...))
+	}
+	return nil
 }
 
 // ParseTimestamp converts integer timestamps (seconds, milliseconds, microseconds, or nanoseconds)

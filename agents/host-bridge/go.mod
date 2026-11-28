@@ -5,6 +5,7 @@ go 1.26.0
 require (
 	github.com/fsnotify/fsnotify v1.8.0
 	github.com/gorilla/websocket v1.5.3
+	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	golang.org/x/crypto v0.59.0
 )
 
@@ -16,7 +17,6 @@ require (
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/s2a-go v0.1.8 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.4 // indirect
-	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e // indirect
 	go.opencensus.io v0.24.0 // indirect
 	golang.org/x/net v0.62.0 // indirect
 	golang.org/x/text v0.44.0 // indirect
@@ -29,7 +29,7 @@ require (
 require (
 	devorbit.net/agents/ai-router v0.0.0
 	devorbit.net/services/connection-broker v0.0.0-00010101000000-000000000000
-	golang.org/x/sys v0.50.0 // indirect
+	golang.org/x/sys v0.50.0
 )
 
 replace devorbit.net/services/connection-broker => ../../services/connection-broker

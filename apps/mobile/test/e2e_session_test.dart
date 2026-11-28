@@ -152,4 +152,32 @@ void main() {
       throwsA(anything),
     );
   });
+
+  test('FlutterE2ESession deriveHttpAuthKey and computeHttpRequestMac match Go vectors exactly', () async {
+    const masterSecret = 'devorbit-shared-test-secret-32b!';
+    const sessionId = 'sess-interop-v1';
+    const deviceId = 'dev-interop-phone-01';
+    const expectedAuthKeyHex = '0a41360b559c8c0122c04cf156b43903209c1b0c1bd8ac9e61f7501e5b071a90';
+    const expectedMacHex = '7a1627cea91b8abcb68da5ffef7ff1afa9017527a6da2f870abcb92c70459d37';
+
+    final authKey = await FlutterE2ESession.deriveHttpAuthKey(
+      sessionId: sessionId,
+      deviceId: deviceId,
+      masterSecret: masterSecret,
+    );
+    final actualAuthKeyHex = authKey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+    expect(actualAuthKeyHex, equals(expectedAuthKeyHex));
+
+    final actualMacHex = FlutterE2ESession.computeHttpRequestMac(
+      authKey: authKey,
+      method: 'POST',
+      requestUri: '/api/v1/e2e',
+      sessionId: sessionId,
+      deviceId: deviceId,
+      timestamp: '1700000000123456',
+      nonce: 'nonce-interop-0001',
+      bodySha256Hex: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+    );
+    expect(actualMacHex, equals(expectedMacHex));
+  });
 }

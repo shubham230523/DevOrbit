@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -51,45 +52,62 @@ type ApplicationResponseEnvelope struct {
 }
 
 type DeviceSession struct {
-	SessionID     string
-	DeviceID      string
-	MasterSecret  string
-	E2ESession    *security.E2ESession
-	ExpiresAt     time.Time
-	cancel        context.CancelFunc
-	mu            sync.Mutex
-	conn          *websocket.Conn
+	SessionID    string
+	DeviceID     string
+	MasterSecret string
+	SecretRef    string
+	E2ESession   *security.E2ESession
+	ExpiresAt    time.Time
+	cancel       context.CancelFunc
+	mu           sync.Mutex
+	conn         *websocket.Conn
 }
 
 type BrokerClient struct {
-	mu             sync.RWMutex
-	BrokerURL      string
-	MachineID      string
-	SessionID      string // Legacy/single session convenience
-	HostToken      string
-	Server         *httptransport.Server
-	E2ESession     *security.E2ESession
-	sessions       map[string]*DeviceSession          // Key: SessionID -> DeviceSession
-	deviceSessions map[string]map[string]bool         // Key: DeviceID -> set of SessionIDs
-	stopChan       chan struct{}
-	ctx            context.Context
-	cancel         context.CancelFunc
-	storePath      string
+	mu              sync.RWMutex
+	BrokerURL       string
+	MachineID       string
+	SessionID       string // Legacy/single session convenience
+	HostToken       string
+	Server          *httptransport.Server
+	E2ESession      *security.E2ESession
+	sessions        map[string]*DeviceSession  // Key: SessionID -> DeviceSession
+	deviceSessions  map[string]map[string]bool // Key: DeviceID -> set of SessionIDs
+	revokedSessions map[string]time.Time
+	revokedDevices  map[string]time.Time
+	stopChan        chan struct{}
+	ctx             context.Context
+	cancel          context.CancelFunc
+	storePath       string
+	secretStore     security.SecretStore
+	persistSecrets  bool
 }
 
 func NewBrokerClient(brokerURL, machineID, sessionID, hostToken string, server *httptransport.Server) *BrokerClient {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &BrokerClient{
-		BrokerURL:      brokerURL,
-		MachineID:      machineID,
-		SessionID:      sessionID,
-		HostToken:      hostToken,
-		Server:         server,
-		sessions:       make(map[string]*DeviceSession),
-		deviceSessions: make(map[string]map[string]bool),
-		stopChan:       make(chan struct{}),
-		ctx:            ctx,
-		cancel:         cancel,
+		BrokerURL:       brokerURL,
+		MachineID:       machineID,
+		SessionID:       sessionID,
+		HostToken:       hostToken,
+		Server:          server,
+		sessions:        make(map[string]*DeviceSession),
+		deviceSessions:  make(map[string]map[string]bool),
+		revokedSessions: make(map[string]time.Time),
+		revokedDevices:  make(map[string]time.Time),
+		stopChan:        make(chan struct{}),
+		ctx:             ctx,
+		cancel:          cancel,
+		secretStore:     security.NewDefaultSecretStore(),
+	}
+}
+
+func (bc *BrokerClient) SetSecretStore(ss security.SecretStore) {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+	bc.secretStore = ss
+	if bc.storePath != "" {
+		bc.persistSecrets = ss != nil && ss.Available()
 	}
 }
 
@@ -136,6 +154,10 @@ func (bc *BrokerClient) ActiveSessionCount() int {
 }
 
 func (bc *BrokerClient) ProvisionSession(sessionID, deviceID, sessionSecret string, expiryArg any) error {
+	return bc.provisionSessionInternal(sessionID, deviceID, sessionSecret, "", expiryArg, true)
+}
+
+func (bc *BrokerClient) provisionSessionInternal(sessionID, deviceID, sessionSecret, existingRef string, expiryArg any, persistNow bool) error {
 	if sessionID == "" || deviceID == "" || sessionSecret == "" {
 		return errors.New("provisioning failed: sessionID, deviceID, and sessionSecret are required")
 	}
@@ -164,6 +186,12 @@ func (bc *BrokerClient) ProvisionSession(sessionID, deviceID, sessionSecret stri
 	}
 
 	bc.mu.Lock()
+	if _, revokedSess := bc.revokedSessions[sessionID]; revokedSess {
+		bc.mu.Unlock()
+		return security.ErrSessionRevoked
+	}
+	delete(bc.revokedDevices, deviceID)
+
 	// Clean up existing session with the same sessionID if any
 	if existing, ok := bc.sessions[sessionID]; ok {
 		existing.cancel()
@@ -179,6 +207,7 @@ func (bc *BrokerClient) ProvisionSession(sessionID, deviceID, sessionSecret stri
 		SessionID:    sessionID,
 		DeviceID:     deviceID,
 		MasterSecret: sessionSecret,
+		SecretRef:    existingRef,
 		E2ESession:   e2eSess,
 		ExpiresAt:    expiry,
 		cancel:       sessCancel,
@@ -191,7 +220,33 @@ func (bc *BrokerClient) ProvisionSession(sessionID, deviceID, sessionSecret stri
 	bc.deviceSessions[deviceID][sessionID] = true
 	bc.SessionID = sessionID // Update primary session pointer
 	bc.E2ESession = e2eSess
-	bc.saveSessionsToDiskLocked()
+
+	var persistErr error
+	if persistNow && bc.storePath != "" {
+		storedNew := false
+		if bc.persistSecrets {
+			if bc.secretStore == nil || !bc.secretStore.Available() {
+				persistErr = fmt.Errorf("%w: %w", security.ErrPersistenceFailed, security.ErrSecureStoreUnavailable)
+			} else {
+				ref, storeErr := bc.secretStore.Store("broker_session", sessionID, []byte(sessionSecret))
+				if storeErr != nil {
+					persistErr = fmt.Errorf("%w: %w", security.ErrPersistenceFailed, storeErr)
+				} else {
+					ds.SecretRef = ref
+					storedNew = true
+				}
+			}
+		}
+		if persistErr == nil {
+			if saveErr := bc.saveSessionsToDiskLocked(); saveErr != nil {
+				if storedNew && bc.secretStore != nil {
+					_ = bc.secretStore.Delete("broker_session", sessionID, ds.SecretRef)
+					ds.SecretRef = ""
+				}
+				persistErr = saveErr
+			}
+		}
+	}
 	bc.mu.Unlock()
 
 	// Launch dedicated, concurrent session loop for this device session
@@ -199,98 +254,203 @@ func (bc *BrokerClient) ProvisionSession(sessionID, deviceID, sessionSecret stri
 
 	log.Printf("BrokerClient: Authenticated independent session provisioned for session=%s device=%s (total active: %d)",
 		sessionID, deviceID, bc.ActiveSessionCount())
-	return nil
+	return persistErr
 }
+
+const persistedBrokerStoreVersion = 2
 
 type StoredSession struct {
-	SessionID     string    `json:"session_id"`
-	DeviceID      string    `json:"device_id"`
-	SessionSecret string    `json:"session_secret"`
-	ExpiresAt     time.Time `json:"expires_at"`
+	SessionID string    `json:"session_id"`
+	DeviceID  string    `json:"device_id"`
+	SecretRef string    `json:"secret_ref,omitempty"`
+	ExpiresAt time.Time `json:"expires_at"`
 }
 
-func (bc *BrokerClient) EnableSessionPersistence(customPath string) {
-	bc.mu.Lock()
-	defer bc.mu.Unlock()
-	if customPath != "" {
-		bc.storePath = customPath
-	} else {
+type persistedBrokerStoreFile struct {
+	Version         int                  `json:"version"`
+	Sessions        []StoredSession      `json:"sessions"`
+	RevokedSessions map[string]time.Time `json:"revoked_sessions,omitempty"`
+	RevokedDevices  map[string]time.Time `json:"revoked_devices,omitempty"`
+}
+
+func (bc *BrokerClient) EnableSessionPersistence(customPath string) error {
+	path := customPath
+	if path == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
 			home = "."
 		}
-		dir := filepath.Join(home, ".devorbit")
-		_ = os.MkdirAll(dir, 0700)
-		bc.storePath = filepath.Join(dir, "host_sessions.json")
+		path = filepath.Join(home, ".devorbit", "host_sessions.json")
 	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return fmt.Errorf("%w: %w", security.ErrPersistenceFailed, err)
+	}
+
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+	bc.storePath = path
+	if bc.secretStore == nil || !bc.secretStore.Available() {
+		bc.persistSecrets = false
+		return security.ErrSecureStoreUnavailable
+	}
+	bc.persistSecrets = true
+	return nil
 }
 
-func (bc *BrokerClient) saveSessionsToDiskLocked() {
+func (bc *BrokerClient) saveSessionsToDiskLocked() error {
 	if bc.storePath == "" {
-		return
+		return nil
 	}
-	var list []StoredSession
-	for _, ds := range bc.sessions {
-		if ds.MasterSecret != "" && time.Now().UTC().Before(ds.ExpiresAt) {
+	now := time.Now().UTC()
+	list := make([]StoredSession, 0)
+	if bc.persistSecrets {
+		for _, ds := range bc.sessions {
+			if ds.SecretRef == "" || !now.Before(ds.ExpiresAt) {
+				continue
+			}
+			if _, revSess := bc.revokedSessions[ds.SessionID]; revSess {
+				continue
+			}
+			if _, revDev := bc.revokedDevices[ds.DeviceID]; revDev {
+				continue
+			}
 			list = append(list, StoredSession{
-				SessionID:     ds.SessionID,
-				DeviceID:      ds.DeviceID,
-				SessionSecret: ds.MasterSecret,
-				ExpiresAt:     ds.ExpiresAt,
+				SessionID: ds.SessionID,
+				DeviceID:  ds.DeviceID,
+				SecretRef: ds.SecretRef,
+				ExpiresAt: ds.ExpiresAt,
 			})
 		}
 	}
-	data, err := json.MarshalIndent(list, "", "  ")
-	if err == nil {
-		_ = os.WriteFile(bc.storePath, data, 0600)
+
+	revSessCopy := make(map[string]time.Time, len(bc.revokedSessions))
+	for k, v := range bc.revokedSessions {
+		revSessCopy[k] = v
 	}
+	revDevCopy := make(map[string]time.Time, len(bc.revokedDevices))
+	for k, v := range bc.revokedDevices {
+		revDevCopy[k] = v
+	}
+
+	filePayload := persistedBrokerStoreFile{
+		Version:         persistedBrokerStoreVersion,
+		Sessions:        list,
+		RevokedSessions: revSessCopy,
+		RevokedDevices:  revDevCopy,
+	}
+	data, err := json.MarshalIndent(filePayload, "", "  ")
+	if err != nil {
+		return fmt.Errorf("%w: %w", security.ErrPersistenceFailed, err)
+	}
+	if err := security.WriteFileAtomic(bc.storePath, data, 0600); err != nil {
+		return fmt.Errorf("%w: %w", security.ErrPersistenceFailed, err)
+	}
+	return nil
 }
 
-func (bc *BrokerClient) LoadPersistedSessions() {
+func (bc *BrokerClient) LoadPersistedSessions() error {
 	bc.mu.RLock()
 	storePath := bc.storePath
+	ss := bc.secretStore
 	bc.mu.RUnlock()
 
 	if storePath == "" {
-		return
+		return nil
 	}
 	data, err := os.ReadFile(storePath)
 	if err != nil {
-		return
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("%w: %w", security.ErrPersistenceFailed, err)
 	}
-	var list []StoredSession
-	if err := json.Unmarshal(data, &list); err != nil {
-		return
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return fmt.Errorf("%w: empty broker session file", security.ErrCorruptPersistedState)
 	}
-	for _, s := range list {
-		if time.Now().UTC().Before(s.ExpiresAt) {
-			_ = bc.ProvisionSession(s.SessionID, s.DeviceID, s.SessionSecret, s.ExpiresAt)
+	if trimmed[0] == '[' {
+		return fmt.Errorf("%w: legacy plaintext broker session file rejected; re-pairing required", security.ErrCorruptPersistedState)
+	}
+
+	var stored persistedBrokerStoreFile
+	if err := json.Unmarshal(trimmed, &stored); err != nil {
+		return fmt.Errorf("%w: %w", security.ErrCorruptPersistedState, err)
+	}
+	if stored.Version != persistedBrokerStoreVersion {
+		return fmt.Errorf("%w: unsupported broker session version %d", security.ErrCorruptPersistedState, stored.Version)
+	}
+
+	bc.mu.Lock()
+	for k, v := range stored.RevokedSessions {
+		bc.revokedSessions[k] = v
+	}
+	for k, v := range stored.RevokedDevices {
+		bc.revokedDevices[k] = v
+	}
+	bc.mu.Unlock()
+
+	now := time.Now().UTC()
+	var loadErrs []error
+	for _, s := range stored.Sessions {
+		if !now.Before(s.ExpiresAt) || s.SessionID == "" || s.DeviceID == "" || s.SecretRef == "" {
+			continue
+		}
+		bc.mu.RLock()
+		_, revSess := bc.revokedSessions[s.SessionID]
+		_, revDev := bc.revokedDevices[s.DeviceID]
+		bc.mu.RUnlock()
+		if revSess || revDev {
+			continue
+		}
+		if ss == nil || !ss.Available() {
+			loadErrs = append(loadErrs, fmt.Errorf("%w: cannot unseal broker session %q", security.ErrSecureStoreUnavailable, s.SessionID))
+			continue
+		}
+		secretBytes, err := ss.Load("broker_session", s.SessionID, s.SecretRef)
+		if err != nil || len(secretBytes) == 0 {
+			loadErrs = append(loadErrs, fmt.Errorf("%w: failed loading broker secret %q: %v", security.ErrCorruptPersistedState, s.SessionID, err))
+			continue
+		}
+		secretStr := string(secretBytes)
+		for i := range secretBytes {
+			secretBytes[i] = 0
+		}
+		if err := bc.provisionSessionInternal(s.SessionID, s.DeviceID, secretStr, s.SecretRef, s.ExpiresAt, false); err != nil {
+			loadErrs = append(loadErrs, err)
 		}
 	}
+	return errors.Join(loadErrs...)
 }
 
 func (bc *BrokerClient) RevokeSession(sessionID string) {
+	now := time.Now().UTC()
 	bc.mu.Lock()
-	defer bc.mu.Unlock()
+	bc.revokedSessions[sessionID] = now
 
 	ds, ok := bc.sessions[sessionID]
-	if !ok {
-		return
-	}
+	if ok {
+		ds.cancel()
+		ds.mu.Lock()
+		if ds.conn != nil {
+			_ = ds.conn.Close()
+			ds.conn = nil
+		}
+		ds.mu.Unlock()
 
-	ds.cancel()
-	ds.mu.Lock()
-	if ds.conn != nil {
-		_ = ds.conn.Close()
-		ds.conn = nil
-	}
-	ds.mu.Unlock()
+		if bc.persistSecrets && bc.secretStore != nil && ds.SecretRef != "" {
+			if err := bc.secretStore.Delete("broker_session", sessionID, ds.SecretRef); err != nil {
+				log.Printf("BrokerClient Warning: failed removing secret for revoked session %s: %v", sessionID, err)
+			}
+		}
+		ds.MasterSecret = ""
+		ds.SecretRef = ""
 
-	delete(bc.sessions, sessionID)
-	if m, ok := bc.deviceSessions[ds.DeviceID]; ok {
-		delete(m, sessionID)
-		if len(m) == 0 {
-			delete(bc.deviceSessions, ds.DeviceID)
+		delete(bc.sessions, sessionID)
+		if m, ok := bc.deviceSessions[ds.DeviceID]; ok {
+			delete(m, sessionID)
+			if len(m) == 0 {
+				delete(bc.deviceSessions, ds.DeviceID)
+			}
 		}
 	}
 
@@ -303,38 +463,47 @@ func (bc *BrokerClient) RevokeSession(sessionID string) {
 			break
 		}
 	}
-	bc.saveSessionsToDiskLocked()
-	if bc.Server != nil {
-		bc.Server.SessionStore().RevokeSession(sessionID)
+	if err := bc.saveSessionsToDiskLocked(); err != nil {
+		log.Printf("BrokerClient Warning: failed persisting session revocation for %s: %v", sessionID, err)
 	}
-	log.Printf("BrokerClient: Session %s revoked and disconnected (remaining active: %d)", sessionID, len(bc.sessions))
+	bc.mu.Unlock()
+
+	if bc.Server != nil {
+		if _, err := bc.Server.SessionStore().RevokeSession(sessionID); err != nil {
+			log.Printf("BrokerClient Warning: failed persisting Host Bridge revocation for session %s: %v", sessionID, err)
+		}
+	}
+	log.Printf("BrokerClient: Session %s revoked and disconnected (remaining active: %d)", sessionID, bc.ActiveSessionCount())
 }
 
 func (bc *BrokerClient) RevokeDevice(deviceID string) {
+	now := time.Now().UTC()
 	bc.mu.Lock()
-	defer bc.mu.Unlock()
+	bc.revokedDevices[deviceID] = now
 
-	sessionIDs, ok := bc.deviceSessions[deviceID]
-	if !ok {
-		if bc.Server != nil {
-			bc.Server.SessionStore().RevokeDevice(deviceID)
-		}
-		return
-	}
-
-	for sID := range sessionIDs {
-		if ds, exists := bc.sessions[sID]; exists {
-			ds.cancel()
-			ds.mu.Lock()
-			if ds.conn != nil {
-				_ = ds.conn.Close()
-				ds.conn = nil
+	if sessionIDs, ok := bc.deviceSessions[deviceID]; ok {
+		for sID := range sessionIDs {
+			bc.revokedSessions[sID] = now
+			if ds, exists := bc.sessions[sID]; exists {
+				ds.cancel()
+				ds.mu.Lock()
+				if ds.conn != nil {
+					_ = ds.conn.Close()
+					ds.conn = nil
+				}
+				ds.mu.Unlock()
+				if bc.persistSecrets && bc.secretStore != nil && ds.SecretRef != "" {
+					if err := bc.secretStore.Delete("broker_session", sID, ds.SecretRef); err != nil {
+						log.Printf("BrokerClient Warning: failed deleting secret for device session %s: %v", sID, err)
+					}
+				}
+				ds.MasterSecret = ""
+				ds.SecretRef = ""
+				delete(bc.sessions, sID)
 			}
-			ds.mu.Unlock()
-			delete(bc.sessions, sID)
 		}
+		delete(bc.deviceSessions, deviceID)
 	}
-	delete(bc.deviceSessions, deviceID)
 
 	if _, exists := bc.sessions[bc.SessionID]; !exists {
 		bc.SessionID = ""
@@ -345,11 +514,17 @@ func (bc *BrokerClient) RevokeDevice(deviceID string) {
 			break
 		}
 	}
-	bc.saveSessionsToDiskLocked()
-	if bc.Server != nil {
-		bc.Server.SessionStore().RevokeDevice(deviceID)
+	if err := bc.saveSessionsToDiskLocked(); err != nil {
+		log.Printf("BrokerClient Warning: failed persisting device revocation for %s: %v", deviceID, err)
 	}
-	log.Printf("BrokerClient: Device %s and all its sessions revoked (remaining active: %d)", deviceID, len(bc.sessions))
+	bc.mu.Unlock()
+
+	if bc.Server != nil {
+		if _, err := bc.Server.SessionStore().RevokeDevice(deviceID); err != nil {
+			log.Printf("BrokerClient Warning: failed persisting Host Bridge device revocation for %s: %v", deviceID, err)
+		}
+	}
+	log.Printf("BrokerClient: Device %s and all its sessions revoked (remaining active: %d)", deviceID, bc.ActiveSessionCount())
 }
 
 func (bc *BrokerClient) runSessionLoop(ctx context.Context, ds *DeviceSession) {
@@ -546,7 +721,9 @@ func (bc *BrokerClient) runSessionLoop(ctx context.Context, ds *DeviceSession) {
 }
 
 func (bc *BrokerClient) Start(ctx context.Context) {
-	bc.LoadPersistedSessions()
+	if err := bc.LoadPersistedSessions(); err != nil {
+		log.Printf("BrokerClient Warning: failed loading persisted sessions (fail-closed; re-pairing may be required): %v", err)
+	}
 }
 
 func (bc *BrokerClient) Stop() {

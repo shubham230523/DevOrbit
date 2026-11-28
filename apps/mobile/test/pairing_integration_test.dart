@@ -1,4 +1,6 @@
+import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
@@ -349,6 +351,164 @@ void main() {
       // 6. Mismatched device_id
       final wrongDevice = Map<String, dynamic>.from(validBase)..['device_id'] = 'wrong-device-id';
       await assertThrowsForBody(wrongDevice, 'device_id');
+    });
+
+    test('HTTPS confirm_url NEVER downgrades to HTTP or falls back on SocketException', () async {
+      final now = DateTime.now().add(const Duration(minutes: 5));
+      final payload = QrPairingPayload(
+        version: '1.0',
+        challengeId: 'qr-https-only-01',
+        hostId: 'host-prod-01',
+        hostName: 'Prod Host',
+        pairingPayload: 'payload-hex-32b',
+        pairingSecret: 'secret-ephemeral-32b',
+        confirmUrl: 'https://bridge.example.com:8443/api/v1/pairing/confirm',
+        brokerUrl: 'wss://broker.example.com',
+        expiresAt: now,
+        rawExpiresAt: now.toIso8601String(),
+      );
+
+      final attemptedUris = <Uri>[];
+      final mockHttp = MockClient((request) async {
+        attemptedUris.add(request.url);
+        throw const SocketException('Connection refused');
+      });
+
+      final client = PairingClient(httpClient: mockHttp);
+      await expectLater(
+        () => client.confirmPairing(
+          payload: payload,
+          deviceId: 'dev-phone-01',
+          deviceName: 'Pixel Phone',
+          secureStorage: storage,
+        ),
+        throwsA(isA<PairingException>()),
+      );
+
+      expect(attemptedUris, equals([Uri.parse('https://bridge.example.com:8443/api/v1/pairing/confirm')]));
+      expect(attemptedUris.any((u) => u.scheme == 'http'), isFalse);
+    });
+
+    test('HTTPS certificate/handshake error does NOT trigger fallback or insecure retry', () async {
+      final now = DateTime.now().add(const Duration(minutes: 5));
+      final payload = QrPairingPayload(
+        version: '1.0',
+        challengeId: 'qr-tls-err-01',
+        hostId: 'host-prod-01',
+        hostName: 'Prod Host',
+        pairingPayload: 'payload-hex-32b',
+        pairingSecret: 'secret-ephemeral-32b',
+        confirmUrl: 'https://bridge.example.com/api/v1/pairing/confirm',
+        brokerUrl: 'wss://broker.example.com',
+        expiresAt: now,
+        rawExpiresAt: now.toIso8601String(),
+      );
+
+      final attemptedUris = <Uri>[];
+      final mockHttp = MockClient((request) async {
+        attemptedUris.add(request.url);
+        throw const HandshakeException('CERTIFICATE_VERIFY_FAILED');
+      });
+
+      final client = PairingClient(httpClient: mockHttp);
+      await expectLater(
+        () => client.confirmPairing(
+          payload: payload,
+          deviceId: 'dev-phone-01',
+          deviceName: 'Pixel Phone',
+          secureStorage: storage,
+        ),
+        throwsA(isA<PairingException>()),
+      );
+
+      expect(attemptedUris.length, equals(1));
+      expect(attemptedUris.single.scheme, equals('https'));
+    });
+
+    test('HTTP dev pairing preserves http:// on localhost fallback when LAN IP refuses connection', () async {
+      final now = DateTime.now().add(const Duration(minutes: 5));
+      final payload = QrPairingPayload(
+        version: '1.0',
+        challengeId: 'qr-dev-fallback-01',
+        hostId: 'host-dev-01',
+        hostName: 'Dev Host',
+        pairingPayload: 'payload-hex-32b',
+        pairingSecret: 'secret-ephemeral-32b',
+        confirmUrl: 'http://192.168.1.42:8082/api/v1/pairing/confirm',
+        brokerUrl: 'ws://127.0.0.1:8081',
+        expiresAt: now,
+        rawExpiresAt: now.toIso8601String(),
+      );
+
+      final attemptedUris = <Uri>[];
+      final mockHttp = MockClient((request) async {
+        attemptedUris.add(request.url);
+        if (request.url.host == '192.168.1.42') {
+          throw const SocketException('Network unreachable');
+        }
+        return http.Response(
+          jsonEncode({
+            'status': 'success',
+            'session_token': 'token-dev-32b',
+            'session_id': 'sess-dev-01',
+            'session_secret': 'secret-dev-32b',
+            'machine_id': 'host-dev-01',
+            'device_id': 'dev-phone-01',
+            'broker_url': 'ws://127.0.0.1:8081',
+            'expires_at': DateTime.now().add(const Duration(hours: 24)).toIso8601String(),
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      });
+
+      final client = PairingClient(httpClient: mockHttp);
+      final res = await client.confirmPairing(
+        payload: payload,
+        deviceId: 'dev-phone-01',
+        deviceName: 'Pixel Phone',
+        secureStorage: storage,
+      );
+
+      expect(res.sessionId, equals('sess-dev-01'));
+      expect(attemptedUris, equals([
+        Uri.parse('http://192.168.1.42:8082/api/v1/pairing/confirm'),
+        Uri.parse('http://localhost:8082/api/v1/pairing/confirm'),
+      ]));
+    });
+
+    test('TimeoutException does NOT trigger duplicate fallback pairing confirmation', () async {
+      final now = DateTime.now().add(const Duration(minutes: 5));
+      final payload = QrPairingPayload(
+        version: '1.0',
+        challengeId: 'qr-timeout-01',
+        hostId: 'host-dev-01',
+        hostName: 'Dev Host',
+        pairingPayload: 'payload-hex-32b',
+        pairingSecret: 'secret-ephemeral-32b',
+        confirmUrl: 'http://192.168.1.42:8082/api/v1/pairing/confirm',
+        expiresAt: now,
+        rawExpiresAt: now.toIso8601String(),
+      );
+
+      final attemptedUris = <Uri>[];
+      final mockHttp = MockClient((request) async {
+        attemptedUris.add(request.url);
+        throw TimeoutException('Timed out');
+      });
+
+      final client = PairingClient(httpClient: mockHttp);
+      await expectLater(
+        () => client.confirmPairing(
+          payload: payload,
+          deviceId: 'dev-phone-01',
+          deviceName: 'Pixel Phone',
+          secureStorage: storage,
+        ),
+        throwsA(isA<PairingException>()),
+      );
+
+      expect(attemptedUris.length, equals(1));
     });
   });
 

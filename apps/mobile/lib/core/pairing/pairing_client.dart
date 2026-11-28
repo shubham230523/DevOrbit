@@ -106,17 +106,18 @@ class PairingClient {
 
     final port = confirmUri.hasPort ? confirmUri.port : 8082;
     // Primary candidate: the IP from the QR payload (the real host LAN address).
-    // Fallback candidates are only tried when the primary refuses the connection
-    // outright (SocketException). A TimeoutException means the host likely received
-    // the request and is processing it — retrying with a different address would
-    // consume the same challenge twice and cause "already consumed" errors.
+    // Only unencrypted development HTTP pairing (scheme == 'http') retains localhost /
+    // emulator loopback (10.0.2.2) fallback candidates when the primary refuses connection.
+    // HTTPS pairing must NEVER silently downgrade to HTTP or fall back to unauthenticated hosts.
     final primaryUri = confirmUri;
     final fallbackUris = <Uri>[];
-    if (confirmUri.host != 'localhost') {
-      fallbackUris.add(Uri.parse('http://localhost:$port/api/v1/pairing/confirm'));
-    }
-    if (confirmUri.host != '10.0.2.2') {
-      fallbackUris.add(Uri.parse('http://10.0.2.2:$port/api/v1/pairing/confirm'));
+    if (scheme == 'http') {
+      if (confirmUri.host != 'localhost') {
+        fallbackUris.add(Uri.parse('http://localhost:$port/api/v1/pairing/confirm'));
+      }
+      if (confirmUri.host != '10.0.2.2') {
+        fallbackUris.add(Uri.parse('http://10.0.2.2:$port/api/v1/pairing/confirm'));
+      }
     }
 
     http.Response? response;

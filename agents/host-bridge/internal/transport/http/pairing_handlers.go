@@ -301,6 +301,7 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 	// Register session in Host Bridge SessionStore first (enforces direct HTTP & Broker authN/authZ)
 	store := s.ensureSessionStore()
 	if _, err := store.RegisterSession(sessionID, req.DeviceID, token, sessionSecret, expiry, security.NewFullSessionPermissions()); err != nil {
+		_ = store.RemoveSession(sessionID)
 		s.pairingEngine.UnconsumeChallenge(req.ChallengeID)
 		writeError(w, http.StatusInternalServerError, "failed to register host session: "+err.Error())
 		return
@@ -318,7 +319,7 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 			expiry,
 		)
 		if err != nil {
-			store.RemoveSession(sessionID)
+			_ = store.RemoveSession(sessionID)
 			s.pairingEngine.UnconsumeChallenge(req.ChallengeID)
 			writeError(w, http.StatusBadGateway, "failed to register session authorization with connection broker: "+err.Error())
 			return
@@ -331,7 +332,7 @@ func (s *Server) HandleConfirmPairing(w http.ResponseWriter, r *http.Request) {
 			if s.brokerAuthorizer != nil {
 				_ = s.brokerAuthorizer.RevokeDevice(r.Context(), s.pairingEngine.HostID(), req.DeviceID)
 			}
-			store.RemoveSession(sessionID)
+			_ = store.RemoveSession(sessionID)
 			s.pairingEngine.UnconsumeChallenge(req.ChallengeID)
 			writeError(w, http.StatusInternalServerError, "failed to provision session on host bridge: "+err.Error())
 			return

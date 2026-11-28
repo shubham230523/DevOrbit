@@ -2,8 +2,11 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -278,4 +281,95 @@ func TestBrokerClient_IndependentSimultaneousDeviceSessions(t *testing.T) {
 	}
 
 	client.Stop()
+}
+
+type brokerTestSecretStore struct {
+	available bool
+	secrets   map[string]string
+}
+
+func (b *brokerTestSecretStore) Name() string    { return "broker-test-store" }
+func (b *brokerTestSecretStore) Available() bool { return b.available }
+func (b *brokerTestSecretStore) Store(scope, id string, secret []byte) (string, error) {
+	if !b.available {
+		return "", security.ErrSecureStoreUnavailable
+	}
+	b.secrets[scope+":"+id] = string(secret)
+	return "test-ref:" + scope + ":" + id, nil
+}
+func (b *brokerTestSecretStore) Load(scope, id, ref string) ([]byte, error) {
+	if !b.available {
+		return nil, security.ErrSecureStoreUnavailable
+	}
+	v, ok := b.secrets[scope+":"+id]
+	if !ok {
+		return nil, security.ErrSecretNotFound
+	}
+	return []byte(v), nil
+}
+func (b *brokerTestSecretStore) Delete(scope, id, ref string) error {
+	delete(b.secrets, scope+":"+id)
+	return nil
+}
+
+func TestBrokerClient_PersistenceNoPlaintextLegacyRejectAndRevocationRestart(t *testing.T) {
+	persistPath := filepath.Join(t.TempDir(), "host_sessions.json")
+	ss := &brokerTestSecretStore{available: true, secrets: make(map[string]string)}
+
+	bc1 := NewBrokerClient("ws://127.0.0.1:18081", "mach-p1", "", "host-token-32b", nil)
+	bc1.SetSecretStore(ss)
+	if err := bc1.EnableSessionPersistence(persistPath); err != nil {
+		t.Fatalf("EnableSessionPersistence failed: %v", err)
+	}
+
+	secret1 := "broker-session-secret-01-32-bytes!"
+	secret2 := "broker-session-secret-02-32-bytes!"
+	if err := bc1.ProvisionSession("sess-b1", "dev-b1", secret1, time.Hour); err != nil {
+		t.Fatalf("ProvisionSession b1 failed: %v", err)
+	}
+	if err := bc1.ProvisionSession("sess-b2", "dev-b2", secret2, time.Hour); err != nil {
+		t.Fatalf("ProvisionSession b2 failed: %v", err)
+	}
+
+	diskBytes, err := os.ReadFile(persistPath)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if strings.Contains(string(diskBytes), secret1) || strings.Contains(string(diskBytes), secret2) || strings.Contains(string(diskBytes), `"session_secret"`) {
+		t.Fatalf("SECURITY FAILURE: BrokerClient persistence wrote plaintext session_secret to disk")
+	}
+
+	bc1.RevokeSession("sess-b1")
+	bc1.Stop()
+
+	// Restart into bc2: only sess-b2 is restored; sess-b1 stays revoked
+	bc2 := NewBrokerClient("ws://127.0.0.1:18081", "mach-p1", "", "host-token-32b", nil)
+	bc2.SetSecretStore(ss)
+	if err := bc2.EnableSessionPersistence(persistPath); err != nil {
+		t.Fatalf("EnableSessionPersistence bc2 failed: %v", err)
+	}
+	if err := bc2.LoadPersistedSessions(); err != nil {
+		t.Fatalf("LoadPersistedSessions failed: %v", err)
+	}
+	defer bc2.Stop()
+
+	if bc2.ActiveSessionCount() != 1 {
+		t.Fatalf("expected exactly 1 active session after restart with revocation, got %d", bc2.ActiveSessionCount())
+	}
+	if err := bc2.ProvisionSession("sess-b1", "dev-b1", secret1, time.Hour); !errors.Is(err, security.ErrSessionRevoked) {
+		t.Fatalf("expected ErrSessionRevoked when attempting to reuse revoked session ID after restart, got: %v", err)
+	}
+
+	// Legacy plaintext broker file must be rejected fail-closed
+	legacyPath := filepath.Join(t.TempDir(), "legacy_host_sessions.json")
+	_ = os.WriteFile(legacyPath, []byte(`[{"session_id":"sess-old","device_id":"dev-old","session_secret":"plain-secret","expires_at":"2099-01-01T00:00:00Z"}]`), 0600)
+	bcLegacy := NewBrokerClient("ws://127.0.0.1:18081", "mach-p1", "", "host-token-32b", nil)
+	bcLegacy.SetSecretStore(ss)
+	_ = bcLegacy.EnableSessionPersistence(legacyPath)
+	if err := bcLegacy.LoadPersistedSessions(); !errors.Is(err, security.ErrCorruptPersistedState) {
+		t.Fatalf("expected ErrCorruptPersistedState for legacy plaintext broker file, got: %v", err)
+	}
+	if bcLegacy.ActiveSessionCount() != 0 {
+		t.Fatalf("legacy plaintext broker sessions must not be restored")
+	}
 }

@@ -3,13 +3,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -27,20 +27,6 @@ import (
 	httptransport "devorbit.net/agents/host-bridge/internal/transport/http"
 	airouter "devorbit.net/agents/ai-router/pkg/router"
 )
-
-// setWindowsUTF8Console switches the Windows console input/output code pages
-// to UTF-8 (65001) so that Unicode block characters render correctly.
-// It is a no-op on non-Windows platforms.
-func setWindowsUTF8Console() {
-	if runtime.GOOS != "windows" {
-		return
-	}
-	kernel32 := syscall.NewLazyDLL("kernel32.dll")
-	setConsoleCP := kernel32.NewProc("SetConsoleCP")
-	setConsoleOutputCP := kernel32.NewProc("SetConsoleOutputCP")
-	_, _, _ = setConsoleCP.Call(65001)
-	_, _, _ = setConsoleOutputCP.Call(65001)
-}
 
 func main() {
 	// Ensure the Windows console uses UTF-8 so QR block characters render correctly.
@@ -128,11 +114,25 @@ func main() {
 	}
 
 	// 5. Outbound Connection Broker Client
-	serverEngine.SessionStore().EnablePersistence("")
-	serverEngine.SessionStore().LoadPersistedSessions()
+	if err := serverEngine.SessionStore().EnablePersistence(""); err != nil {
+		if errors.Is(err, security.ErrSecureStoreUnavailable) {
+			log.Println("Host Bridge Security Notice: OS secure secret store unavailable; HTTP sessions will remain in-memory only and require re-pairing after restart (revocation tombstones remain persisted).")
+		} else {
+			log.Printf("Host Bridge Warning: Failed enabling HTTP session persistence: %v", err)
+		}
+	}
+	if err := serverEngine.SessionStore().LoadPersistedSessions(); err != nil {
+		log.Printf("Host Bridge Warning: Failed loading persisted HTTP sessions (fail-closed; re-pairing may be required): %v", err)
+	}
 
 	brokerClient := transport.NewBrokerClient(cfg.BrokerWSURL, cfg.HostID, "", cfg.HostSecret, serverEngine)
-	brokerClient.EnableSessionPersistence("")
+	if err := brokerClient.EnableSessionPersistence(""); err != nil {
+		if errors.Is(err, security.ErrSecureStoreUnavailable) {
+			log.Println("Host Bridge Security Notice: OS secure secret store unavailable; broker sessions will remain in-memory only and require re-pairing after restart.")
+		} else {
+			log.Printf("Host Bridge Warning: Failed enabling broker session persistence: %v", err)
+		}
+	}
 	serverEngine.SetSessionProvisioner(func(sessionID, deviceID, sessionSecret string, expiry time.Time) error {
 		return brokerClient.ProvisionSession(sessionID, deviceID, sessionSecret, expiry)
 	})

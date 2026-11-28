@@ -45,3 +45,23 @@
 - **Master Plan 0 Status:** `COMPLETED` (`COMMITTED`, `PUSHED`, `REMOTE-VERIFIED` on `origin/security/atomic-agent-task-execution` and `origin/quality/autonomous-15min-improvement`).
 - **Master Plan 0.1 Changes Made:** Reconciled `CURRENT_STATE.md`, `ACTIVE_PLAN.md`, `EXECUTION_LOG.md`, `KNOWN_ISSUES.md`, and `handoffs/latest-handoff.md` to mark Master Plan 0 completed, remove obsolete MP0 commit/push instructions, record `7aed09683a829f83dd3a6f04cfbba0f6e376bc31` as the verified MP0 commit, preserve `7ba545da10f4ec61bf180c70c60960a3af03e5d4` as MP24's automated implementation commit, and document unresolved `session_store.go` persistence/empty-permission restoration risks and `pairing_client.dart` HTTPS-to-HTTP fallback behavior for independent review. Zero application code or tests modified.
 - **Remaining Work:** Independent review of Master Plan 24 (`7ba545da10f4ec61bf180c70c60960a3af03e5d4`) and live TLS/mobile-to-host validation.
+
+---
+
+### Entry 5 — Master Plan 24 Closure (Independent Review & Targeted Remediation)
+- **Starting Baseline (MP0.1):** `be4ec8aa93cdfb8463f393f9f5d1ee0d457ef60d`
+- **Commit / Branch:** Pending commit & push on `security/atomic-agent-task-execution` & `quality/autonomous-15min-improvement`
+- **Confirmed Findings Remediated:**
+  - **F-01 (High):** Empty/missing permissions escalation in `SessionStore.LoadPersistedSessions` -> removed `omitempty`, preserved empty `{}` maps as zero-privilege `NewScopedSessionPermissions()`, rejected `nil` permissions and legacy plaintext files fail-closed (`ErrCorruptPersistedState`).
+  - **F-02 (High):** Plaintext `session_secret` persistence, ignored I/O errors, non-atomic writes, and non-durable revocation in `SessionStore` (`host_http_sessions.json`) and `BrokerClient` (`host_sessions.json`) -> added OS-backed `SecretStore` (`secret_store.go`, `secret_store_windows.go` DPAPI, `secret_store_linux.go` `secret-tool`, `secret_store_other.go`), memory-only fallback on unavailable OS store, atomic `WriteFileAtomic`, durable `revoked_sessions`/`revoked_devices` tombstones, error propagation across callers (`main.go`, `handlers.go`, `pairing_handlers.go`).
+  - **F-03 (High):** Mobile `PairingClient` hardcoded `http://` fallback on `SocketException` -> restricted `fallbackUris` strictly to `scheme == 'http'`.
+  - **F-04 (Low):** Multi-valued `X-Forwarded-Proto` header ambiguity -> required `len(r.Header.Values("X-Forwarded-Proto")) == 1` in `isTransportConfidential`.
+  - **F-05 (Cross-Platform Build):** `cmd/host-bridge/main.go` `syscall.NewLazyDLL` broke `GOOS=linux` builds -> extracted `console_windows.go` and `console_other.go`.
+- **Verification Commands Executed (after final code edit):**
+  - `go vet ./...` & `go test -count=1 -timeout=120s ./...` in `agents\host-bridge`, `services\connection-broker`, `services\control-plane`, `agents\ai-router`, `agents\acp-adapter` -> **PASS** (exit 0).
+  - `GOOS=linux GOARCH=amd64 go build ./...` & `GOOS=windows GOARCH=amd64 go build ./...` in all 5 Go modules -> **PASS** (exit 0).
+  - `go test -race -count=1 -timeout=180s ./internal/security/...` in `agents\host-bridge` -> **BLOCKED** (exit 1: `cc1.exe: sorry, unimplemented: 64-bit mode not compiled in`).
+  - `flutter analyze` -> **PASS** (`No issues found!`).
+  - `flutter test` -> **PASS** (`+37: All tests passed!`, including 4 new HTTPS fallback regression tests & Go/Dart HTTP Auth MAC vector test).
+- **Phase 4 Live Validation Status:** **BLOCKED** on `Windows NT 10.0.26200.0` (no `caddy`/`nginx`, no trusted CA cert, `adb devices -l` empty).
+- **Stage Status:** Code & automated tests `IMPLEMENTED`, `TESTED`, `REVIEWED`; `PRODUCTION-VALIDATED` remains `BLOCKED`.

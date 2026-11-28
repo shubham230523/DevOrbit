@@ -271,7 +271,7 @@ func TestAuthBoundary_EveryProtectedRoute(t *testing.T) {
 	scopedCreds := env.registerSession("sess-scoped", "dev-scoped", "tok-scoped-32bytes-secret-001!!", "sec-scoped-32bytes-master-001!!", time.Hour, security.NewScopedSessionPermissions())
 	expCreds := env.registerSession("sess-exp", "dev-exp", "tok-exp-32bytes-secret-value-001!", "sec-exp-32bytes-master-value-001!!", 100*time.Millisecond, security.NewFullSessionPermissions())
 	revCreds := env.registerSession("sess-rev", "dev-rev", "tok-rev-32bytes-secret-value-001!", "sec-rev-32bytes-master-value-001!!", time.Hour, security.NewFullSessionPermissions())
-	env.server.SessionStore().RevokeSession(revCreds.sessionID)
+	_, _ = env.server.SessionStore().RevokeSession(revCreds.sessionID)
 	time.Sleep(150 * time.Millisecond)
 
 	// Seed a real process ID & agent task owned by fullCreds so process/task endpoints resolve cleanly when authorized
