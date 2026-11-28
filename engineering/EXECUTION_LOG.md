@@ -178,3 +178,22 @@
   - Docker/container E2E locally → **BLOCKED** (daemon not running: `npipe:////./pipe/dockerDesktopLinuxEngine` not found).
   - GitHub Actions run inspection → **BLOCKED** (`gh` CLI not installed; no authenticated API access from this host).
 - **Stage Status:** M2 repository scope `IMPLEMENTED`, `TESTED`; container-topology E2E and CI-run inspection `BLOCKED`. Verdict: **M2 PARTIALLY COMPLETE**.
+
+---
+
+### Entry 11 — MP26 M2 Commit, Push & CI Evidence (including a correction to the MP25 CI assumption)
+- **M2 Implementation Commit:** `d8eb21fbac222b96b24befc1738605f4fb597f9c` (43 files, +3017/−2123).
+- **Push Results:** `881c7dc..d8eb21f` for both `security/atomic-agent-task-execution` and `quality/autonomous-15min-improvement` (exit 0).
+- **`git ls-remote origin` (exit 0):**
+  ```text
+  c49804547aef7dc1100b8b444ee32695f353e7e6        refs/heads/main
+  d8eb21fbac222b96b24befc1738605f4fb597f9c        refs/heads/quality/autonomous-15min-improvement
+  d8eb21fbac222b96b24befc1738605f4fb597f9c        refs/heads/security/atomic-agent-task-execution
+  ```
+  Local `HEAD` = `d8eb21f…`; working tree clean; no force-push; `main` untouched.
+- **CI execution evidence (GitHub REST API, unauthenticated):**
+  - `GET /repos/…/actions/runs?branch=security/atomic-agent-task-execution` → `total_count: 0` (**zero runs** for this branch, including `d8eb21f`).
+  - `GET /repos/…/actions/runs?per_page=5` → `total_count: 65`, with every visible run on **`main`**, dated **2026-11-23**, `conclusion: failure` (e.g. `145f8b0`, `db25369`, `f145c04`).
+  - `GET /repos/…/actions/permissions` → **HTTP 401** (requires authentication), so repository Actions enablement cannot be confirmed from this host.
+- **Correction to the MP25 record:** the MP25 claim that the `go-race` job "will execute on ubuntu-latest" was an *expectation*, not evidence. In reality **no workflow run has ever been created for the engineering branches**, so the MP25 CI expansion (race, cross-builds, Android build, scanners) is `NOT RUN`, not `PASS`. Root cause requires authenticated repository access.
+- **Consequence for Task I:** MP26 Task I is **BLOCKED** — the workflow is implemented and pushed, but its first execution has not occurred and cannot be inspected from this host.

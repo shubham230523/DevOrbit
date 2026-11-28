@@ -93,7 +93,12 @@ Single argument-aware policy used by both execution boundaries (direct HTTP and 
 1. **Docker daemon not running on this host** (`npipe:////./pipe/dockerDesktopLinuxEngine` missing) →
    container-topology E2E, compose config validation and image build not executed locally. CI jobs
    (`deployment-validate`, `broker-binary-e2e`) cover them; results unverified.
-2. **No authenticated GitHub access** → workflow run results for the pushed commit not inspected.
+2. **CI has never run for the engineering branches (verified via GitHub REST API):**
+   `actions/runs?branch=security/atomic-agent-task-execution` → `total_count: 0`, while the repository
+   reports `total_count: 65` runs, all on `main`, dated 2026-11-23, all `conclusion: failure`.
+   `actions/permissions` returns **HTTP 401**, so Actions enablement cannot be confirmed without
+   authenticated access. Therefore every CI criterion — including the MP25 `go-race` job — is
+   **NOT RUN**, not PASS. **This supersedes the MP25 expectation that the race job executes in CI.**
 3. **M1 external dependencies unchanged:** physical Android/iOS devices, macOS/Xcode, CA-trusted TLS
    with DNS + proxy host, Android upload keystore + CI signing secrets, Linux `-race` execution.
 
