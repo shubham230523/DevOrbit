@@ -559,31 +559,25 @@ func (s *Server) HandleExecuteProcess(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Commands that execute project-defined code (the Gradle family) require an explicit,
-	// single-use authorization bound to this exact workspace, command and argument vector. Session
-	// permission alone is not sufficient, so scripted or AI-induced invocations cannot escalate.
-	if requiresApproval, reason := s.processSvc.RequiresApproval(&req.ProcessSpec); requiresApproval {
-		if err := s.consumeProcessApproval(authCtx.SessionID, authCtx.DeviceID, &req.ProcessSpec); err != nil {
-			status := http.StatusForbidden
-			if errors.Is(err, application.ErrApprovalMismatch) {
-				status = http.StatusForbidden
-			}
-			wipeApprovalToken(&req.ProcessSpec)
-			writeError(w, status, "approval_required: "+reason+"; obtain an approval token from /api/v1/processes/approvals and resubmit")
-			return
-		}
-		s.securityEvent(observability.LevelInfo, EventProcessApproved, map[string]any{
-			"command":   req.ProcessSpec.Command,
-			"arg_count": len(req.ProcessSpec.Args),
-			"workspace": req.ProcessSpec.WorkspaceID,
-		})
-		s.incrementMetric("devorbit_process_approvals_consumed_total")
-	}
-	// The token must never reach the child process or the response body.
-	wipeApprovalToken(&req.ProcessSpec)
+	// The approval gate lives in ProcessService so that every route (HTTP and agent) shares one
+	// boundary. Here we only supply the authenticated principal: the service consumes the token and
+	// revalidates the exact workspace, command and arguments immediately before launch.
+	req.ProcessSpec.OwnerSessionID = authCtx.SessionID
+	req.ProcessSpec.OwnerDeviceID = authCtx.DeviceID
 
 	info, err := s.processSvc.ExecuteProcess(r.Context(), &req.ProcessSpec)
 	if err != nil {
+		if isApprovalError(err) {
+			s.securityEvent(observability.LevelWarn, EventProcessApprovalRejected, map[string]any{
+				"command":   req.ProcessSpec.Command,
+				"arg_count": len(req.ProcessSpec.Args),
+				"workspace": req.ProcessSpec.WorkspaceID,
+				"reason":    approvalRejectionReason(err),
+			})
+			s.incrementMetric("devorbit_process_approvals_rejected_total")
+			writeError(w, approvalErrorStatus(err), "approval_required: "+approvalRejectionReason(err))
+			return
+		}
 		if errors.Is(err, domain.ErrCommandNotAllowed) {
 			writeError(w, http.StatusForbidden, err.Error())
 		} else if errors.Is(err, domain.ErrAccessDenied) {
@@ -798,7 +792,16 @@ func (s *Server) HandleApproveAgentTask(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusConflict, "task is not awaiting approval")
 		return
 	}
-	if task.ApprovalToken == "" || subtle.ConstantTimeCompare([]byte(req.ApprovalToken), []byte(task.ApprovalToken)) != 1 {
+	if task.ApprovalToken == "" {
+		writeError(w, http.StatusForbidden, "invalid approval token")
+		return
+	}
+	// A task paused on a process approval carries the approval id, and the human decision was recorded
+	// against that proposal through the process approval endpoint. The execution itself is authorized
+	// (and consumed exactly once) by the process approval service, so the legacy constant-time
+	// comparison applies only to task-level approvals.
+	if !strings.HasPrefix(task.ApprovalToken, "pappr-") &&
+		subtle.ConstantTimeCompare([]byte(req.ApprovalToken), []byte(task.ApprovalToken)) != 1 {
 		writeError(w, http.StatusForbidden, "invalid approval token")
 		return
 	}

@@ -109,10 +109,16 @@ func main() {
 
 	// Initialize Gemini Agent Engine, Tool Executor, and Approval Manager
 	approvalMgr := application.NewApprovalManager()
-	// Gradle execution requires an explicit human decision: requesting an approval mints nothing, and
-	// only a decision on /api/v1/processes/approvals/{id}/decision issues a single-use token.
-	serverEngine.SetProcessApprovalStore(application.NewProcessApprovalStore(10 * time.Minute))
+	// One authoritative process approval service. Creating a proposal mints nothing; only a decision on
+	// /api/v1/processes/approvals/{id}/decision issues a single-use token, and the shared
+	// ProcessService gate consumes it for BOTH the HTTP and agent execution routes.
+	processApprovals := application.NewProcessApprovalStore(10 * time.Minute)
+	serverEngine.SetProcessApprovalStore(processApprovals)
+	psSvc.SetProcessApprovalStore(processApprovals)
 	agentExecutor := application.NewAgentToolExecutor(wsSvc, fsSvc, psSvc, gsSvc, dsSvc, approvalMgr)
+	// The agent route must use the same authoritative service as the HTTP route, never the legacy
+	// task approval manager, for commands that execute project-defined code.
+	agentExecutor.SetProcessApprovalStore(processApprovals)
 	agentEngine := application.NewGeminiAgentEngine(aiRouter, agentExecutor, approvalMgr)
 	serverEngine.SetAgentEngine(agentEngine)
 

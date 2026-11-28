@@ -707,7 +707,9 @@ func (e *GeminiAgentEngine) runTaskInternal(ctx context.Context, taskID string, 
 		return fmt.Errorf("task '%s' not found", taskID)
 	}
 
-	taskCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	// Bind the owning principal to the execution context so a process approval requested by this task
+	// is scoped to the same session and device that would authorize it over HTTP.
+	taskCtx, cancel := context.WithTimeout(WithTaskOwner(ctx, task.OwnerSessionID, task.OwnerDeviceID), 5*time.Minute)
 
 	task.mu.Lock()
 	if task.executing {

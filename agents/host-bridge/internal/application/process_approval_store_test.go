@@ -270,6 +270,89 @@ func TestProcessApprovalStore_RejectAfterApproveRemovesToken(t *testing.T) {
 	}
 }
 
+// TestProcessApprovalStore_CancelAbandonsPendingProposal proves cancellation has real server-side
+// effect: the proposal can no longer be approved and can never execute.
+func TestProcessApprovalStore_CancelAbandonsPendingProposal(t *testing.T) {
+	store, _ := newTestStore(t)
+	approval := mustCreate(t, store, "gradlew", []string{"build"})
+
+	cancelled, err := store.Cancel(approval.ID, "sess-1", "dev-1")
+	if err != nil {
+		t.Fatalf("Cancel failed: %v", err)
+	}
+	if cancelled.State != ProcessApprovalCancelled {
+		t.Fatalf("expected cancelled state, got %q", cancelled.State)
+	}
+	if cancelled.Token != "" {
+		t.Fatalf("a cancelled proposal must never carry a token")
+	}
+
+	if _, err := store.Decide(approval.ID, "sess-1", "dev-1", "approve", approval.Digest); !errors.Is(err, ErrProcessApprovalNotPending) {
+		t.Fatalf("expected approval of a cancelled proposal to be refused, got %v", err)
+	}
+	if _, err := store.ConsumeByApprovalID(approval.ID, "sess-1", "dev-1", "/workspace", "gradlew", []string{"build"}); err == nil {
+		t.Fatalf("expected execution of a cancelled proposal to be refused")
+	}
+}
+
+// TestProcessApprovalStore_CancelIsOwnerBoundAndIdempotent proves another principal cannot cancel and
+// that repeated cancellation has a deterministic outcome.
+func TestProcessApprovalStore_CancelIsOwnerBoundAndIdempotent(t *testing.T) {
+	store, _ := newTestStore(t)
+	approval := mustCreate(t, store, "gradlew", []string{"build"})
+
+	if _, err := store.Cancel(approval.ID, "sess-2", "dev-1"); !errors.Is(err, ErrProcessApprovalOwner) {
+		t.Fatalf("expected owner rejection for cancellation, got %v", err)
+	}
+	if _, err := store.Cancel(approval.ID, "sess-1", "dev-1"); err != nil {
+		t.Fatalf("first cancellation failed: %v", err)
+	}
+	if _, err := store.Cancel(approval.ID, "sess-1", "dev-1"); !errors.Is(err, ErrProcessApprovalNotPending) {
+		t.Fatalf("expected deterministic not-pending on repeated cancellation, got %v", err)
+	}
+}
+
+// TestProcessApprovalStore_AuthorizationDispatch covers both accepted authorization forms and proves
+// that neither works before a human decision.
+func TestProcessApprovalStore_AuthorizationDispatch(t *testing.T) {
+	store, _ := newTestStore(t)
+
+	pending := mustCreate(t, store, "gradlew", []string{"build"})
+	if _, err := store.ConsumeAuthorization(pending.ID, "sess-1", "dev-1", "/workspace", "gradlew", []string{"build"}); !errors.Is(err, ErrProcessApprovalNotApproved) {
+		t.Fatalf("expected pending proposal to be refused, got %v", err)
+	}
+
+	approved := mustCreate(t, store, "gradlew", []string{"test"})
+	if _, err := store.Decide(approved.ID, "sess-1", "dev-1", "approve", approved.Digest); err != nil {
+		t.Fatalf("Decide failed: %v", err)
+	}
+
+	// Approval id form (agent task flow).
+	if _, err := store.ConsumeAuthorization(approved.ID, "sess-1", "dev-1", "/workspace", "gradlew", []string{"test"}); err != nil {
+		t.Fatalf("expected approval-id authorization to be consumed, got %v", err)
+	}
+	// Replay of the same authorization is refused.
+	if _, err := store.ConsumeAuthorization(approved.ID, "sess-1", "dev-1", "/workspace", "gradlew", []string{"test"}); !errors.Is(err, ErrProcessApprovalNotPending) {
+		t.Fatalf("expected replay of consumed approval to be refused, got %v", err)
+	}
+
+	// Execution token form (direct HTTP flow).
+	second := mustCreate(t, store, "gradlew", []string{"assembleDebug"})
+	decidedToken, err := store.Decide(second.ID, "sess-1", "dev-1", "approve", second.Digest)
+	if err != nil {
+		t.Fatalf("Decide failed: %v", err)
+	}
+	if decidedToken.Token == "" {
+		t.Fatalf("expected an execution token")
+	}
+	if _, err := store.ConsumeAuthorization(decidedToken.Token, "sess-1", "dev-1", "/workspace", "gradlew", []string{"assembleDebug"}); err != nil {
+		t.Fatalf("expected execution-token authorization to be consumed, got %v", err)
+	}
+	if _, err := store.ConsumeAuthorization(decidedToken.Token, "sess-1", "dev-1", "/workspace", "gradlew", []string{"assembleDebug"}); !errors.Is(err, ErrProcessApprovalToken) {
+		t.Fatalf("expected token replay to be refused, got %v", err)
+	}
+}
+
 func TestProcessApprovalStore_StatusNeverExposesToken(t *testing.T) {
 	store, _ := newTestStore(t)
 	approval := mustCreate(t, store, "gradlew", []string{"build"})

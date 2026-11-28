@@ -47,7 +47,10 @@ enum ProcessApprovalPhase {
   /// Any failure that is not recoverable by retrying the same decision.
   failed,
 
-  /// The approval was abandoned locally before a decision was sent.
+  /// Cancellation has been sent to the host and not yet confirmed.
+  cancellationRequested,
+
+  /// The host confirmed that the proposal is no longer actionable.
   cancelled,
 }
 
@@ -151,6 +154,9 @@ abstract class ProcessApprovalApi {
     required List<String> args,
     String? approvalToken,
   });
+
+  /// Asks the host to abandon a pending proposal. Returns true only when the host confirms it.
+  Future<bool> cancelProcessApproval({required String approvalId});
 }
 
 /// Drives the two-step approval protocol for one command.
@@ -276,11 +282,34 @@ class ProcessApprovalController {
     }
   }
 
-  /// Abandons the proposal locally. The host record simply expires; nothing is authorized locally.
-  void cancel() {
-    if (_busy) return;
-    if (_phase == ProcessApprovalPhase.awaitingDecision) {
-      _phase = ProcessApprovalPhase.cancelled;
+  /// Cancels the pending proposal on the server.
+  ///
+  /// The previous implementation only changed local state, which left the host proposal actionable
+  /// until it expired. Cancellation is now confirmed by the host; if the request fails or is not
+  /// confirmed, the controller reports [ProcessApprovalPhase.failed] rather than claiming a
+  /// cancellation that did not happen.
+  Future<void> cancel() async {
+    final proposal = _proposal;
+    if (proposal == null || _busy || _phase != ProcessApprovalPhase.awaitingDecision) return;
+
+    _busy = true;
+    _phase = ProcessApprovalPhase.cancellationRequested;
+    _error = null;
+    try {
+      final confirmed = await _api.cancelProcessApproval(approvalId: proposal.approvalId);
+      if (confirmed) {
+        _phase = ProcessApprovalPhase.cancelled;
+        _executionToken = null;
+      } else {
+        // The host may still hold the proposal; never report success we cannot prove.
+        _phase = ProcessApprovalPhase.failed;
+        _error = 'Cancellation was not confirmed by the host; the proposal may still expire normally.';
+      }
+    } catch (e) {
+      _phase = ProcessApprovalPhase.failed;
+      _error = 'Network error while cancelling: $e';
+    } finally {
+      _busy = false;
     }
   }
 

@@ -30,6 +30,7 @@ const (
 	EventProcessApprovalApproved        = "process_approval_approved"
 	EventProcessApprovalRejected        = "process_approval_failed"
 	EventProcessApprovalRejectedDecided = "process_approval_rejected_by_user"
+	EventProcessApprovalCancelled       = "process_approval_cancelled"
 	EventProcessApproved                = "process_approval_consumed"
 )
 

@@ -22,6 +22,37 @@ type AgentToolExecutor struct {
 	gitSvc        *GitService
 	deviceSvc     *DeviceService
 	approvalMgr   *ApprovalManager
+	// processApprovals is the authoritative approval service for commands that execute
+	// project-defined code. The legacy approvalMgr is NOT an authorization route for those commands.
+	processApprovals *ProcessApprovalStore
+}
+
+// SetProcessApprovalStore installs the authoritative process approval service used for Gradle-family
+// commands. Without it those commands fail closed.
+func (e *AgentToolExecutor) SetProcessApprovalStore(store *ProcessApprovalStore) {
+	e.processApprovals = store
+}
+
+// taskOwnerContextKey carries the owning session and device of the running task so a process
+// approval can be bound to the same principal that would authorize it over HTTP.
+type taskOwnerContextKey struct{}
+
+type taskOwner struct {
+	SessionID string
+	DeviceID  string
+}
+
+// WithTaskOwner attaches the owning session and device to a task execution context.
+func WithTaskOwner(ctx context.Context, sessionID, deviceID string) context.Context {
+	return context.WithValue(ctx, taskOwnerContextKey{}, taskOwner{SessionID: sessionID, DeviceID: deviceID})
+}
+
+// taskOwnerFromContext returns the owning principal recorded on the context.
+func taskOwnerFromContext(ctx context.Context) (string, string) {
+	if owner, ok := ctx.Value(taskOwnerContextKey{}).(taskOwner); ok {
+		return owner.SessionID, owner.DeviceID
+	}
+	return "", ""
 }
 
 func NewAgentToolExecutor(
@@ -238,6 +269,69 @@ func (e *AgentToolExecutor) ExecuteTool(
 			}
 		}
 
+		ownerSession, ownerDevice := taskOwnerFromContext(ctx)
+		spec := &domain.ProcessSpec{
+			WorkspaceID:    workspaceID,
+			Command:        cmdStr,
+			Args:           cmdArgs,
+			TimeoutSeconds: 30,
+			OwnerSessionID: ownerSession,
+			OwnerDeviceID:  ownerDevice,
+		}
+
+		// Commands that execute project-defined code are authorized by the process approval service
+		// only. The legacy task ApprovalManager is deliberately not consulted for them, so an old
+		// task-approval token can never authorize a Gradle execution.
+		if requiresApproval, policyReason := e.processSvc.RequiresApproval(spec); requiresApproval {
+			if e.processApprovals == nil {
+				return nil, nil, ErrApprovalRequirementMissing
+			}
+			if ownerSession == "" || ownerDevice == "" {
+				return nil, nil, ErrProcessApprovalOwner
+			}
+
+			if approvalToken == "" {
+				approval, err := e.processApprovals.Create(
+					ownerSession, ownerDevice, workspaceID, cmdStr, cmdArgs, policyReason,
+				)
+				if err != nil {
+					return nil, nil, err
+				}
+				// The engine receives a proposal-shaped view so the task pauses and the client can
+				// display the exact command. Token is the approval id, which grants nothing on its own;
+				// ExpectedSHA256 carries the digest the human decision must echo.
+				return nil, &ApprovalProposal{
+					Token:          approval.ID,
+					TaskID:         taskID,
+					WorkspaceID:    workspaceID,
+					ToolName:       toolName,
+					Command:        cmdStr,
+					Args:           append([]string(nil), cmdArgs...),
+					ExpectedSHA256: approval.Digest,
+					Reason:         fmt.Sprintf("Process approval required: %s", policyReason),
+					CreatedAt:      approval.CreatedAt,
+					ExpiresAt:      approval.ExpiresAt,
+				}, ErrApprovalRequired
+			}
+
+			// The human decision was recorded against this proposal. The authorization is consumed by
+			// the shared ProcessService gate, so the tool never authorizes execution itself.
+			spec.ApprovalToken = approvalToken
+
+			info, err := e.processSvc.ExecuteProcess(ctx, spec)
+			if err != nil {
+				return nil, nil, err
+			}
+			return map[string]any{
+				"process_id": info.ID,
+				"command":    info.Command,
+				"exit_code":  info.ExitCode,
+				"stdout":     info.Stdout,
+				"stderr":     info.Stderr,
+			}, nil, nil
+		}
+
+		// Non-Gradle commands keep the existing task-level approval behaviour.
 		if approvalToken == "" {
 			proposal, err := e.approvalMgr.CreateProposal(
 				taskID, workspaceID, toolName, "", "", "", "", cmdStr, cmdArgs,
@@ -254,12 +348,6 @@ func (e *AgentToolExecutor) ExecuteTool(
 			return nil, nil, err
 		}
 
-		spec := &domain.ProcessSpec{
-			WorkspaceID:    workspaceID,
-			Command:        cmdStr,
-			Args:           cmdArgs,
-			TimeoutSeconds: 30,
-		}
 		info, err := e.processSvc.ExecuteProcess(ctx, spec)
 		if err != nil {
 			return nil, nil, err

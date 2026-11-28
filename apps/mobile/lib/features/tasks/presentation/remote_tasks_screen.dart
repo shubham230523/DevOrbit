@@ -20,13 +20,81 @@ class _RemoteTasksScreenState extends State<RemoteTasksScreen> {
   final List<String> _logs = [];
   bool _isRunning = false;
   bool _autoScroll = true;
+
+  /// Guards against stale asynchronous completions overwriting a newer run's state.
+  int _runGeneration = 0;
+  String? _activeProcessId;
+  ProcessApprovalController? _activeController;
+  HostBridgeApiClient? _activeClient;
   final ScrollController _scrollController = ScrollController();
+
+  /// Cancels the operation the Stop button represents.
+  ///
+  /// If a process was started, cancellation is sent to the host and only reported as complete when the
+  /// host confirms it. If execution has not started yet, the pending approval is cancelled on the host
+  /// so it cannot be approved later. The UI never claims termination it has not confirmed.
+  Future<void> _stopTask() async {
+    final generation = _runGeneration;
+    final processId = _activeProcessId;
+    final controller = _activeController;
+    final client = _activeClient;
+
+    setState(() {
+      _logs.add('--- Cancellation requested ---');
+    });
+
+    if (processId != null && client != null) {
+      final confirmed = await client.cancelProcess(processId: processId);
+      if (!mounted || generation != _runGeneration) return;
+      setState(() {
+        _logs.add(confirmed
+            ? '--- Execution cancelled (confirmed by host) ---\n'
+            : '--- Cancellation not confirmed by the host; the process may still be running ---\n');
+        if (confirmed) {
+          _isRunning = false;
+          _activeProcessId = null;
+        }
+      });
+      _scrollToBottom();
+      return;
+    }
+
+    if (controller != null) {
+      await controller.cancel();
+      if (!mounted || generation != _runGeneration) return;
+      setState(() {
+        switch (controller.phase) {
+          case ProcessApprovalPhase.cancelled:
+            _logs.add('--- Approval cancelled on the host; nothing was executed. ---\n');
+            _isRunning = false;
+            break;
+          case ProcessApprovalPhase.failed:
+            _logs.add('--- ${controller.error ?? "Cancellation failed"} ---\n');
+            break;
+          default:
+            _logs.add('--- Cancellation requested; awaiting host confirmation ---');
+            break;
+        }
+      });
+      _scrollToBottom();
+      return;
+    }
+
+    setState(() {
+      _isRunning = false;
+      _logs.add('--- Nothing to cancel. ---\n');
+    });
+    _scrollToBottom();
+  }
 
   Future<void> _runTask(String taskName, String command, List<String> args) async {
     if (_isRunning) return;
 
+    final generation = ++_runGeneration;
+
     setState(() {
       _isRunning = true;
+      _activeProcessId = null;
       _logs.add('--- Executing Task: $taskName ($command ${args.join(" ")}) ---');
     });
     _scrollToBottom();
@@ -56,6 +124,8 @@ class _RemoteTasksScreenState extends State<RemoteTasksScreen> {
     // Commands that execute project-defined code (the Gradle family) require an explicit human
     // decision. Propose first: requesting an approval grants nothing on its own.
     final controller = ProcessApprovalController(HostBridgeProcessApprovalApi(client));
+    _activeController = controller;
+    _activeClient = client;
     await controller.propose(workspaceId: wsId, command: command, args: args);
 
     Map<String, dynamic>? res;
@@ -71,18 +141,19 @@ class _RemoteTasksScreenState extends State<RemoteTasksScreen> {
           if (controller.phase == ProcessApprovalPhase.approved) {
             await controller.executeApproved();
             res = controller.result;
+            _activeProcessId = res != null ? res['process_id'] as String? : null;
           }
         } else if (decision == _ApprovalDecision.reject) {
           await controller.reject();
         } else {
-          controller.cancel();
+          await controller.cancel();
         }
         break;
       default:
         break;
     }
 
-    if (!mounted) return;
+    if (!mounted || generation != _runGeneration) return;
 
     setState(() {
       _isRunning = false;
@@ -215,10 +286,7 @@ class _RemoteTasksScreenState extends State<RemoteTasksScreen> {
                 if (_isRunning)
                   OutlinedButton.icon(
                     onPressed: () {
-                      setState(() {
-                        _isRunning = false;
-                        _logs.add('--- Process Execution Stopped ---');
-                      });
+                      _stopTask();
                     },
                     icon: const Icon(Icons.stop, color: Colors.redAccent),
                     label: const Text('Stop', style: TextStyle(color: Colors.redAccent)),

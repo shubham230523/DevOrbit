@@ -52,6 +52,21 @@
 - ~~`git --ext-diff`/`--textconv`/`--no-index`/`--output` escaped the policy; `GIT_EXTERNAL_DIFF`,
   `GIT_PAGER`, `GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `GIT_TEMPLATE_DIR` were inherited~~ — **RESOLVED**.
 
+### Master Plan 26.3 (this session)
+
+- ~~The agent `execute_command` route authorized Gradle through the legacy `ApprovalManager`, and
+  `ProcessService` had no gate, so a valid legacy task token could authorize Gradle execution and any
+  future route bypassed the approval boundary~~ — **RESOLVED**: the gate now lives in
+  `ProcessService` (both routes), consumes via `ProcessApprovalStore.ConsumeAuthorization`, and the
+  agent tool no longer consults `ApprovalManager` for commands requiring approval. Regression tests
+  cover the legacy-token, missing-store, missing-owner, pending, replayed and rejected cases.
+- ~~Client-side cancellation abandoned the proposal only in local UI while the host proposal stayed
+  actionable until expiry~~ — **RESOLVED**: `POST /api/v1/processes/approvals/{id}/cancel` is
+  owner-bound and pending-only; the controller reports cancellation only when the host confirms it.
+- ~~The mobile Stop button only flipped a UI flag while the remote process kept running~~ —
+  **RESOLVED**: Stop calls the host process-cancel endpoint and reports termination only when the host
+  confirms it; stale async completions are discarded by a run-generation counter.
+
 ## 2. Active Blockers & Environment Limitations
 
 - **Docker daemon unavailable on the implementation host** — `docker version` fails with
@@ -84,6 +99,14 @@
   signed-request tests exercise the real middleware, including the self-approval regression.
 
 ## 3. Accepted Residual Risks (documented, not fixed)
+
+- **The agent task-detail UI does not yet perform the two-step Gradle approval.** The host contract is
+  complete and tested (proposal id + digest → decision → resume with the approval id), but the task
+  screen still assumes a single legacy approval token, so in-app approval of an AI-requested Gradle
+  command is not usable yet. This is the main outstanding item in the approval workstream.
+- **Process cancellation is confirmed by the host process runner, not by the OS reaping a tree.**
+  `ProcessRunner.CancelProcess` kills the started process and reports success; child processes that
+  detached from the started process are not guaranteed to be terminated.
 
 - **The host cannot prove a human rather than a compromised client performed the decision.** The host
   guarantees that execution requires a separate decision bound to the exact proposal it issued, made

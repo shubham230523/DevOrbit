@@ -17,12 +17,6 @@ import (
 // token stays usable.
 const processApprovalTTL = 10 * time.Minute
 
-// wipeApprovalToken clears the token from the spec so it cannot be logged, echoed, or inherited by
-// the child process environment.
-func wipeApprovalToken(spec *domain.ProcessSpec) {
-	spec.ApprovalToken = ""
-}
-
 // processApprovalStore lazily creates the store. A server without explicit configuration still
 // enforces approvals: the requirement is derived from the shared command policy, never from wiring.
 func (s *Server) processApprovalStore() *application.ProcessApprovalStore {
@@ -41,16 +35,30 @@ func (s *Server) SetProcessApprovalStore(store *application.ProcessApprovalStore
 	s.processApprovals = store
 }
 
-// consumeProcessApproval validates and consumes a single-use execution token issued by a human
-// approval decision. It revalidates the exact workspace, command and argument vector.
-func (s *Server) consumeProcessApproval(sessionID, deviceID string, spec *domain.ProcessSpec) error {
-	if strings.TrimSpace(spec.ApprovalToken) == "" {
-		return application.ErrApprovalRequirementMissing
+// isApprovalError reports whether err originates in the process approval boundary.
+func isApprovalError(err error) bool {
+	return errors.Is(err, application.ErrApprovalRequirementMissing) ||
+		errors.Is(err, application.ErrProcessApprovalNotFound) ||
+		errors.Is(err, application.ErrProcessApprovalNotPending) ||
+		errors.Is(err, application.ErrProcessApprovalNotApproved) ||
+		errors.Is(err, application.ErrProcessApprovalExpired) ||
+		errors.Is(err, application.ErrProcessApprovalOwner) ||
+		errors.Is(err, application.ErrProcessApprovalDigest) ||
+		errors.Is(err, application.ErrProcessApprovalScope) ||
+		errors.Is(err, application.ErrProcessApprovalToken)
+}
+
+// approvalErrorStatus maps an approval failure to its HTTP status. Everything defaults to 403: an
+// unknown approval error must never be reported as success.
+func approvalErrorStatus(err error) int {
+	switch {
+	case errors.Is(err, application.ErrProcessApprovalExpired):
+		return http.StatusGone
+	case errors.Is(err, application.ErrProcessApprovalNotPending):
+		return http.StatusConflict
+	default:
+		return http.StatusForbidden
 	}
-	_, err := s.processApprovalStore().Consume(
-		spec.ApprovalToken, sessionID, deviceID, spec.WorkspaceID, spec.Command, spec.Args,
-	)
-	return err
 }
 
 // approvalRejectionReason maps approval errors to stable, non-sensitive reason codes.
@@ -64,6 +72,8 @@ func approvalRejectionReason(err error) string {
 		return "proposal_not_found"
 	case errors.Is(err, application.ErrProcessApprovalNotPending):
 		return "proposal_already_decided"
+	case errors.Is(err, application.ErrProcessApprovalNotApproved):
+		return "proposal_pending"
 	case errors.Is(err, application.ErrProcessApprovalExpired):
 		return "proposal_expired"
 	case errors.Is(err, application.ErrProcessApprovalOwner):
@@ -81,23 +91,13 @@ func approvalRejectionReason(err error) string {
 
 // approvalStatus writes the fail-closed response for a rejected approval operation.
 func (s *Server) approvalStatus(w http.ResponseWriter, err error, command string, argCount int) {
-	status := http.StatusForbidden
-	switch {
-	case errors.Is(err, application.ErrProcessApprovalNotFound), errors.Is(err, application.ErrProcessApprovalToken):
-		status = http.StatusForbidden
-	case errors.Is(err, application.ErrProcessApprovalExpired):
-		status = http.StatusGone
-	case errors.Is(err, application.ErrProcessApprovalNotPending):
-		status = http.StatusConflict
-	}
-
 	s.securityEvent(observability.LevelWarn, EventProcessApprovalRejected, map[string]any{
 		"command":   command,
 		"arg_count": argCount,
 		"reason":    approvalRejectionReason(err),
 	})
 	s.incrementMetric("devorbit_process_approvals_rejected_total")
-	writeError(w, status, "approval_required: "+approvalRejectionReason(err))
+	writeError(w, approvalErrorStatus(err), "approval_required: "+approvalRejectionReason(err))
 }
 
 // HandleCreateProcessApproval records a PENDING approval request.
@@ -190,6 +190,10 @@ func (s *Server) HandleProcessApproval(w http.ResponseWriter, r *http.Request) {
 		s.handleDecideProcessApproval(w, r, authCtx, approvalID)
 		return
 	}
+	if len(parts) == 2 && parts[1] == "cancel" && r.Method == http.MethodPost {
+		s.handleCancelProcessApproval(w, authCtx, approvalID)
+		return
+	}
 	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 }
 
@@ -208,6 +212,28 @@ func (s *Server) handleGetProcessApproval(w http.ResponseWriter, authCtx *Authen
 		"reason":         approval.Reason,
 		"command_digest": approval.Digest,
 		"expires_at":     approval.ExpiresAt.Format(time.RFC3339),
+	})
+}
+
+// handleCancelProcessApproval abandons a pending proposal on the server. Without this, a client
+// "cancel" would only change its own UI while the host proposal stayed actionable until expiry.
+// Nothing is authorized by cancellation and no token is ever revealed.
+func (s *Server) handleCancelProcessApproval(w http.ResponseWriter, authCtx *AuthenticatedContext, approvalID string) {
+	approval, err := s.processApprovalStore().Cancel(approvalID, authCtx.SessionID, authCtx.DeviceID)
+	if err != nil {
+		s.approvalStatus(w, err, "", 0)
+		return
+	}
+
+	s.securityEvent(observability.LevelInfo, EventProcessApprovalCancelled, map[string]any{
+		"approval_id": approval.ID,
+		"command":     approval.Command,
+		"workspace":   approval.WorkspaceID,
+	})
+	s.incrementMetric("devorbit_process_approvals_cancelled_total")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"approval_id": approval.ID,
+		"state":       approval.State,
 	})
 }
 

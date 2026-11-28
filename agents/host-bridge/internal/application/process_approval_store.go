@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +19,9 @@ import (
 var (
 	ErrProcessApprovalNotFound   = errors.New("process approval error: unknown approval id")
 	ErrProcessApprovalNotPending = errors.New("process approval error: approval already decided")
+	// ErrProcessApprovalNotApproved means execution was attempted while the proposal is still pending,
+	// i.e. no human decision has been recorded yet.
+	ErrProcessApprovalNotApproved = errors.New("process approval error: proposal has not been approved")
 	ErrProcessApprovalExpired    = errors.New("process approval error: approval has expired")
 	ErrProcessApprovalOwner      = errors.New("process approval error: approval belongs to a different session or device")
 	ErrProcessApprovalDigest     = errors.New("process approval error: confirmation digest does not match the proposed command")
@@ -41,6 +45,9 @@ const (
 	ProcessApprovalExpired ProcessApprovalState = "expired"
 	// ProcessApprovalConsumed means the single authorized execution has been used.
 	ProcessApprovalConsumed ProcessApprovalState = "consumed"
+	// ProcessApprovalCancelled means the requester abandoned the proposal before a decision. A
+	// cancelled proposal can never be approved and can never execute.
+	ProcessApprovalCancelled ProcessApprovalState = "cancelled"
 )
 
 // ProcessApproval is a request to execute a command that runs project-defined code (the Gradle
@@ -244,6 +251,36 @@ func (s *ProcessApprovalStore) Decide(id, sessionID, deviceID, decision, digest 
 	}
 }
 
+// Cancel abandons a pending proposal on the server side, so the client no longer has to rely on the
+// proposal silently expiring. Only a pending proposal may be cancelled; a decision that already
+// happened is a terminal state and is reported as such.
+//
+// Repeated cancellation is deterministic: the second call reports the proposal as not pending rather
+// than changing anything. A cancel racing with a decision is resolved by the store mutex, so exactly
+// one terminal outcome wins.
+func (s *ProcessApprovalStore) Cancel(id, sessionID, deviceID string) (*ProcessApproval, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	approval, ok := s.approvals[id]
+	if !ok {
+		return nil, ErrProcessApprovalNotFound
+	}
+	if approval.OwnerSessionID != sessionID || approval.OwnerDeviceID != deviceID {
+		return nil, ErrProcessApprovalOwner
+	}
+	if s.expireLocked(approval, s.now()) {
+		return nil, ErrProcessApprovalExpired
+	}
+	if approval.State != ProcessApprovalPending {
+		return nil, ErrProcessApprovalNotPending
+	}
+
+	approval.State = ProcessApprovalCancelled
+	approval.DecidedAt = s.now()
+	return approval.Clone(), nil
+}
+
 // Consume validates and uses the single authorized execution. It revalidates the full binding
 // immediately before process launch and deletes the token so a replay cannot succeed.
 func (s *ProcessApprovalStore) Consume(token, sessionID, deviceID, workspaceID, command string, args []string) (*ProcessApproval, error) {
@@ -287,11 +324,65 @@ func (s *ProcessApprovalStore) Consume(token, sessionID, deviceID, workspaceID, 
 	return approval.Clone(), nil
 }
 
+// ConsumeAuthorization consumes an authorization presented by any route.
+//
+// Two identifiers can legitimately appear here and both mean the same thing — a recorded human
+// decision for this exact execution:
+//   - an execution token (`pexec-…`) issued to the deciding client;
+//   - an approval id (`pappr-…`) carried by the agent task flow, where the human decision was recorded
+//     against the proposal and the token never leaves the host.
+//
+// Dispatch lives here so that every route passes through one consumption point.
+func (s *ProcessApprovalStore) ConsumeAuthorization(authorization, sessionID, deviceID, workspaceID, command string, args []string) (*ProcessApproval, error) {
+	if strings.HasPrefix(authorization, "pappr-") {
+		return s.ConsumeByApprovalID(authorization, sessionID, deviceID, workspaceID, command, args)
+	}
+	return s.Consume(authorization, sessionID, deviceID, workspaceID, command, args)
+}
+
+// ConsumeByApprovalID consumes an approval that a human has already approved, addressed by its id.
+//
+// The agent task flow carries the approval id (the value the AI was given when the proposal was
+// created) rather than the execution token, so the token itself never travels through the agent.
+// Consumption still requires the store state to be approved — which only a human decision can
+// produce — and still revalidates the full execution scope.
+func (s *ProcessApprovalStore) ConsumeByApprovalID(id, sessionID, deviceID, workspaceID, command string, args []string) (*ProcessApproval, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	approval, ok := s.approvals[id]
+	if !ok {
+		return nil, ErrProcessApprovalNotFound
+	}
+	if approval.OwnerSessionID != sessionID || approval.OwnerDeviceID != deviceID {
+		return nil, ErrProcessApprovalOwner
+	}
+	if s.expireLocked(approval, s.now()) {
+		return nil, ErrProcessApprovalExpired
+	}
+	if approval.State == ProcessApprovalPending {
+		return nil, ErrProcessApprovalNotApproved
+	}
+	if approval.State != ProcessApprovalApproved || approval.Token == "" {
+		return nil, ErrProcessApprovalNotPending
+	}
+
+	expected := CanonicalCommandDigest(approval.WorkspaceID, approval.Command, approval.Args)
+	if approval.WorkspaceID != workspaceID || CanonicalCommandDigest(workspaceID, command, args) != expected {
+		return nil, ErrProcessApprovalScope
+	}
+
+	delete(s.byToken, approval.Token)
+	approval.Token = ""
+	approval.State = ProcessApprovalConsumed
+	return approval.Clone(), nil
+}
+
 // expireLocked marks a lapsed approval expired. It reports whether the approval is (now) unusable.
 func (s *ProcessApprovalStore) expireLocked(approval *ProcessApproval, now time.Time) bool {
-	if approval.State == ProcessApprovalConsumed {
-		return true
-	}
+	// Only time-based expiry is reported here. Terminal states (consumed, rejected, cancelled) are
+	// detected by each caller so the resulting error stays precise instead of being reported as
+	// "expired".
 	if now.After(approval.ExpiresAt) {
 		if approval.Token != "" {
 			delete(s.byToken, approval.Token)

@@ -113,9 +113,27 @@ Argument validation cannot make Gradle safe: **every** task, including `help`, e
 project-defined build scripts. Gradle is therefore a separate trust boundary and requires an explicit,
 auditable authorization in addition to session permission.
 
-**Agent path** (`execute_command` tool): unchanged and unconditional — the tool always returns an
-approval proposal and only executes after the proposal's single-use token is consumed by the host
-when the task is resumed from `/api/v1/agent/tasks/approve`. The AI never receives a token it can use.
+### One authoritative boundary (MP26.3)
+
+Both execution routes pass through the **same gate inside `ProcessService`**, which consumes the
+authorization immediately before launch. A route that omits the owner or the authorization fails
+closed. For commands that execute project-defined code:
+
+| Route | Authorization it presents | Delegated to |
+|---|---|---|
+| Direct HTTP (`/api/v1/processes/execute`) | `execution_token` (`pexec-…`) issued by the decision endpoint | `ProcessApprovalStore.Consume` |
+| Agent `execute_command` | approval id (`pappr-…`) whose proposal a human approved | `ProcessApprovalStore.ConsumeByApprovalID` |
+
+Dispatch happens inside the store (`ConsumeAuthorization`), so both forms mean exactly one thing: a
+recorded human decision for this exact execution. The **legacy task `ApprovalManager` is not an
+authorization route for Gradle**: the agent tool consults the process approval store only, and a test
+proves that a valid legacy token is rejected for a Gradle command. `ApprovalManager` continues to
+serve task-level approvals (file edits, and `git`/`adb` command approvals).
+
+**Agent path detail:** when the AI requests a Gradle command, the tool creates a *pending* process
+proposal and returns it (approval id + command digest, no token). The task pauses on
+`approval_required`. A human decision on `/api/v1/processes/approvals/{id}/decision` records consent;
+the task is then resumed with the approval id, which the gate consumes exactly once.
 
 **HTTP path** (`/api/v1/processes/execute`): Gradle requires an `execution_token` issued only by an
 explicit decision on a pending proposal.
@@ -183,6 +201,7 @@ The status representation never contains the execution token.
 |---|---|
 | Missing token on a Gradle execution | 403 `approval_required: approval_missing` |
 | Unknown/already-consumed/replayed token | 403 `approval_required: token_not_found_or_consumed` |
+| Proposal still pending (no human decision yet) | 403 `approval_required: proposal_pending` |
 | Proposal unknown | 403 `approval_required: proposal_not_found` |
 | Proposal already decided | 409 `approval_required: proposal_already_decided` |
 | Proposal expired | 410 `approval_required: proposal_expired` |
@@ -197,6 +216,35 @@ Bound to the requesting **session and device**, the **workspace**, the **exact c
 vector**; single-use; expires after 10 minutes (same window as the proposal); constant-time compared;
 removed from the request before the process starts, so it is never logged, echoed, or inherited by the
 child process.
+
+### Cancellation
+
+```http
+POST /api/v1/processes/approvals/{approval_id}/cancel
+200 {"approval_id": "…", "state": "cancelled"}
+```
+
+Authenticated, owner-bound (session + device), and only valid while the proposal is pending. A
+cancelled proposal can never be approved (409) and can never execute; repeated cancellation returns
+409 deterministically. A cancel racing with a decision is serialized by the store mutex, so exactly
+one terminal outcome wins. Cancellation never reveals an execution token.
+
+If the client cannot confirm the response, it must **not** report the proposal as cancelled: the
+mobile controller moves to `failed` with an explicit message, and the host proposal simply expires.
+
+### Stop contract
+
+The Stop action distinguishes three cases and never claims more than the host confirmed:
+
+1. **Process already started** → `POST /api/v1/processes/{process_id}/cancel`; the UI reports
+   "cancelled (confirmed by host)" only on a 200 carrying `status: cancelled`, otherwise
+   "cancellation not confirmed; the process may still be running".
+2. **Approval pending** → the approval is cancelled on the host (above) and the UI reports
+   "approval cancelled on the host; nothing was executed".
+3. **Nothing active** → "nothing to cancel".
+
+A run generation counter ensures a late response from an older run cannot overwrite the state of a
+newer one.
 
 ### Mobile flow
 

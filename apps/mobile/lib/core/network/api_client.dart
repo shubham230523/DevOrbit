@@ -32,6 +32,10 @@ class HostBridgeProcessApprovalApi implements ProcessApprovalApi {
       );
 
   @override
+  Future<bool> cancelProcessApproval({required String approvalId}) =>
+      _client.cancelProcessApproval(approvalId: approvalId);
+
+  @override
   Future<ProcessExecutionResult> executeProcess({
     required String workspaceId,
     required String command,
@@ -333,6 +337,46 @@ class HostBridgeApiClient {
       );
     } catch (e) {
       return ProcessApprovalDecisionResult(statusCode: 0, error: e.toString());
+    }
+  }
+
+  /// Cancels a pending approval on the host. Returns true only when the host confirms the proposal is
+  /// no longer actionable, so the UI never claims a cancellation that did not happen.
+  Future<bool> cancelProcessApproval({required String approvalId}) async {
+    try {
+      final res = await _sendProtected(
+        method: 'POST',
+        path: '/api/v1/processes/approvals/$approvalId/cancel',
+        body: '{}',
+        timeout: const Duration(seconds: 10),
+      );
+      if (res.statusCode != 200) return false;
+      final body = jsonDecode(res.body);
+      return body is Map<String, dynamic> && body['state'] == 'cancelled';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Requests cancellation of a running host process. Returns true only when the host reports the
+  /// process as cancelled; a local UI change must never be presented as process termination.
+  Future<bool> cancelProcess({required String processId}) async {
+    try {
+      final res = await _sendProtected(
+        method: 'POST',
+        path: '/api/v1/processes/$processId/cancel',
+        body: '{}',
+        timeout: const Duration(seconds: 10),
+      );
+      if (res.statusCode != 200) return false;
+      final body = jsonDecode(res.body);
+      if (body is Map<String, dynamic>) {
+        final status = body['status'];
+        if (status is String) return status == 'cancelled';
+      }
+      return false;
+    } catch (_) {
+      return false;
     }
   }
 

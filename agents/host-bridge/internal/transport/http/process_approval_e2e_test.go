@@ -34,6 +34,12 @@ type approvalE2E struct {
 func newApprovalE2E(t *testing.T) *approvalE2E {
 	t.Helper()
 	env := newSecTestEnv(t)
+
+	// Production wiring: one authoritative store shared by the HTTP layer and the ProcessService gate.
+	store := application.NewProcessApprovalStore(10 * time.Minute)
+	env.server.SetProcessApprovalStore(store)
+	env.procSvc.SetProcessApprovalStore(store)
+
 	creds := env.registerSession("sess-approval-e2e", "dev-approval-e2e", "token-approval-e2e-0123456789",
 		"master-secret-approval-e2e-0123456789", time.Hour, security.NewFullSessionPermissions())
 
@@ -373,8 +379,10 @@ func TestApprovalE2E_DifferentSessionCannotDecideOrConsume(t *testing.T) {
 
 func TestApprovalE2E_ExpiredApprovalIsRejected(t *testing.T) {
 	e := newApprovalE2E(t)
-	// Inject a store whose proposals lapse immediately.
-	e.env.server.SetProcessApprovalStore(application.NewProcessApprovalStore(time.Millisecond))
+	// Inject a store whose proposals lapse immediately (wired to both layers, as in production).
+	expiring := application.NewProcessApprovalStore(time.Millisecond)
+	e.env.server.SetProcessApprovalStore(expiring)
+	e.env.procSvc.SetProcessApprovalStore(expiring)
 
 	command := gradleCommand()
 	proposal := e.requestApproval(command, []string{"build"})
@@ -478,6 +486,50 @@ func TestApprovalE2E_ConcurrentDuplicateExecutionRunsOnce(t *testing.T) {
 	}
 	if got := atomic.LoadInt64(&successes); got != 1 {
 		t.Fatalf("expected exactly one successful execution, got %d (statuses: %v)", got, statuses)
+	}
+}
+
+// TestApprovalE2E_MissingApprovalStoreFailsClosed proves the gate refuses rather than falling back to
+// "no approval required" when the approval infrastructure is not wired.
+func TestApprovalE2E_MissingApprovalStoreFailsClosed(t *testing.T) {
+	e := newApprovalE2E(t)
+	e.env.procSvc.SetProcessApprovalStore(nil)
+
+	status, raw := e.execute(gradleCommand(), []string{"build"}, "pexec-anything")
+	if status != http.StatusForbidden || !strings.Contains(raw, "approval_required") {
+		t.Fatalf("expected fail-closed rejection without an approval store, got %d (%s)", status, raw)
+	}
+}
+
+// TestApprovalE2E_ServerSideCancellation proves a cancelled proposal cannot be approved or executed,
+// so a client "cancel" has real server-side effect instead of only changing local UI.
+func TestApprovalE2E_ServerSideCancellation(t *testing.T) {
+	e := newApprovalE2E(t)
+	proposal := e.requestApproval(gradleCommand(), []string{"build"})
+	approvalID, _ := proposal["approval_id"].(string)
+	digest, _ := proposal["command_digest"].(string)
+
+	status, raw := e.do(http.MethodPost, "/api/v1/processes/approvals/"+approvalID+"/cancel", nil)
+	if status != http.StatusOK {
+		t.Fatalf("expected 200 from cancellation, got %d (%s)", status, raw)
+	}
+	if state := decodeJSON(t, raw)["state"]; state != string(application.ProcessApprovalCancelled) {
+		t.Fatalf("expected cancelled state, got %v", state)
+	}
+
+	// A cancelled proposal cannot be approved afterwards.
+	if status, raw := e.decide(approvalID, "approve", digest); status != http.StatusConflict {
+		t.Fatalf("expected 409 when approving a cancelled proposal, got %d (%s)", status, raw)
+	}
+
+	// Repeated cancellation is deterministic.
+	if status, raw := e.do(http.MethodPost, "/api/v1/processes/approvals/"+approvalID+"/cancel", nil); status != http.StatusConflict {
+		t.Fatalf("expected 409 on repeated cancellation, got %d (%s)", status, raw)
+	}
+
+	// And nothing can execute.
+	if status, raw := e.execute(gradleCommand(), []string{"build"}, ""); status != http.StatusForbidden {
+		t.Fatalf("expected execution to be blocked after cancellation, got %d (%s)", status, raw)
 	}
 }
 

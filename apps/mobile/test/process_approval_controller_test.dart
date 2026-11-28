@@ -10,6 +10,8 @@ class _FakeApi implements ProcessApprovalApi {
     this.executeStatusCode = 200,
     this.throwOnRequest = false,
     this.throwOnDecision = false,
+    this.throwOnCancel = false,
+    this.cancelConfirmed = true,
     this.expiresIn = const Duration(minutes: 10),
   });
 
@@ -19,7 +21,10 @@ class _FakeApi implements ProcessApprovalApi {
   int executeStatusCode;
   bool throwOnRequest;
   bool throwOnDecision;
+  bool throwOnCancel;
+  bool cancelConfirmed;
   Duration expiresIn;
+  int cancelCalls = 0;
 
   int requestCalls = 0;
   int decisionCalls = 0;
@@ -78,6 +83,13 @@ class _FakeApi implements ProcessApprovalApi {
       state: 'approved',
       executionToken: decisionToken,
     );
+  }
+
+  @override
+  Future<bool> cancelProcessApproval({required String approvalId}) async {
+    cancelCalls++;
+    if (throwOnCancel) throw Exception('socket closed');
+    return cancelConfirmed;
   }
 
   @override
@@ -173,18 +185,55 @@ void main() {
       expect(api.executeCalls, 0);
     });
 
-    test('cancel is local and never authorizes anything', () async {
+    test('cancel is confirmed by the host and authorizes nothing', () async {
       final api = _FakeApi();
       final controller = ProcessApprovalController(api);
 
       await controller.propose(workspaceId: '/ws', command: './gradlew', args: ['build']);
-      controller.cancel();
+      await controller.cancel();
 
+      expect(api.cancelCalls, 1);
       expect(controller.phase, ProcessApprovalPhase.cancelled);
       expect(api.decisionCalls, 0);
 
       await controller.executeApproved();
       expect(api.executeCalls, 0);
+    });
+
+    test('cancel that the host does not confirm is not reported as cancelled', () async {
+      final api = _FakeApi(cancelConfirmed: false);
+      final controller = ProcessApprovalController(api);
+
+      await controller.propose(workspaceId: '/ws', command: './gradlew', args: ['build']);
+      await controller.cancel();
+
+      expect(controller.phase, ProcessApprovalPhase.failed);
+      expect(controller.hasExecutionToken, isFalse);
+      expect(controller.error, isNotNull);
+    });
+
+    test('network failure during cancel does not claim cancellation', () async {
+      final api = _FakeApi(throwOnCancel: true);
+      final controller = ProcessApprovalController(api);
+
+      await controller.propose(workspaceId: '/ws', command: './gradlew', args: ['build']);
+      await controller.cancel();
+
+      expect(controller.phase, ProcessApprovalPhase.failed);
+      expect(api.executeCalls, 0);
+    });
+
+    test('a decision in flight blocks cancellation', () async {
+      final api = _FakeApi();
+      final controller = ProcessApprovalController(api);
+
+      await controller.propose(workspaceId: '/ws', command: './gradlew', args: ['build']);
+      await controller.approve();
+
+      // The proposal is already approved, so cancellation is refused locally.
+      await controller.cancel();
+      expect(api.cancelCalls, 0);
+      expect(controller.phase, ProcessApprovalPhase.approved);
     });
 
     test('duplicate approve taps produce a single decision request', () async {
