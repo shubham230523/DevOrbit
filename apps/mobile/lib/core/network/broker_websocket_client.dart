@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import '../security/e2e_session.dart';
@@ -57,6 +58,20 @@ class BrokerWebSocketClient {
   final String masterSecret;
   final Duration readinessTimeout;
 
+  /// When false, this client never schedules its own reconnect attempts; an external
+  /// supervisor (ConnectionManager) owns backoff/retry policy. Defaults to true so the
+  /// single-client behaviour used by existing integrations is unchanged.
+  final bool autoReconnect;
+
+  /// Maximum backoff between self-scheduled reconnect attempts.
+  final Duration maxBackoff;
+
+  /// Base backoff used for the first self-scheduled reconnect attempt.
+  final Duration baseBackoff;
+
+  /// Fraction (0..1) of the computed backoff that is randomised to prevent thundering herds.
+  final double jitterRatio;
+
   WebSocketChannel? _channel;
   StreamSubscription? _channelSubscription;
   FlutterE2ESession? _e2eSession;
@@ -67,10 +82,15 @@ class BrokerWebSocketClient {
 
   bool _isReconnecting = false;
   bool _manuallyDisconnected = false;
+  bool _connectInFlight = false;
   Timer? _reconnectTimer;
   Timer? _readinessTimer;
   int _reconnectAttempts = 0;
-  static const int _maxBackoffSeconds = 30;
+
+  /// Monotonic epoch guarding against stale asynchronous events (late frames, onDone, or
+  /// reconnect timers belonging to a superseded socket) mutating newer connection state.
+  int _generation = 0;
+  final Random _random;
 
   BrokerConnectionState get state => _state;
   Stream<BrokerConnectionState> get stateStream => _stateController.stream;
@@ -83,7 +103,42 @@ class BrokerWebSocketClient {
     required this.token,
     required this.masterSecret,
     this.readinessTimeout = const Duration(seconds: 30),
-  });
+    this.autoReconnect = true,
+    this.maxBackoff = const Duration(seconds: 30),
+    this.baseBackoff = const Duration(seconds: 1),
+    this.jitterRatio = 0.5,
+    Random? random,
+  }) : _random = random ?? Random.secure();
+
+  /// True once the broker has revoked or expired this session. Such a client never
+  /// reconnects; credentials must be re-paired (see [resetTerminalState]).
+  bool get isTerminal =>
+      _state == BrokerConnectionState.revoked || _state == BrokerConnectionState.sessionExpired;
+
+  /// Computes the bounded exponential backoff delay for [attempt] (0-based) with full jitter.
+  Duration computeBackoffDelay(int attempt) {
+    final cappedAttempt = attempt < 0 ? 0 : attempt;
+    var millis = baseBackoff.inMilliseconds * (1 << (cappedAttempt > 16 ? 16 : cappedAttempt));
+    final maxMillis = maxBackoff.inMilliseconds;
+    if (millis > maxMillis) {
+      millis = maxMillis;
+    }
+    if (jitterRatio > 0) {
+      final spread = (millis * jitterRatio.clamp(0.0, 1.0)).round();
+      if (spread > 0) {
+        millis -= _random.nextInt(spread + 1);
+      }
+    }
+    return Duration(milliseconds: millis < 0 ? 0 : millis);
+  }
+
+  /// Clears a terminal (revoked/expired) state so a freshly re-paired session can connect.
+  void resetTerminalState() {
+    if (isTerminal) {
+      _state = BrokerConnectionState.disconnected;
+      _reconnectAttempts = 0;
+    }
+  }
 
   void _updateState(BrokerConnectionState newState) {
     if (_state != newState && !_stateController.isClosed) {
@@ -93,7 +148,17 @@ class BrokerWebSocketClient {
   }
 
   Future<void> connect() async {
+    // Terminal sessions (revoked/expired) must never silently reconnect.
+    if (isTerminal) {
+      return;
+    }
+    // Prevent duplicate/overlapping connection attempts (duplicate sockets).
+    if (_connectInFlight) {
+      return;
+    }
+    _connectInFlight = true;
     _manuallyDisconnected = false;
+    final generation = ++_generation;
     _updateState(BrokerConnectionState.connecting);
 
     try {
@@ -102,6 +167,7 @@ class BrokerWebSocketClient {
         deviceId: deviceId,
         masterSecret: masterSecret,
       );
+      if (generation != _generation) return;
 
       final baseUri = Uri.parse(brokerUrl);
       if (baseUri.scheme.toLowerCase() != 'ws' && baseUri.scheme.toLowerCase() != 'wss') {
@@ -114,6 +180,7 @@ class BrokerWebSocketClient {
 
       await _channelSubscription?.cancel();
       _channel?.sink.close();
+      if (generation != _generation) return;
 
       _channel = IOWebSocketChannel.connect(
         wsUri,
@@ -122,6 +189,7 @@ class BrokerWebSocketClient {
         },
       );
       await _channel!.ready;
+      if (generation != _generation) return;
 
       _updateState(BrokerConnectionState.transportConnected);
       _updateState(BrokerConnectionState.authenticating);
@@ -129,6 +197,7 @@ class BrokerWebSocketClient {
       // Start readiness timer: if no session_ready or session_pending arrives in time, fail
       _readinessTimer?.cancel();
       _readinessTimer = Timer(readinessTimeout, () {
+        if (generation != _generation) return;
         if (_state == BrokerConnectionState.authenticating) {
           _updateState(BrokerConnectionState.connectionFailed);
           _failPendingRequests(TimeoutException('Readiness handshake timed out waiting for broker response'));
@@ -139,6 +208,7 @@ class BrokerWebSocketClient {
 
       _channelSubscription = _channel!.stream.listen(
         (data) async {
+          if (generation != _generation) return;
           try {
             final jsonMap = jsonDecode(data.toString()) as Map<String, dynamic>;
             final frameType = jsonMap['type'];
@@ -217,38 +287,59 @@ class BrokerWebSocketClient {
           } catch (_) {}
         },
         onError: (error) {
+          if (generation != _generation) return;
           _readinessTimer?.cancel();
-          if (_state != BrokerConnectionState.revoked && _state != BrokerConnectionState.sessionExpired) {
+          if (!isTerminal) {
             _failPendingRequests(Exception('WebSocket error: $error'));
-            _scheduleReconnect();
+            if (autoReconnect) {
+              _scheduleReconnect();
+            } else {
+              // No self-scheduled retry: report the failure so an external supervisor
+              // (ConnectionManager) can decide how and when to reconnect.
+              _updateState(BrokerConnectionState.connectionFailed);
+            }
           }
         },
         onDone: () {
+          if (generation != _generation) return;
           _readinessTimer?.cancel();
-          if (_state != BrokerConnectionState.revoked && _state != BrokerConnectionState.sessionExpired) {
+          if (!isTerminal) {
             _failPendingRequests(Exception('WebSocket connection closed'));
-            if (!_manuallyDisconnected) {
+            if (_manuallyDisconnected) {
+              _updateState(BrokerConnectionState.disconnected);
+            } else if (autoReconnect) {
               _scheduleReconnect();
             } else {
-              _updateState(BrokerConnectionState.disconnected);
+              // Unexpected closure (broker restart / network drop). Surface it so the
+              // supervisor observes the loss instead of silently staying "connected".
+              _updateState(BrokerConnectionState.connectionFailed);
             }
           }
         },
       );
     } catch (e) {
+      if (generation != _generation) return;
       _readinessTimer?.cancel();
-      _updateState(BrokerConnectionState.authFailed);
-      _failPendingRequests(Exception('Authentication failed: $e'));
+      // A malformed/unsupported broker URL is a configuration defect, not an authentication
+      // rejection; keep the two distinguishable for operators and supervisors.
+      final isConfigError = e is ArgumentError || e is FormatException;
+      _updateState(isConfigError
+          ? BrokerConnectionState.connectionFailed
+          : BrokerConnectionState.authFailed);
+      _failPendingRequests(Exception(isConfigError
+          ? 'Invalid broker configuration: $e'
+          : 'Authentication failed: $e'));
       if (!_manuallyDisconnected) {
         _scheduleReconnect();
       }
+    } finally {
+      _connectInFlight = false;
     }
   }
 
   void _scheduleReconnect() {
-    if (_manuallyDisconnected ||
-        _state == BrokerConnectionState.revoked ||
-        _state == BrokerConnectionState.sessionExpired) {
+    if (!autoReconnect) return;
+    if (_manuallyDisconnected || isTerminal) {
       return;
     }
     if (_isReconnecting) return;
@@ -256,18 +347,15 @@ class BrokerWebSocketClient {
 
     _updateState(BrokerConnectionState.reconnecting);
 
-    int delaySeconds = 1 << _reconnectAttempts;
-    if (delaySeconds > _maxBackoffSeconds) {
-      delaySeconds = _maxBackoffSeconds;
-    }
+    final delay = computeBackoffDelay(_reconnectAttempts);
     _reconnectAttempts++;
+    final generation = _generation;
 
     _reconnectTimer?.cancel();
-    _reconnectTimer = Timer(Duration(seconds: delaySeconds), () async {
+    _reconnectTimer = Timer(delay, () async {
+      if (generation != _generation) return;
       _isReconnecting = false;
-      if (_manuallyDisconnected ||
-          _state == BrokerConnectionState.revoked ||
-          _state == BrokerConnectionState.sessionExpired) {
+      if (_manuallyDisconnected || isTerminal) {
         return;
       }
       try {
@@ -377,20 +465,30 @@ class BrokerWebSocketClient {
 
   void disconnect() {
     _manuallyDisconnected = true;
+    // Invalidate every in-flight asynchronous event belonging to the closed socket so a late
+    // frame or onDone callback cannot resurrect a connection the caller just discarded.
+    _generation++;
     _cancelReconnect();
     _readinessTimer?.cancel();
     _channelSubscription?.cancel();
+    _channelSubscription = null;
     _channel?.sink.close();
     _channel = null;
-    _updateState(BrokerConnectionState.disconnected);
+    // A revoked/expired session must stay terminal; an ordinary disconnect must never be able
+    // to mask or downgrade a revocation signal.
+    if (!isTerminal) {
+      _updateState(BrokerConnectionState.disconnected);
+    }
     _failPendingRequests(Exception('Client disconnected'));
   }
 
   void dispose() {
     _manuallyDisconnected = true;
+    _generation++;
     _cancelReconnect();
     _readinessTimer?.cancel();
     _channelSubscription?.cancel();
+    _channelSubscription = null;
     _channel?.sink.close();
     _stateController.close();
     for (final completer in _pendingRequests.values) {

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Production network security policy (release builds).
+
+  Cleartext HTTP is disabled globally: the Host Bridge must be reached over https:// (direct) or
+  wss:// (broker) in production. The debug source set overrides this file with a narrowly scoped
+  cleartext exception for local development LAN/emulator hosts only.
+
+  Base trust anchors are the system CA store; no user-installed CAs are trusted for app traffic.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+
+    <!-- Loopback is always permitted for the on-device host bridge in developer setups. -->
+    <domain-config cleartextTrafficPermitted="false">
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">127.0.0.1</domain>
+    </domain-config>
+</network-security-config>

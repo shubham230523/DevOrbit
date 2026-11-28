@@ -4,29 +4,34 @@
 **Repository:** `https://github.com/shubham230523/DevOrbit`
 **Feature Branch:** `security/atomic-agent-task-execution`
 **Target Remote Branch:** `quality/autonomous-15min-improvement`
-**Verified Starting HEAD (this session):** `2425cc838c64e7e1e28c67e33c1636d45e5889d7`
-**MP24.1 Code + Test Commit:** `76ca2286523b1978acec1e64723d74ec64cddf2d`
-**Historical Checkpoints:** MP23 (`efee2c99e16427223c803b89460dbe61fd151064`), MP24 initial (`7ba545da10f4ec61bf180c70c60960a3af03e5d4`), MP0 (`7aed09683a829f83dd3a6f04cfbba0f6e376bc31`), MP0.1 (`be4ec8aa93cdfb8463f393f9f5d1ee0d457ef60d`), MP24 closure (`2425cc838c64e7e1e28c67e33c1636d45e5889d7`)
+**Verified Starting HEAD (MP25 M1):** `6e93ea43d815182bddcc6497df90c16f8aebcbda`
+**Historical Checkpoints:** MP23 `efee2c9`, MP24 initial `7ba545d`, MP0 `7aed096`, MP0.1 `be4ec8a`, MP24 closure `2425cc8`, MP24.1 `76ca228`
 
 ## 1. Current Plan & Phase
 
-- **Master Plan 0 / 0.1:** `COMPLETED`.
-- **Master Plan 24 (Criteria A–H):** `IMPLEMENTED`, `TESTED`, `REVIEWED`, `COMMITTED`, `PUSHED`, `REMOTE-VERIFIED` at `2425cc8`.
-- **Master Plan 24.1 (revocation durability, Windows secret deletion, rollback errors, broker revocation propagation):** `IMPLEMENTED`, `TESTED`, `REVIEWED`, `COMMITTED` in `76ca228`. Push + remote verification is the only remaining step of the plan.
-- **Master Plan 24 Criterion I (`PRODUCTION-VALIDATED`):** `BLOCKED` — no Caddy/Nginx, no CA-trusted certificate, no attached physical Android/iOS device on this host.
+- **Master Plan 25 assessment:** `COMPLETED` (read-only, 17 parts, gap matrix G-01…G-41).
+- **Master Plan 25 · M1** (verification closure, release-build integrity, store-critical platform config): **repository scope `IMPLEMENTED` + `TESTED`; external evidence `BLOCKED`. Verdict: M1 PARTIALLY COMPLETE.**
+- **M2–M6:** not started (hardening/observability, execution completeness, identity/persistence/compliance, scale, distribution).
 
 ## 2. Last Completed Action
 
-- Reconciled the 10 uncommitted files of unfinished MP24.1 work found at session start, corrected them, then closed the remaining gaps: durable/idempotent revocation for sessions absent from memory, persisted-state preservation in `saveLocked`, persisted-secret destruction, external-file DPAPI secret storage with real `Delete()`, full rollback error propagation, broker revocation error propagation, and complete broker session-only revocation (`Broker.RevokeSession`).
-- Added 8 regression test groups (see `EXECUTION_LOG.md` Entry 6) and verified: `go vet` + `go test` in all 5 Go modules, `linux/amd64` + `windows/amd64` cross-builds, native Windows DPAPI tests, `flutter analyze`, and `flutter test` (37/37).
-- `go test -race ./internal/security/...` remains `BLOCKED` on this host (32-bit-only MinGW: `cc1.exe: sorry, unimplemented: 64-bit mode not compiled in`).
+Implemented MP25 M1 Tasks A–F:
+
+1. **A — Connectivity truthfulness:** `ConnectionManager` rewritten as a real supervisor over `BrokerWebSocketClient` (transport-derived status, terminal revocation, duplicate-connect prevention, generation guards, jittered bounded backoff, network-path switch). Transport hardened (`autoReconnect`, jitter, generation guards, config-vs-auth error classification, closure surfacing). Dashboard bound to the supervised state. **12 new tests against real loopback WebSocket servers.**
+2. **B — Android release integrity:** credential-driven signing (env vars or git-ignored `key.properties`), **release refuses to build without credentials** (verified), `android:label="DevOrbit"`, `allowBackup=false` + exclusion rules, network security config (release cleartext off, debug-only LAN exception), camera feature optional, `minSdk ≥ 24`, `KEYSTORE_SETUP.md` + `key.properties.example` + ProGuard rules.
+3. **C — iOS:** `NSLocalNetworkUsageDescription`, ATS restricted to `NSAllowsLocalNetworking`, expanded camera rationale, `IOS_STORE_READINESS.md`.
+4. **D — CI:** rewritten workflow (correct triggers, `vet`+`test` matrix, **`-race` with CGO on ubuntu-latest**, cross-builds, Flutter analyze/test, Android debug build + artifact, gated signed release with debug-key rejection, gitleaks, govulncheck, least privilege).
+5. **E — TLS prerequisites:** `Caddyfile`, `env.example`, deployment README, `docs/testing/LIVE_TLS_VALIDATION_PROCEDURE.md`.
+6. **F — Hygiene/continuity:** confirmed no tracked binaries/secrets; removed empty local `tests/` dir; continuity docs updated.
+
+Verification: 5/5 Go modules `vet`+`test` PASS; linux/windows cross-builds PASS; `flutter analyze` clean; `flutter test` **49/49**; Android debug APK built; release refused without creds; release built with an ephemeral (deleted) keystore.
 
 ## 3. Exact Next Action
 
 ```bash
 git status --short --branch
 git push origin security/atomic-agent-task-execution
-git push origin security/atomic-agent-task-execution:quality/autonomous-15min-improvement
+git push origin HEAD:quality/autonomous-15min-improvement
 git rev-parse HEAD
 git ls-remote origin \
   refs/heads/security/atomic-agent-task-execution \
@@ -34,46 +39,53 @@ git ls-remote origin \
   refs/heads/main
 ```
 
-Confirm both engineering branches point at the same `HEAD` and that `refs/heads/main` is still `c49804547aef7dc1100b8b444ee32695f353e7e6`, then append the observed SHAs as `EXECUTION_LOG.md` Entry 7.
+Confirm both engineering heads equal `HEAD` and `refs/heads/main` is still
+`c49804547aef7dc1100b8b444ee32695f353e7e6`; append the observed SHAs as `EXECUTION_LOG.md` Entry 9.
+If `ls-remote` fails for network reasons, record **BLOCKED** — never substitute remote-tracking refs.
+
+Then: configure the 4 Android signing secrets, run `docs/testing/LIVE_TLS_VALIDATION_PROCEDURE.md`, and
+run `flutter build ios --release --no-codesign` on macOS.
 
 ## 4. What Must NOT Be Repeated
 
-- **Do NOT** re-audit Master Plan 23 (`efee2c9`) or re-implement Master Plan 24 fixes (`7ba545d`, `2425cc8`) without concrete regression evidence.
-- **Do NOT** re-implement the MP24.1 fixes already in `76ca228`.
-- **Do NOT** weaken `SessionStore` / `BrokerClient` fail-closed persistence (never persist plaintext `session_secret`, never escalate `nil`/empty permissions, never report durable revocation without a persisted tombstone), re-enable `http://` fallbacks for `https://` pairing URLs, or drop persisted-only session entries in `saveLocked`.
-- **Do NOT** change `BrokerClient.RevokeBrokerSession`/`RevokeBrokerDevice` to call back into `SessionStore` (recursive/duplicate revocation).
+- **Do NOT** re-audit MP23/24/24.1/25 or re-implement their fixes without regression evidence.
+- **Do NOT** reintroduce a simulated/local connection state: `isTransportAuthenticated` must only be
+  true after a broker `session_ready`/`auth_ack`.
+- **Do NOT** make release signing fall back to the debug keystore, or commit `key.properties`, `*.jks`,
+  `*.keystore`, keystore passwords, or CI secrets.
+- **Do NOT** add `NSAllowsArbitraryLoads`, `POST_NOTIFICATIONS` without a notification implementation,
+  or `UIBackgroundModes` without real background support.
+- **Do NOT** weaken fail-closed persistence, E2E encryption, pairing proof verification, or broker
+  header-only authentication.
 - **Do NOT** modify `main` or force-push any branch.
-- **Do NOT** claim MP24 closure or production readiness on automated tests alone — Criterion I is still `BLOCKED`.
 
 ## 5. Relevant Files
 
-- `agents/host-bridge/internal/security/session_store.go`, `session_store_test.go`
-- `agents/host-bridge/internal/security/secret_store.go`, `secret_store_windows.go`, `secret_store_windows_test.go`, `secret_store_linux.go`, `secret_store_other.go`
-- `agents/host-bridge/internal/transport/broker_client.go`, `broker_client_test.go`, `broker_authorizer.go`
-- `agents/host-bridge/internal/transport/http/handlers.go`, `pairing_handlers.go`, `pairing_transport_security_test.go`
-- `agents/host-bridge/cmd/host-bridge/main.go`
-- `services/connection-broker/internal/broker/broker.go`, `broker_test.go`
-- `apps/mobile/lib/core/pairing/pairing_client.dart`, `apps/mobile/test/*` (unchanged in MP24.1)
+- Mobile: `apps/mobile/lib/core/network/{connection_manager,broker_websocket_client}.dart`,
+  `apps/mobile/lib/features/dashboard/presentation/dashboard_screen.dart`,
+  `apps/mobile/test/connection_manager_test.dart`,
+  `apps/mobile/android/app/build.gradle.kts`, `apps/mobile/android/app/src/main/AndroidManifest.xml`,
+  `apps/mobile/android/app/src/{main,debug}/res/xml/*`, `apps/mobile/android/KEYSTORE_SETUP.md`,
+  `apps/mobile/ios/Runner/Info.plist`, `apps/mobile/ios/IOS_STORE_READINESS.md`
+- CI/deploy: `.github/workflows/ci.yml`, `infrastructure/deployment/{Caddyfile,env.example,README.md}`,
+  `docs/testing/LIVE_TLS_VALIDATION_PROCEDURE.md`
+- Host/broker (unchanged in M1, must not regress): `agents/host-bridge/internal/{security,transport}`,
+  `services/connection-broker/internal/broker`
 
 ## 6. Verification Commands
 
 ```bash
-# Go modules
-(cd agents/host-bridge && go vet ./... && go test -count=1 -timeout=180s ./...)
-(cd services/connection-broker && go vet ./... && go test -count=1 -timeout=120s ./...)
-(cd services/control-plane && go vet ./... && go test -count=1 -timeout=120s ./...)
-(cd agents/ai-router && go vet ./... && go test -count=1 -timeout=120s ./...)
-(cd agents/acp-adapter && go vet ./... && go test -count=1 -timeout=120s ./...)
+for m in agents/host-bridge agents/ai-router agents/acp-adapter services/connection-broker services/control-plane; do
+  (cd "$m" && go vet ./... && go test -count=1 -timeout=180s ./...)
+done
 
-# Race detector (BLOCKED on this Windows host; run in Linux CI)
-(cd agents/host-bridge && go test -race -count=1 -timeout=300s ./internal/security/...)
+(cd agents/host-bridge && GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./... && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build ./...)
 
-# Windows DPAPI behavior (must execute on Windows, not cross-built)
-(cd agents/host-bridge && go test -run TestWindowsDPAPI -v ./internal/security/)
+(cd apps/mobile && flutter pub get && flutter analyze && flutter test)
 
-# Cross-builds
-(cd agents/host-bridge && GOOS=linux GOARCH=amd64 go build ./... && GOOS=windows GOARCH=amd64 go build ./...)
+# Local Android builds on this Windows host require:
+#   Remove-Item Env:ANDROID_PREFS_ROOT; Remove-Item Env:ANDROID_USER_HOME
+(cd apps/mobile && flutter build apk --debug)
 
-# Mobile
-(cd apps/mobile && flutter analyze && flutter test)
+# Race detector: BLOCKED locally (32-bit MinGW); CI job runs it on ubuntu-latest.
 ```

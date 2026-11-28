@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 11 and below (android:fullBackupContent).
+
+  Paired session credentials live in EncryptedSharedPreferences, whose master key is bound to the
+  Android Keystore and cannot be restored onto another device. Backing those files up produces
+  unusable ciphertext at best and stale credentials at worst, so they are excluded explicitly.
+-->
+<full-backup-content>
+    <exclude domain="sharedpref" path="FlutterSecureStorage.xml" />
+    <exclude domain="sharedpref" path="FlutterSecureKeyStorage.xml" />
+    <exclude domain="file" path="devorbit_secure" />
+    <exclude domain="file" path="key.store" />
+</full-backup-content>

@@ -3,7 +3,23 @@
 <plist version="1.0">
 <dict>
 	<key>NSCameraUsageDescription</key>
-	<string>DevOrbit needs camera access to scan pairing QR codes from host machines.</string>
+	<string>DevOrbit uses the camera only to scan the pairing QR code displayed by your own development computer. The camera is never used for any other purpose, and no photos or video are stored.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>DevOrbit connects to your own development computer on the local network to run authorized AI-assisted coding tasks. Connections are end-to-end encrypted and only reach the host you paired with.</string>
+	<!--
+	  App Transport Security policy (deliberately minimal).
+
+	  NSAllowsLocalNetworking permits plaintext HTTP to local-network destinations (LAN IP
+	  literals, .local names, and unqualified hostnames) so a Host Bridge on the same Wi-Fi
+	  can be reached during pairing. It does NOT relax ATS for internet destinations, and
+	  NSAllowsArbitraryLoads is intentionally absent: all broker/internet traffic remains
+	  subject to default ATS (TLS 1.2+, forward secrecy, no cleartext).
+	-->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
 	<key>CFBundleDevelopmentRegion</key>

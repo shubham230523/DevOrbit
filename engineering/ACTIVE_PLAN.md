@@ -4,52 +4,56 @@
 
 ### Master Plan 0 / 0.1 — Persistent Engineering Memory & Cross-Session Continuity
 
-- **Status:** `COMPLETED` (`COMMITTED`, `PUSHED`, `REMOTE-VERIFIED`: MP0 at `7aed09683a829f83dd3a6f04cfbba0f6e376bc31`, MP0.1 reconciled at `be4ec8aa93cdfb8463f393f9f5d1ee0d457ef60d`).
+- **Status:** `COMPLETED` (`COMMITTED`, `PUSHED`, `REMOTE-VERIFIED`: MP0 at `7aed09683a829f83dd3a6f04cfbba0f6e376bc31`, MP0.1 at `be4ec8aa93cdfb8463f393f9f5d1ee0d457ef60d`).
+
+### Master Plan 23 — Host Bridge HTTP Auth & Trust Boundary
+
+- **Status:** `IMPLEMENTED`, `TESTED`, `COMMITTED`, `PUSHED`, `REMOTE-VERIFIED` at `efee2c99e16427223c803b89460dbe61fd151064`.
 
 ### Master Plan 24 — Pairing Bootstrap, Host-Admin Confidentiality & Closure Remediation
 
-- **Original Starting Baseline:** `efee2c99e16427223c803b89460dbe61fd151064`
-- **Initial MP24 Implementation Commit:** `7ba545da10f4ec61bf180c70c60960a3af03e5d4`
-- **Closure Commit:** `2425cc838c64e7e1e28c67e33c1636d45e5889d7` (`COMMITTED`, `PUSHED`, `REMOTE-VERIFIED` on both engineering branches)
-- **Automated Stage:** `IMPLEMENTED`, `TESTED`, `REVIEWED` for Criteria A–H.
-- **Outstanding Criterion:** **I — `BLOCKED`** (live TLS reverse proxy + physical Android/iOS validation).
-
-| Criterion | Stage Status | Evidence / Notes |
-|---|---|---|
-| A. Host-admin routes require confidential transport in prod; ignore untrusted/ambiguous `X-Forwarded-Proto` | `IMPLEMENTED`, `TESTED`, `REVIEWED` | `auth_middleware.go`, `pairing_transport_security_test.go` |
-| B. Pairing confirmation requires confidential transport in prod | `IMPLEMENTED`, `TESTED`, `REVIEWED` | `pairing_handlers.go`, `pairing_transport_security_test.go` |
-| C. Pairing replay & retry (`v1.1` timestamp+nonce proof; activation/revocation invalidation) | `IMPLEMENTED`, `TESTED`, `REVIEWED` | `pairing.go`, `pairing_test.go`, `pairing_integration_test.dart` |
-| D. Direct E2E HTTP uses HKDF-derived HMAC outer auth without raw bearer tokens | `IMPLEMENTED`, `TESTED`, `REVIEWED` | `auth_middleware.go`, `crypto_test.go`, `e2e_session_test.dart` |
-| E. Production listener requires native TLS or trusted proxy, loopback-only bind, cross-platform build | `IMPLEMENTED`, `TESTED`, `REVIEWED` | `config.go`, `console_windows.go`/`console_other.go` |
-| F. Empty/restricted permissions preserved across persistence; missing/null permissions rejected fail-closed | `IMPLEMENTED`, `TESTED`, `REVIEWED` | `session_store.go`, `session_store_test.go` |
-| G. OS-backed secret protection + atomic persistence + revocation tombstones + error propagation | `IMPLEMENTED`, `TESTED`, `REVIEWED` | extended further by MP24.1 (see below) |
-| H. Mobile HTTPS pairing never downgrades or falls back to HTTP | `IMPLEMENTED`, `TESTED`, `REVIEWED` | `pairing_client.dart`, `pairing_integration_test.dart` |
-| I. Live TLS reverse-proxy (Caddy/Nginx) & physical Android/iOS validation | `BLOCKED` / `PENDING` | Missing `caddy`/`nginx`, trusted cert, and attached physical device (`adb devices -l` empty) |
-
-## Active Master Plan
+- **Status:** Criteria A–H `IMPLEMENTED`/`TESTED`/`REVIEWED`/`COMMITTED`/`PUSHED` at `2425cc838c64e7e1e28c67e33c1636d45e5889d7`.
+- **Criterion I (live TLS + physical mobile validation):** `BLOCKED` (external dependencies). Procedure now written: `docs/testing/LIVE_TLS_VALIDATION_PROCEDURE.md`.
 
 ### Master Plan 24.1 — Revocation Durability & Rollback Failure Closure
 
-- **Verified Starting HEAD:** `2425cc838c64e7e1e28c67e33c1636d45e5889d7`
-- **Code + Test Commit:** `76ca2286523b1978acec1e64723d74ec64cddf2d`
-- **Objective:** Close only the remaining session-revocation, rollback, Windows secret-deletion, and broker-revocation error paths found in independent review of `2425cc8`. No re-implementation of the MP24 fixes and no repository-wide re-audit.
-- **Overall Status:** `IMPLEMENTED`, `TESTED`, `REVIEWED`, `COMMITTED` (push + remote verification recorded in `EXECUTION_LOG.md`).
+- **Status:** `IMPLEMENTED`, `TESTED`, `REVIEWED`, `COMMITTED`, `PUSHED`, `REMOTE-VERIFIED` at `76ca2286523b1978acec1e64723d74ec64cddf2d`.
+- **Accepted residuals:** DPAPI orphaned sealed-blob cleanup, legacy `pkg/broker` duplicate (see `KNOWN_ISSUES.md`).
 
-#### Acceptance Criteria
+### Master Plan 25 — Production Readiness Assessment
 
-| Criterion | Stage Status | Evidence |
-|---|---|---|
-| 1. Durable, idempotent revocation tombstone when the session is absent from memory; no success without persisted tombstone | `IMPLEMENTED`, `TESTED`, `REVIEWED` | `session_store.go` (`RevokeSession`), `session_store_test.go` (`TestSessionStore_AbsentSessionRevocationTombstoneAndRollback`) |
-| 1b. Persisted-only entries survive revocation of unloaded sessions; sealed secrets of unloaded sessions are destroyed | `IMPLEMENTED`, `TESTED`, `REVIEWED` | `session_store.go` (`saveLocked` merge, `persistedSecretRefsLocked`), `TestSessionStore_AbsentRevocationDestroysPersistedSealedSecret`, `TestSessionStore_RevocationPreservesUnloadedPersistedSessions` |
-| 2. Windows DPAPI supports real per-session secret deletion with fail-closed semantics | `IMPLEMENTED`, `TESTED`, `REVIEWED` | `secret_store_windows.go`, `secret_store_windows_test.go` (3 native Windows tests) |
-| 3. Rollback paths never discard `RemoveSession`/revocation errors and never return pairing success after partial provisioning | `IMPLEMENTED`, `TESTED`, `REVIEWED` | `pairing_handlers.go`, `pairing_transport_security_test.go` |
-| 4. Broker revocation errors propagate end-to-end; non-success HTTP status on required-stage failure; session-only vs device-wide semantics verified | `IMPLEMENTED`, `TESTED`, `REVIEWED` | `broker_client.go`, `broker_authorizer.go`, `handlers.go`, `cmd/host-bridge/main.go`, `services/connection-broker/internal/broker/broker.go`, `broker_test.go` |
-| 5. Continuity documents corrected (stale "pending commit/push" claim removed) | `IMPLEMENTED` | `CURRENT_STATE.md`, `ACTIVE_PLAN.md`, `KNOWN_ISSUES.md`, `EXECUTION_LOG.md`, `handoffs/latest-handoff.md` |
-| 6. Verification (go vet/test, Windows DPAPI tests, cross-builds, Flutter) | `IMPLEMENTED`, `TESTED` | `CURRENT_STATE.md` §3 — `-race` `BLOCKED` on this host |
-| 7. Commit/push to both engineering branches with matching remote SHAs | `COMMITTED` → see `EXECUTION_LOG.md` | `main` untouched (`c49804547aef7dc1100b8b444ee32695f353e7e6`) |
+- **Status:** `COMPLETED` (read-only assessment; `DEVORBIT_PRODUCTION_READINESS_MASTER_ASSESSMENT.md`, 17 parts, gap matrix G-01…G-41).
+
+## Active Master Plan
+
+### Master Plan 25 · M1 — Verification Closure, Release Build Integrity & Store-Critical Platform Config
+
+- **Verified Starting HEAD:** `6e93ea43d815182bddcc6497df90c16f8aebcbda`
+- **Objective:** convert assessed `PARTIALLY IMPLEMENTED` items into verified repository implementations for connectivity truthfulness, release signing, store-critical platform config, CI verification depth, and TLS deployment prerequisites.
+- **Overall Status:** repository scope `IMPLEMENTED` + `TESTED`; external-evidence scope `BLOCKED`. **Verdict: M1 PARTIALLY COMPLETE.**
+
+| Task | Scope | Status | Evidence |
+|---|---|---|---|
+| A | Real transport-derived connection state (G-12) | `IMPLEMENTED`, `TESTED` | `connection_manager.dart` rewrite, `broker_websocket_client.dart` hardening, dashboard wiring, 12 new real-WebSocket tests |
+| B | Android production release configuration (G-H3/G-28) | `IMPLEMENTED`, `TESTED`, `VERIFIED` (local builds) | `app/build.gradle.kts` signing + fail-closed guard, manifest/backup/network-security config, `KEYSTORE_SETUP.md`; debug APK built, release refused without creds, release built with ephemeral keystore |
+| C | iOS store-critical configuration (G-29) | `IMPLEMENTED`; compile/TestFlight `BLOCKED` | `Info.plist` (local network + ATS), `IOS_STORE_READINESS.md` |
+| D | CI/CD verification depth (G-27) | `IMPLEMENTED` (workflow); race detector `BLOCKED` locally, CI job added | `.github/workflows/ci.yml` rewrite |
+| E | Live TLS deployment prerequisites (G-10) | `IMPLEMENTED` (repo); live validation `BLOCKED` | `Caddyfile`, `env.example`, deployment README, validation procedure |
+| F | Hygiene + continuity | `IMPLEMENTED` | No tracked binaries/secrets; empty `tests/` removed; continuity docs updated |
+
+#### Remaining external dependencies (blocking full M1)
+
+1. Production Android upload keystore + 4 CI secrets (`KEYSTORE_SETUP.md`).
+2. Physical Android device (pairing/E2E/revocation evidence).
+3. macOS + Xcode + Apple account (iOS compile/TestFlight/App Review).
+4. Physical iPhone.
+5. DNS name + reachable proxy host + Caddy for CA-trusted TLS validation.
+6. Linux 64-bit CGO runner (`go test -race` executes in CI once pushed).
 
 ## Exact Next Engineering Action
 
-1. Push `security/atomic-agent-task-execution` and `quality/autonomous-15min-improvement`, then verify both remote heads equal the local `HEAD` (recorded in `EXECUTION_LOG.md`).
-2. Run `go test -race ./internal/security/...` (Host Bridge) in Linux CI or a 64-bit CGO environment, since the Windows MinGW toolchain here cannot compile `-race`.
-3. In an environment with Caddy/Nginx, a CA-trusted certificate, and a physical Android/iOS device, execute Phase 4 live validation to close Master Plan 24 Criterion I.
+1. Push both engineering branches and confirm identical remote heads (`git ls-remote`).
+2. Configure the four Android signing secrets in GitHub and confirm the signed-release job produces a non-debug-signed AAB artifact.
+3. On a host with DNS + Caddy, execute `docs/testing/LIVE_TLS_VALIDATION_PROCEDURE.md` Steps 1–6 and record evidence.
+4. On macOS, run `flutter build ios --release --no-codesign` and record the result.
+5. Then begin M2 (security hardening & operations baseline) per the MP25 roadmap.

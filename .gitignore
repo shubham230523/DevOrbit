@@ -39,3 +39,10 @@ node_modules/
 *.pem
 *.key
 local.properties
+
+# Release signing material (Android) — NEVER commit
+*.jks
+*.keystore
+key.properties
+key.properties.*
+!key.properties.example

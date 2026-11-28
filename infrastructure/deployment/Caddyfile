@@ -1,0 +1,95 @@
+# DevOrbit production reverse proxy (Caddy v2)
+#
+# Purpose: terminate TLS with an ACME-issued (CA-trusted) certificate and proxy to the services,
+# including the long-lived WebSocket tunnels used by the Connection Broker and the Host Bridge.
+#
+# Usage:
+#   CADDY_EMAIL=you@example.com \
+#   BROKER_HOST=broker.example.com \
+#   HOST_BRIDGE_HOST=host.example.com \
+#   caddy run --config infrastructure/deployment/Caddyfile --envfile infrastructure/deployment/.env
+#
+# Nothing here proves production TLS: validation requires a real DNS name, a reachable host and a
+# CA-trusted certificate. See docs/testing/LIVE_TLS_VALIDATION_PROCEDURE.md.
+
+{
+	email {$CADDY_EMAIL}
+	# Uncomment to use Let's Encrypt staging while testing (avoids rate limits):
+	# acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+	admin off
+}
+
+# ------------------------------------------------------------------------------------------------
+# Connection Broker  (wss://broker.example.com/ws/... and https://broker.example.com/api/v1/...)
+# ------------------------------------------------------------------------------------------------
+{$BROKER_HOST} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		Cross-Origin-Opener-Policy "same-origin"
+		-Server
+	}
+
+	# WebSocket tunnels: host and client sockets are long-lived, so timeouts are disabled and
+	# buffering is turned off to avoid head-of-line stalls on relayed frames.
+	@ws path /ws/*
+	reverse_proxy @ws 127.0.0.1:8081 {
+		flush_interval -1
+		header_up X-Forwarded-Proto {scheme}
+		transport http {
+			dial_timeout 10s
+			read_timeout 0
+			write_timeout 0
+		}
+		health_uri /api/v1/health
+		health_interval 15s
+		health_timeout 3s
+	}
+
+	# Internal service-to-service endpoints and health.
+	reverse_proxy /api/v1/* 127.0.0.1:8081 {
+		header_up X-Forwarded-Proto {scheme}
+		transport http {
+			dial_timeout 5s
+			response_header_timeout 15s
+		}
+	}
+
+	# Anything else is not part of the public broker surface.
+	respond 404
+}
+
+# ------------------------------------------------------------------------------------------------
+# Host Bridge (optional: only when the host is internet-reachable behind this proxy)
+#
+# DEVORBIT_TRUSTED_PROXIES must include 127.0.0.1 on the Host Bridge so that the single
+# X-Forwarded-Proto: https header is treated as authoritative for confidential-transport checks.
+# ------------------------------------------------------------------------------------------------
+{$HOST_BRIDGE_HOST} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	reverse_proxy 127.0.0.1:8082 {
+		# Exactly one X-Forwarded-Proto value: the Host Bridge rejects ambiguous headers.
+		header_up X-Forwarded-Proto {scheme}
+		header_up X-Real-IP {remote_host}
+		flush_interval -1
+		transport http {
+			dial_timeout 10s
+			read_timeout 0
+			write_timeout 0
+		}
+		health_uri /api/v1/health
+		health_interval 15s
+		health_timeout 3s
+	}
+}

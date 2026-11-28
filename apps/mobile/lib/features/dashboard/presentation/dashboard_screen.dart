@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import '../../../core/network/broker_websocket_client.dart';
+import '../../../core/network/connection_manager.dart';
 import '../../../core/security/secure_storage.dart';
 import '../../machines/presentation/qr_pairing_dialog.dart';
 
@@ -31,7 +32,7 @@ class DashboardScreen extends StatefulWidget {
 
 class _DashboardScreenState extends State<DashboardScreen> {
   late TextEditingController _brokerController;
-  BrokerWebSocketClient? _brokerClient;
+  ConnectionManager? _connectionManager;
   BrokerConnectionState _connectionState = BrokerConnectionState.disconnected;
   bool _isLoading = false;
   Map<String, dynamic>? _healthData;
@@ -144,9 +145,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }
 
   Future<void> _handleLogout() async {
-    _brokerClient?.disconnect();
-    _brokerClient?.dispose();
-    _brokerClient = null;
+    _connectionManager?.disconnect();
+    _connectionManager?.dispose();
+    _connectionManager = null;
 
     await _storage.clearPairedSession();
 
@@ -191,17 +192,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
       return;
     }
 
-    _brokerClient?.disconnect();
-    _brokerClient?.dispose();
+    _connectionManager?.disconnect();
+    _connectionManager?.dispose();
 
-    _brokerClient = BrokerWebSocketClient(
-      brokerUrl: url,
-      machineId: _machineId!,
-      deviceId: _deviceId!,
-      sessionId: _sessionId!,
-      token: _token!,
-      masterSecret: _masterSecret!,
-    );
+    final manager = ConnectionManager();
+    _connectionManager = manager;
+    manager.addListener(_onConnectionManagerChanged);
 
     setState(() {
       _isLoading = true;
@@ -216,15 +212,46 @@ class _DashboardScreenState extends State<DashboardScreen> {
       }
     });
 
-    _brokerClient!.stateStream.listen((state) async {
-      if (mounted) {
-        setState(() {
-          _connectionState = state;
-          _isLoading = (state == BrokerConnectionState.connecting ||
-                        state == BrokerConnectionState.authenticating);
-        });
-      }
+    final started = await manager.connect(BrokerConnectionProfile(
+      brokerUrl: url,
+      machineId: _machineId!,
+      deviceId: _deviceId!,
+      sessionId: _sessionId!,
+      token: _token!,
+      masterSecret: _masterSecret!,
+    ));
 
+    if (!started && mounted) {
+      setState(() {
+        _isLoading = false;
+        _errorMessage = manager.isRevoked
+            ? 'Device revoked: Credentials invalidated. Please re-pair this host.'
+            : 'A connection attempt is already in progress.';
+      });
+    }
+  }
+
+  /// Single sink for supervised connection state. UI status is always derived from the
+  /// real broker transport; no local simulation can promote it to "connected".
+  void _onConnectionManagerChanged() {
+    final manager = _connectionManager;
+    if (manager == null || !mounted) return;
+    final state = manager.status;
+    if (state == _connectionState) return;
+
+    setState(() {
+      _connectionState = state;
+      _isLoading = (state == BrokerConnectionState.connecting ||
+          state == BrokerConnectionState.transportConnected ||
+          state == BrokerConnectionState.authenticating ||
+          state == BrokerConnectionState.reconnecting);
+    });
+
+    _handleConnectionSideEffects(state);
+  }
+
+  Future<void> _handleConnectionSideEffects(BrokerConnectionState state) async {
+    {
       if (state == BrokerConnectionState.authenticatedBrokerSessionActive) {
         await _fetchLiveHostDataOverBroker();
       } else if (state == BrokerConnectionState.waitingForHost) {
@@ -282,13 +309,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
           });
         }
       }
-    });
-
-    await _brokerClient!.connect();
+    }
   }
 
   Future<void> _fetchLiveHostDataOverBroker() async {
-    if (_brokerClient == null || _brokerClient!.state != BrokerConnectionState.authenticatedBrokerSessionActive) {
+    final activeClient = _connectionManager?.client;
+    if (activeClient == null ||
+        !(_connectionManager?.isTransportAuthenticated ?? false) ||
+        activeClient.state != BrokerConnectionState.authenticatedBrokerSessionActive) {
       return;
     }
 
@@ -298,7 +326,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     });
 
     try {
-      final healthResp = await _brokerClient!.sendRequest(
+      final healthResp = await activeClient.sendRequest(
         method: 'GET',
         path: '/api/v1/health',
       );
@@ -306,7 +334,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       if (healthResp.statusCode == 200) {
         final healthJson = jsonDecode(healthResp.body) as Map<String, dynamic>;
 
-        final wsResp = await _brokerClient!.sendRequest(
+        final wsResp = await activeClient.sendRequest(
           method: 'GET',
           path: '/api/v1/workspaces',
         );
@@ -348,8 +376,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
   @override
   void dispose() {
     _brokerController.dispose();
-    _brokerClient?.disconnect();
-    _brokerClient?.dispose();
+    _connectionManager?.removeListener(_onConnectionManagerChanged);
+    _connectionManager?.disconnect();
+    _connectionManager?.dispose();
+    _connectionManager = null;
     super.dispose();
   }
 

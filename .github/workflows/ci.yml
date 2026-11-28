@@ -2,65 +2,329 @@ name: DevOrbit CI
 
 on:
   push:
-    branches: [ main, feature/** ]
+    branches:
+      - main
+      - 'security/**'
+      - 'quality/**'
+      - 'feature/**'
   pull_request:
-    branches: [ main ]
+    branches:
+      - main
+      - 'security/**'
+      - 'quality/**'
+
+# Least privilege by default. No job inherits write/write-all.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: '1.24'
+  FLUTTER_CHANNEL: 'stable'
 
 jobs:
-  test-go-services:
-    name: Test Go Microservices & Agents
+  # ---------------------------------------------------------------------------------------------
+  # Go: vet + unit tests for every module (works on any OS, no CGO required)
+  # ---------------------------------------------------------------------------------------------
+  go-test:
+    name: Go vet + test (${{ matrix.module }})
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - agents/host-bridge
+          - agents/ai-router
+          - agents/acp-adapter
+          - services/connection-broker
+          - services/control-plane
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: ${{ matrix.module }}/go.sum
 
-      - name: Test Control Plane
-        run: |
-          cd services/control-plane
-          go test -v ./...
+      - name: go vet
+        working-directory: ${{ matrix.module }}
+        run: go vet ./...
 
-      - name: Test Connection Broker
-        run: |
-          cd services/connection-broker
-          go test -v ./...
+      - name: go test
+        working-directory: ${{ matrix.module }}
+        run: go test -count=1 -timeout=180s ./...
 
-      - name: Test Host Bridge
-        run: |
-          cd agents/host-bridge
-          go test -v ./...
-
-      - name: Test ACP Adapter
-        run: |
-          cd agents/acp-adapter
-          go test -v ./...
-
-      - name: Test AI Router
-        run: |
-          cd agents/ai-router
-          go test -v ./...
-
-  test-flutter-mobile:
-    name: Test Flutter Mobile Application
+  # ---------------------------------------------------------------------------------------------
+  # Go: race detector on a genuine 64-bit Linux CGO runner
+  # ---------------------------------------------------------------------------------------------
+  go-race:
+    name: Go race detector (${{ matrix.module }})
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - agents/host-bridge
+          - agents/ai-router
+          - agents/acp-adapter
+          - services/connection-broker
+          - services/control-plane
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Flutter
-        uses: subosito/flutter-action@v2
+      - uses: actions/setup-go@v5
         with:
-          channel: 'stable'
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: ${{ matrix.module }}/go.sum
 
-      - name: Flutter Pub Get & Analyze
+      - name: Verify 64-bit CGO toolchain
         run: |
-          cd apps/mobile
+          gcc --version
+          echo "CGO_ENABLED=$CGO_ENABLED"
+          test "$(go env GOARCH)" = "amd64"
+
+      - name: go test -race
+        working-directory: ${{ matrix.module }}
+        env:
+          CGO_ENABLED: '1'
+        run: go test -race -count=1 -timeout=300s ./...
+
+  # ---------------------------------------------------------------------------------------------
+  # Go: cross-platform builds (host tools must build for Linux and Windows hosts)
+  # ---------------------------------------------------------------------------------------------
+  go-cross-build:
+    name: Go cross-build (linux + windows)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - agents/host-bridge
+          - services/connection-broker
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+
+      - name: Build linux/amd64
+        working-directory: ${{ matrix.module }}
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: amd64
+        run: go build ./...
+
+      - name: Build windows/amd64
+        working-directory: ${{ matrix.module }}
+        env:
+          CGO_ENABLED: '0'
+          GOOS: windows
+          GOARCH: amd64
+        run: go build ./...
+
+  # ---------------------------------------------------------------------------------------------
+  # Flutter: analyze + tests
+  # ---------------------------------------------------------------------------------------------
+  flutter-analyze-test:
+    name: Flutter analyze + test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          cache: true
+
+      - name: flutter pub get
+        working-directory: apps/mobile
+        run: flutter pub get
+
+      - name: flutter analyze
+        working-directory: apps/mobile
+        run: flutter analyze
+
+      - name: flutter test
+        working-directory: apps/mobile
+        run: flutter test --reporter expanded
+
+  # ---------------------------------------------------------------------------------------------
+  # Android: debug build verification (always runs, needs no signing material)
+  # ---------------------------------------------------------------------------------------------
+  android-debug-build:
+    name: Android debug build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          cache: true
+
+      - name: flutter pub get
+        working-directory: apps/mobile
+        run: flutter pub get
+
+      - name: Build debug APK
+        working-directory: apps/mobile
+        run: flutter build apk --debug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: devorbit-android-debug-apk
+          path: apps/mobile/build/app/outputs/flutter-apk/app-debug.apk
+          retention-days: 14
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------------------------
+  # Android: signed release verification. Runs only on pushes (never on PRs, so fork PRs cannot
+  # exfiltrate secrets) and only when the signing secrets are configured.
+  # ---------------------------------------------------------------------------------------------
+  android-release-build:
+    name: Android release build (signed)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check signing secrets availability
+        id: signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "Android signing secrets are not configured; skipping signed release build."
+          fi
+
+      - uses: actions/setup-java@v4
+        if: steps.signing.outputs.available == 'true'
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        if: steps.signing.outputs.available == 'true'
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          cache: true
+
+      - name: Materialize keystore
+        if: steps.signing.outputs.available == 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          KEYSTORE_PATH="$RUNNER_TEMP/upload-keystore.jks"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
+          chmod 600 "$KEYSTORE_PATH"
+          echo "DEVORBIT_ANDROID_KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
+
+      - name: Build signed App Bundle
+        if: steps.signing.outputs.available == 'true'
+        working-directory: apps/mobile
+        env:
+          DEVORBIT_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          DEVORBIT_ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          DEVORBIT_ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
           flutter pub get
-          flutter analyze
+          flutter build appbundle --release
+          flutter build apk --release
 
-      - name: Run Flutter Tests
+      - name: Verify release signature is not the debug key
+        if: steps.signing.outputs.available == 'true'
+        working-directory: apps/mobile
         run: |
-          cd apps/mobile
-          flutter test
+          set -euo pipefail
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -1)
+          "$APKSIGNER" verify --print-certs build/app/outputs/flutter-apk/app-release.apk | tee certs.txt
+          if grep -q "CN=Android Debug" certs.txt; then
+            echo "::error::Release APK is signed with the Android debug key"
+            exit 1
+          fi
+
+      - name: Upload signed artifacts
+        if: steps.signing.outputs.available == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: devorbit-android-release
+          path: |
+            apps/mobile/build/app/outputs/bundle/release/app-release.aab
+            apps/mobile/build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 30
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------------------------
+  # Security: secret scanning + Go dependency vulnerability scanning
+  # ---------------------------------------------------------------------------------------------
+  secret-scan:
+    name: Secret scanning (gitleaks)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  dependency-scan:
+    name: Dependency vulnerability scan (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - agents/host-bridge
+          - agents/ai-router
+          - agents/acp-adapter
+          - services/connection-broker
+          - services/control-plane
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+
+      - name: govulncheck
+        working-directory: ${{ matrix.module }}
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...

@@ -1,10 +1,26 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Camera is used exclusively to scan pairing QR codes; the app is fully usable without it. -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <uses-feature
+        android:name="android.hardware.camera"
+        android:required="false" />
+
+    <!--
+      allowBackup=false: paired session credentials are bound to the device keystore and must not be
+      restored onto another device. dataExtractionRules/fullBackupContent additionally exclude the
+      secure-storage files for the platform variants that honour them.
+    -->
     <application
-        android:label="devorbit_mobile"
+        android:label="DevOrbit"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false"
+        android:fullBackupContent="@xml/backup_rules"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:usesCleartextTraffic="false">
         <activity
             android:name=".MainActivity"
             android:exported="true"

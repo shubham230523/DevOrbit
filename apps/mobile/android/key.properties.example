@@ -1,0 +1,17 @@
+# DevOrbit Android release signing template.
+#
+# 1. Copy this file to `android/key.properties` (this path is git-ignored).
+# 2. Fill in the values for YOUR upload keystore.
+# 3. NEVER commit `key.properties`, `*.jks` or `*.keystore`.
+#
+# The same values may instead be supplied as environment variables (preferred for CI):
+#   DEVORBIT_ANDROID_KEYSTORE_PATH
+#   DEVORBIT_ANDROID_KEYSTORE_PASSWORD
+#   DEVORBIT_ANDROID_KEY_ALIAS
+#   DEVORBIT_ANDROID_KEY_PASSWORD
+#
+# Path is resolved relative to apps/mobile/android unless absolute.
+storeFile=/absolute/path/to/upload-keystore.jks
+storePassword=CHANGE_ME
+keyAlias=upload
+keyPassword=CHANGE_ME

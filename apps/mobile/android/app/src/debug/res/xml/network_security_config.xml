@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  DEBUG-ONLY network security policy.
+
+  Local development requires plaintext HTTP to a Host Bridge running on the developer machine
+  (emulator loopback 10.0.2.2, or a LAN address such as 192.168.x.x). Cleartext is enabled here
+  only, and this file is never packaged into a release build because it lives in the `debug`
+  source set, which overrides the `main` policy for debug variants.
+
+  Release builds keep cleartextTrafficPermitted="false" from src/main/res/xml.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

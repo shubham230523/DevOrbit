@@ -1,7 +1,52 @@
+import java.io.FileInputStream
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
+}
+
+// ---------------------------------------------------------------------------------------------
+// Release signing configuration
+//
+// Credentials are NEVER committed. They are resolved, in order, from:
+//   1. Environment variables (preferred for CI):
+//        DEVORBIT_ANDROID_KEYSTORE_PATH, DEVORBIT_ANDROID_KEYSTORE_PASSWORD,
+//        DEVORBIT_ANDROID_KEY_ALIAS, DEVORBIT_ANDROID_KEY_PASSWORD
+//   2. android/key.properties (developer machine, git-ignored; see key.properties.example)
+//
+// A release build FAILS CLOSED when credentials are absent: it is never silently signed with the
+// debug keystore (see `verifyReleaseSigning` below).
+// ---------------------------------------------------------------------------------------------
+val keystorePropertiesFile = rootProject.file("key.properties")
+val keystoreProperties = Properties().apply {
+    if (keystorePropertiesFile.exists()) {
+        FileInputStream(keystorePropertiesFile).use { load(it) }
+    }
+}
+
+fun signingValue(envKey: String, propertyKey: String): String? {
+    val fromEnv = System.getenv(envKey)?.trim()
+    if (!fromEnv.isNullOrEmpty()) return fromEnv
+    val fromProperty = keystoreProperties.getProperty(propertyKey)?.trim()
+    return if (fromProperty.isNullOrEmpty()) null else fromProperty
+}
+
+val releaseStoreFilePath = signingValue("DEVORBIT_ANDROID_KEYSTORE_PATH", "storeFile")
+val releaseStorePassword = signingValue("DEVORBIT_ANDROID_KEYSTORE_PASSWORD", "storePassword")
+val releaseKeyAlias = signingValue("DEVORBIT_ANDROID_KEY_ALIAS", "keyAlias")
+val releaseKeyPassword = signingValue("DEVORBIT_ANDROID_KEY_PASSWORD", "keyPassword")
+
+val hasReleaseSigning = !releaseStoreFilePath.isNullOrEmpty() &&
+    !releaseStorePassword.isNullOrEmpty() &&
+    !releaseKeyAlias.isNullOrEmpty() &&
+    !releaseKeyPassword.isNullOrEmpty()
+
+// Resolve the keystore relative to the android/ project directory when not absolute.
+val resolvedReleaseStoreFile: File? = releaseStoreFilePath?.let { path ->
+    val candidate = File(path)
+    if (candidate.isAbsolute) candidate else rootProject.file(path)
 }
 
 android {
@@ -15,18 +60,28 @@ android {
     }
 
     defaultConfig {
-        // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
+        // Stable application id: changing it later breaks Play updates and pairing storage.
         applicationId = "com.devorbit.devorbit_mobile"
-        // You can update the following values to match your application needs.
-        // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = flutter.minSdkVersion
+        // Android 7.0+: required baseline for the modern TLS stack used by the broker/E2E channel.
+        minSdk = maxOf(flutter.minSdkVersion, 24)
         targetSdk = flutter.targetSdkVersion
-        // Uses the version code from pubspec.yaml. When using split APKs, 1000 * ABI_VERSION
-        // is added automatically by Flutter. (https://developer.android.com/studio/build/configure-apk-splits#configure-APK-versions)
-        // You can force using the value of versionCode by specifying the `-P force-version-code-ignoring-abi=true`
-        // flag during build.
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+    }
+
+    signingConfigs {
+        if (hasReleaseSigning && resolvedReleaseStoreFile != null) {
+            create("release") {
+                storeFile = resolvedReleaseStoreFile
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+                enableV1Signing = false
+                enableV2Signing = true
+                enableV3Signing = true
+                enableV4Signing = true
+            }
+        }
     }
 
     buildTypes {
@@ -43,9 +98,18 @@ android {
             }
         }
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            // R8 shrinking is intentionally left off until a release build can be validated on a
+            // real device. Turning it on without runtime verification risks stripping reflectively
+            // loaded plugin classes. Rules are prepared in proguard-rules.pro for that step.
+            isMinifyEnabled = false
+            isShrinkResources = false
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
+            // Deliberately NOT falling back to the debug keystore: when credentials are missing the
+            // signing config is absent and the task-graph guard below fails the build.
+            signingConfig = if (hasReleaseSigning) signingConfigs.findByName("release") else null
         }
     }
 }
@@ -58,4 +122,30 @@ kotlin {
 
 flutter {
     source = "../.."
+}
+
+// Fail closed for every release artifact: assembling/bundling a release requires real credentials.
+val releaseArtifactTaskNames = setOf(
+    "assembleRelease",
+    "bundleRelease",
+    "packageRelease",
+    "packageReleaseBundle",
+    "signReleaseBundle",
+    "assembleReleaseBundle",
+)
+
+gradle.taskGraph.whenReady {
+    val requestedReleaseTasks = allTasks
+        .map { it.name }
+        .filter { releaseArtifactTaskNames.contains(it) }
+    if (requestedReleaseTasks.isNotEmpty() && !hasReleaseSigning) {
+        throw GradleException(
+            "DevOrbit release build refused: no release signing credentials configured.\n" +
+                "Provide DEVORBIT_ANDROID_KEYSTORE_PATH / DEVORBIT_ANDROID_KEYSTORE_PASSWORD / " +
+                "DEVORBIT_ANDROID_KEY_ALIAS / DEVORBIT_ANDROID_KEY_PASSWORD environment variables " +
+                "or an untracked android/key.properties file.\n" +
+                "Release builds are never signed with the debug keystore. " +
+                "See apps/mobile/android/KEYSTORE_SETUP.md. Requested: $requestedReleaseTasks"
+        )
+    }
 }
